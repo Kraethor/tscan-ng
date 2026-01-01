@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtualenv
+venv/
+.venv/
+
+# Captures / data
+pcaps/
+*.pcap
+*.pcapng
+
+# Output logs
+*.jsonl
+*.log
+
+# Runtime sockets/tmp
+/run/tscan/
