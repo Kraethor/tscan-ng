@@ -1,0 +1,9 @@
+/var/log/tscan/*.jsonl {
+    daily
+    rotate 14
+    compress
+    copytruncate
+    missingok
+    notifempty
+    su tscan tscan
+}

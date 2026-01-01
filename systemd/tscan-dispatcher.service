@@ -1,0 +1,20 @@
+[Unit]
+Description=tscan-ng dispatcher + workers
+After=network.target
+Wants=tscan-capture.service
+
+[Service]
+Type=simple
+User=tscan
+Group=tscan
+Environment="PATH=/opt/tscan/venv/bin:/usr/bin:/bin"
+WorkingDirectory=/opt/tscan
+RuntimeDirectory=tscan
+RuntimeDirectoryMode=0755
+ExecStart=/opt/tscan/venv/bin/python -u -m tscan_ng.run --socket /run/tscan/tscan.sock --workers 4 --out /var/log/tscan/results.jsonl
+Restart=on-failure
+LimitNOFILE=65536
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
