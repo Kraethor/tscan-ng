@@ -1,10 +1,16 @@
 import argparse, os, struct, socket, multiprocessing as mp
 from tscan_ng.parsing.net import parse_basic
-from tscan_ng.detectors import http_basic
+from tscan_ng.detectors import http_basic, ftp, pop3, imap, smtp
 from tscan_ng.sinks.jsonl import JSONLSink
 
 HDR = struct.Struct("!IIIHH")  # sec,usec,caplen,l2type,pad
-DETECTORS = [http_basic.detect]
+DETECTORS = [
+    http_basic.detect,
+    ftp.detect,
+    pop3.detect,
+    imap.detect,
+    smtp.detect,
+]
 
 def worker_main(pipe, out_path):
     sink = JSONLSink(out_path if out_path else None)
