@@ -7,10 +7,17 @@ def detect(pkt):
         return []
     lines = payload.split(b"\r\n")
     findings = []
-    for idx, line in enumerate(lines):
-        if line.upper().startswith(b"USER "):
-            user = line[5:].strip().decode("utf-8", "ignore")
-            if idx + 1 < len(lines) and lines[idx + 1].upper().startswith(b"PASS "):
-                passwd = lines[idx + 1][5:].strip().decode("utf-8", "ignore")
-                findings.append({"type": "pop3_creds", "creds": f"{user}:{passwd}"})
+    pending_user = None
+    for line in lines:
+        upper = line.upper()
+        if upper.startswith(b"USER "):
+            pending_user = line[5:].strip().decode("utf-8", "ignore")
+            continue
+        if upper.startswith(b"PASS ") and pending_user:
+            passwd = line[5:].strip().decode("utf-8", "ignore")
+            findings.append({"type": "pop3_creds", "creds": f"{pending_user}:{passwd}"})
+            pending_user = None
+            continue
+        if upper.startswith(b"-ERR") or upper.startswith(b"QUIT"):
+            pending_user = None
     return findings
