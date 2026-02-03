@@ -21,15 +21,37 @@ def _find_auth_plain(lines: list[bytes]) -> list[dict]:
     return findings
 
 
+def _next_client_tokens(lines: list[bytes], start_idx: int, count: int) -> list[bytes]:
+    tokens = []
+    idx = start_idx
+    while idx < len(lines) and len(tokens) < count:
+        token = lines[idx].strip()
+        if token:
+            if not token.upper().startswith(b"334 "):
+                tokens.append(token)
+        idx += 1
+    return tokens
+
+
 def _find_auth_login(lines: list[bytes]) -> list[dict]:
     findings = []
     for idx, line in enumerate(lines):
-        if b"AUTH LOGIN" not in line.upper():
+        upper = line.upper()
+        if b"AUTH LOGIN" not in upper:
             continue
-        if idx + 2 >= len(lines):
-            continue
-        user = decode_b64(lines[idx + 1].strip())
-        passwd = decode_b64(lines[idx + 2].strip())
+        parts = line.split(b"AUTH LOGIN", 1)[1].strip()
+        user = decode_b64(parts) if parts else ""
+        needed = 2 if not user else 1
+        tokens = _next_client_tokens(lines, idx + 1, needed)
+        passwd = ""
+        if user:
+            if tokens:
+                passwd = decode_b64(tokens[0])
+        elif len(tokens) >= 2:
+            user = decode_b64(tokens[0])
+            passwd = decode_b64(tokens[1])
+        elif len(tokens) == 1:
+            user = decode_b64(tokens[0])
         if user or passwd:
             findings.append({"type": "smtp_login_creds", "creds": f"{user}:{passwd}"})
     return findings
