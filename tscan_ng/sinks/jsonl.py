@@ -11,4 +11,7 @@ class JSONLSink:
         if self._fd:
             self._fd.write(line)
         else:
-            os.write(1, line)
+            try:
+                os.write(1, line)
+            except OSError:
+                pass
