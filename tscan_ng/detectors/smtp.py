@@ -4,7 +4,7 @@ _SMTP_RESPONSE_RE = re.compile(rb"^\d{3}[ -]")
 
 from tscan_ng.detectors.common import decode_b64
 
-def _find_auth_plain(lines: list[bytes]) -> list[dict]:
+def _find_auth_plain(lines: list[bytes], src: str, dst: str) -> list[dict]:
     findings = []
     for idx, line in enumerate(lines):
         upper = line.upper()
@@ -20,9 +20,9 @@ def _find_auth_plain(lines: list[bytes]) -> list[dict]:
         if len(parts) >= 3:
             user = parts[-2]
             passwd = parts[-1]
-            findings.append({"type": "smtp_plain_creds", "creds": f"{user}:{passwd}"})
+            findings.append({"type": "smtp_plain_creds", "src": src, "dst": dst, "creds": f"{user}:{passwd}"})
     return findings
-
+    
 
 def _next_client_tokens(lines: list[bytes], start_idx: int, count: int) -> list[bytes]:
     tokens = []
@@ -35,7 +35,7 @@ def _next_client_tokens(lines: list[bytes], start_idx: int, count: int) -> list[
     return tokens
 
 
-def _find_auth_login(lines: list[bytes]) -> list[dict]:
+def _find_auth_login(lines: list[bytes], src: str, dst: str) -> list[dict]:
     findings = []
     for idx, line in enumerate(lines):
         upper = line.upper()
@@ -55,9 +55,9 @@ def _find_auth_login(lines: list[bytes]) -> list[dict]:
         elif len(tokens) == 1:
             user = decode_b64(tokens[0])
         if user or passwd:
-            findings.append({"type": "smtp_login_creds", "creds": f"{user}:{passwd}"})
+            findings.append({"type": "smtp_login_creds", "src": src, "dst": dst, "creds": f"{user}:{passwd}"})
     return findings
-
+    
 
 def detect(pkt):
     """Detect SMTP AUTH LOGIN/PLAIN credentials."""
@@ -67,7 +67,8 @@ def detect(pkt):
     if not payload:
         return []
     lines = payload.split(b"\r\n")
+    src, dst = pkt["src"], pkt["dst"]
     findings = []
-    findings.extend(_find_auth_plain(lines))
-    findings.extend(_find_auth_login(lines))
+    findings.extend(_find_auth_plain(lines, src, dst))
+    findings.extend(_find_auth_login(lines, src, dst))
     return findings
