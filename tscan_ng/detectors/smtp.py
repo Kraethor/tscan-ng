@@ -1,5 +1,8 @@
-from tscan_ng.detectors.common import decode_b64
+import re
 
+_SMTP_RESPONSE_RE = re.compile(rb"^\d{3}[ -]")
+
+from tscan_ng.detectors.common import decode_b64
 
 def _find_auth_plain(lines: list[bytes]) -> list[dict]:
     findings = []
@@ -26,9 +29,8 @@ def _next_client_tokens(lines: list[bytes], start_idx: int, count: int) -> list[
     idx = start_idx
     while idx < len(lines) and len(tokens) < count:
         token = lines[idx].strip()
-        if token:
-            if not token.upper().startswith(b"334 "):
-                tokens.append(token)
+        if token and not _SMTP_RESPONSE_RE.match(token):
+            tokens.append(token)
         idx += 1
     return tokens
 
