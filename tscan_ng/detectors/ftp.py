@@ -6,6 +6,7 @@ def detect(pkt):
     if not payload:
         return []
     lines = payload.split(b"\r\n")
+    src, dst = pkt["src"], pkt["dst"]
     findings = []
     pending_user = None
     for line in lines:
@@ -15,7 +16,7 @@ def detect(pkt):
             continue
         if upper.startswith(b"PASS ") and pending_user:
             passwd = line[5:].strip().decode("utf-8", "ignore")
-            findings.append({"type": "ftp_creds", "creds": f"{pending_user}:{passwd}"})
+            findings.append({"type": "ftp_creds", "src": src, "dst": dst, "creds": f"{pending_user}:{passwd}"})
             pending_user = None
             continue
         if upper.startswith(b"530") or upper.startswith(b"QUIT"):
