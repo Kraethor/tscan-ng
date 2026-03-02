@@ -1,24 +1,8 @@
+from tscan_ng.detectors.common import detect_user_pass
+
 def detect(pkt):
     """Detect FTP USER/PASS credentials in cleartext."""
-    if not pkt["tcp"]:
+    if not pkt["tcp"] or not pkt["payload"]:
         return []
-    payload = pkt["payload"]
-    if not payload:
-        return []
-    lines = payload.split(b"\r\n")
-    src, dst = pkt["src"], pkt["dst"]
-    findings = []
-    pending_user = None
-    for line in lines:
-        upper = line.upper()
-        if upper.startswith(b"USER "):
-            pending_user = line[5:].strip().decode("utf-8", "ignore")
-            continue
-        if upper.startswith(b"PASS ") and pending_user:
-            passwd = line[5:].strip().decode("utf-8", "ignore")
-            findings.append({"type": "ftp_creds", "src": src, "dst": dst, "creds": f"{pending_user}:{passwd}"})
-            pending_user = None
-            continue
-        if upper.startswith(b"530") or upper.startswith(b"QUIT"):
-            pending_user = None
-    return findings
+    return detect_user_pass(pkt["payload"], "ftp_creds", pkt["src"], pkt["dst"],
+                             reset_prefixes=(b"530", b"QUIT"))
