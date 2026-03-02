@@ -1,6 +1,6 @@
 import argparse, os, struct, socket, multiprocessing as mp
 from tscan_ng.parsing.net import parse_basic
-from tscan_ng.detectors import http_basic, ftp, pop3, imap, smtp
+from tscan_ng.detectors import DETECTORS
 from tscan_ng.sinks.jsonl import JSONLSink
 
 HDR = struct.Struct("!IIIHH")  # sec,usec,caplen,l2type,pad
