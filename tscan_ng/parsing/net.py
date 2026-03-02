@@ -1,12 +1,37 @@
+"""
+parsing/net.py - Layer 2/3/4 packet parser for tscan-ng.
+
+Parses raw packet bytes into a normalized dict suitable for use by detectors.
+Supports Ethernet (DLT_EN10MB), raw IP (DLT_RAW), and Linux cooked capture
+(DLT_LINUX_SLL) link layer types.
+
+Returned dict fields:
+    src     (str)   - Source IP address (v4 or v6)
+    dst     (str)   - Destination IP address (v4 or v6)
+    tcp     (bool)  - True if transport layer is TCP
+    udp     (bool)  - True if transport layer is UDP
+    sport   (int)   - Source port
+    dport   (int)   - Destination port
+    payload (bytes) - Transport layer payload
+"""
+
 import socket
 import dpkt
 
-DLT_EN10MB   = 1
-DLT_RAW      = 12
-DLT_LINUX_SLL = 113
+DLT_EN10MB    = 1    # Standard Ethernet
+DLT_RAW       = 12   # Raw IP
+DLT_LINUX_SLL = 113  # Linux cooked capture
+
 
 def _ip_str(raw: bytes) -> str:
-    """Convert raw IP bytes to a readable string (v4 or v6)."""
+    """
+    Convert raw IP address bytes to a human-readable string.
+    Handles both IPv4 (4 bytes) and IPv6 (16 bytes).
+    Args:
+        raw: Raw IP address bytes from a dpkt IP/IP6 header.
+    Returns:
+        Dotted-decimal (IPv4) or colon-hex (IPv6) string, or empty string on error.
+    """
     try:
         if len(raw) == 4:
             return socket.inet_ntop(socket.AF_INET, raw)
@@ -16,8 +41,22 @@ def _ip_str(raw: bytes) -> str:
         pass
     return ""
 
-def parse_basic(l2type: int, data: bytes):
-    """ETH/RAW/SLL -> (IPv4/IPv6) -> TCP/UDP. Return a small dict or None."""
+
+def parse_basic(l2type: int, data: bytes) -> dict | None:
+    """
+    Parse a raw packet into a normalized dict for detector consumption.
+
+    Walks the packet from Layer 2 through Layer 4. Returns None if the packet
+    is not IPv4/IPv6, not TCP/UDP, or cannot be parsed.
+
+    Args:
+        l2type: libpcap datalink type (e.g. DLT_EN10MB, DLT_RAW, DLT_LINUX_SLL).
+        data:   Raw packet bytes as captured by libpcap.
+
+    Returns:
+        A dict with keys: src, dst, tcp, udp, sport, dport, payload.
+        Returns None if the packet is not parseable or not of interest.
+    """
     try:
         if l2type == DLT_EN10MB:
             eth = dpkt.ethernet.Ethernet(data)
