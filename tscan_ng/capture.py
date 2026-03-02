@@ -1,3 +1,17 @@
+"""
+capture.py - Low-level pcap capture process for tscan-ng.
+
+Opens a network interface in promiscuous mode using libpcap via ctypes,
+captures packets at line speed, and forwards them to the dispatcher via
+a Unix datagram socket.
+
+Each packet is prefixed with a fixed-size header:
+    HDR = struct.Struct("!IIIHH")  # sec, usec, caplen, l2type, pad
+
+Usage:
+    python -m tscan_ng.capture -i <iface> -s <socket_path> [options]
+"""
+
 import os, sys, ctypes, ctypes.util, multiprocessing as mp
 
 PCAP_ERRBUF_SIZE = 256
@@ -9,10 +23,16 @@ pcap = ctypes.CDLL(libpcap_path)
 pcap_t = ctypes.c_void_p
 
 class timeval(ctypes.Structure):
+    """Maps to C struct timeval (tv_sec, tv_usec)."""
     _fields_ = [("tv_sec", ctypes.c_long), ("tv_usec", ctypes.c_long)]
+
+
 class pcap_pkthdr(ctypes.Structure):
+    """Maps to C struct pcap_pkthdr (timestamp, capture length, wire length)."""
     _fields_ = [("ts", timeval), ("caplen", ctypes.c_uint32), ("len", ctypes.c_uint32)]
 
+
+# libpcap function bindings
 pcap_create = pcap.pcap_create; pcap_create.argtypes=[ctypes.c_char_p, ctypes.c_char_p]; pcap_create.restype=pcap_t
 pcap_set_buffer_size = pcap.pcap_set_buffer_size; pcap_set_buffer_size.argtypes=[pcap_t, ctypes.c_int]
 pcap_set_snaplen = pcap.pcap_set_snaplen; pcap_set_snaplen.argtypes=[pcap_t, ctypes.c_int]
@@ -22,7 +42,7 @@ pcap_activate = pcap.pcap_activate; pcap_activate.argtypes=[pcap_t]; pcap_activa
 pcap_datalink = pcap.pcap_datalink; pcap_datalink.argtypes=[pcap_t]; pcap_datalink.restype=ctypes.c_int
 pcap_geterr = pcap.pcap_geterr; pcap_geterr.argtypes=[pcap_t]; pcap_geterr.restype=ctypes.c_char_p
 
-# Change 1: proper argtypes using pcap_pkthdr instead of unsafe c_ubyte cast
+# Proper argtypes using pcap_pkthdr avoids unsafe c_ubyte cast
 pcap_next_ex = pcap.pcap_next_ex
 pcap_next_ex.argtypes = [
     pcap_t,
@@ -38,11 +58,31 @@ except AttributeError:
     pcap_set_immediate_mode = None
 
 def _err(pc):
-    return (pcap_geterr(pc) or b"unknown").decode("utf-8","ignore")
+    """Return a human-readable error string from a pcap handle."""
+    return (pcap_geterr(pc) or b"unknown").decode("utf-8", "ignore")
 
 def capture_into_unix_dgram(iface: str, sock_path: str, buf_bytes=32*1024*1024, snaplen=65535, immediate=True):
+    """
+    Capture packets from a network interface and forward them to the dispatcher.
+
+    Opens the specified interface with libpcap in promiscuous mode and sends
+    each captured packet — prefixed with a metadata header — to the dispatcher
+    via a connected Unix datagram socket.
+
+    The packet header format is:
+        struct { uint32 sec; uint32 usec; uint32 caplen; uint16 l2type; uint16 pad; }
+
+    Args:
+        iface:      Network interface name to capture from (e.g. "eth1").
+        sock_path:  Path to the dispatcher's Unix datagram socket.
+        buf_bytes:  Kernel capture buffer size in bytes (default: 32MB).
+        snaplen:    Maximum bytes to capture per packet (default: 65535).
+        immediate:  If True, enable immediate mode for low-latency capture.
+                    Falls back to 1ms timeout if immediate mode is unavailable.
+    """
     import struct, socket
     HDR = struct.Struct("!IIIHH")  # sec,usec,caplen,l2type,pad
+    
     s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     s.connect(sock_path)
 
@@ -54,7 +94,7 @@ def capture_into_unix_dgram(iface: str, sock_path: str, buf_bytes=32*1024*1024, 
     pcap_set_snaplen(pc, snaplen)
     pcap_set_promisc(pc, 1)
 
-    # Change 2: use timeout=1 as fallback if immediate mode unavailable to avoid busy-loop
+    # Use timeout=0 only when immediate mode is active to avoid busy-looping
     if immediate and pcap_set_immediate_mode:
         pcap_set_immediate_mode(pc, 1)
         pcap_set_timeout(pc, 0)
@@ -66,8 +106,6 @@ def capture_into_unix_dgram(iface: str, sock_path: str, buf_bytes=32*1024*1024, 
         print(f"pcap_activate: {_err(pc)}", file=sys.stderr); os._exit(3)
 
     dlt = pcap_datalink(pc)
-
-    # Change 1: clean call without manual cast
     hdr_ptr = ctypes.POINTER(pcap_pkthdr)()
     data_ptr = ctypes.POINTER(ctypes.c_ubyte)()
 
@@ -92,13 +130,18 @@ def capture_into_unix_dgram(iface: str, sock_path: str, buf_bytes=32*1024*1024, 
         except Exception:
             pass
 
+
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("-i","--iface", required=True)
-    ap.add_argument("-s","--socket", required=True)
-    ap.add_argument("-B","--buffer-bytes", type=int, default=32*1024*1024)
-    ap.add_argument("--snaplen", type=int, default=65535)
-    ap.add_argument("--no-immediate", action="store_true")
+    ap = argparse.ArgumentParser(description="tscan-ng pcap capture process.")
+    ap.add_argument("-i", "--iface", required=True, help="Network interface to capture from.")
+    ap.add_argument("-s", "--socket", required=True, help="Path to dispatcher Unix datagram socket.")
+    ap.add_argument("-B", "--buffer-bytes", type=int, default=32*1024*1024,
+                    help="Kernel capture buffer size in bytes (default: 32MB).")
+    ap.add_argument("--snaplen", type=int, default=65535,
+                    help="Maximum bytes to capture per packet (default: 65535).")
+    ap.add_argument("--no-immediate", action="store_true",
+                    help="Disable immediate mode (use 1ms timeout instead).")
     args = ap.parse_args()
-    capture_into_unix_dgram(args.iface, args.socket, args.buffer_bytes, args.snaplen, immediate=not args.no_immediate)
+    capture_into_unix_dgram(args.iface, args.socket, args.buffer_bytes,
+                            args.snaplen, immediate=not args.no_immediate)
