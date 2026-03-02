@@ -1,12 +1,41 @@
-import os, orjson as json
+"""
+sinks/jsonl.py - JSONL output sink for tscan-ng detection findings.
+
+Writes detection findings as newline-delimited JSON (JSONL) to either a file
+or stdout. Uses orjson for fast serialization.
+
+Each worker process opens its own file handle. On Linux, O_APPEND writes
+are atomic for small payloads, making concurrent multi-worker writes safe
+in practice for typical finding sizes.
+"""
+
+import os
+import orjson as json
+
 
 class JSONLSink:
-    def __init__(self, path: str|None):
+    """
+    Writes detection findings to a JSONL file or stdout.
+    Args:
+        path: Filesystem path to the output file, or None to write to stdout.
+    """
+
+    def __init__(self, path: str | None):
+        """
+        Open the output file in binary append mode with no buffering.
+        Args:
+            path: Output file path, or None for stdout.
+        """
         self._fd = None
         if path:
             self._fd = open(path, "ab", buffering=0)
 
     def write(self, obj: dict):
+        """
+        Serialize obj to JSON and write it as a single line.
+        Args:
+            obj: Dictionary to serialize. Must be orjson-serializable.
+        """
         line = json.dumps(obj) + b"\n"
         if self._fd:
             self._fd.write(line)
