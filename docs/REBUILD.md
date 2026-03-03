@@ -117,6 +117,24 @@ sudo -u tscan -H bash -lc '
 '
 ```
 
+## Configuration
+
+Copy and edit the runtime config:
+```bash
+sudo cp /opt/tscan/tscan.conf /opt/tscan/tscan.conf
+sudo chown tscan:tscan /opt/tscan/tscan.conf
+sudo chmod 640 /opt/tscan/tscan.conf
+```
+
+Edit `/opt/tscan/tscan.conf` and set at minimum:
+```ini
+[capture]
+iface = 
+```
+
+All other values have safe defaults. See the config file for documentation
+of every setting.
+
 ---
 
 ## Logging Directory
