@@ -1,5 +1,6 @@
 # REBUILD.md
-**tscan-ng – Rebuild & Deployment Guide (U02)**
+**tscan-ng – Rebuild & Deployment Guide**
+**Host: U01**
 
 ## Purpose
 
@@ -118,12 +119,11 @@ sudo -u tscan -H bash -lc '
 
 Copy the example config and set ownership:
 ```bash
-sudo cp /opt/tscan/tscan-ng.conf /opt/tscan/tscan-ng.conf
-sudo chown tscan:tscan /opt/tscan/tscan-ng.conf
-sudo chmod 640 /opt/tscan/tscan-ng.conf
+sudo chown tscan:tscan /opt/tscan/tscan-ng/config/tscan-ng.conf
+sudo chmod 640 /opt/tscan/tscan-ng/config/tscan-ng.conf
 ```
 
-Edit `/opt/tscan/tscan-ng.conf` and set at minimum:
+Edit `/opt/tscan/tscan-ng/config/tscan-ng.conf` and set at minimum:
 ```ini
 [capture]
 iface = <your capture interface name>
