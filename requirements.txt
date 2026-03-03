@@ -1,6 +1,2 @@
-sudo -u tscan -H bash -lc "
-  cd /opt/tscan
-  source venv/bin/activate
-  pip freeze > requirements.txt
-  deactivate
-"
+dpkt==1.9.8
+orjson==3.11.3
