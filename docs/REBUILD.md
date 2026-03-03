@@ -44,7 +44,7 @@ Traffic generated *on this host* will **not** be seen by the capture NIC.
 |-------------------------------------------|--------------------------------|
 | `/opt/tscan`                              | Application root               |
 | `/opt/tscan/tscan_ng`                     | Python source                  |
-| `/opt/tscan/tscan_ng/config/tscan-ng.conf`| Runtime configuration          |
+| `/opt/tscan/tscan_ng/config/tscan_ng.conf`| Runtime configuration          |
 | `/opt/tscan/scripts`                      | Operational scripts            |
 | `/opt/tscan/systemd`                      | systemd unit files             |
 | `/opt/tscan/logrotate`                    | logrotate config               |
@@ -122,11 +122,11 @@ sudo -u tscan -H bash -lc '
 
 Set ownership and permissions on the config file:
 ```bash
-sudo chown tscan:tscan /opt/tscan/tscan_ng/config/tscan-ng.conf
+sudo chown tscan:tscan /opt/tscan/tscan_ng/config/tscan_ng.conf
 sudo chmod 640 /opt/tscan/tscan_ng/config/tscan-ng.conf
 ```
 
-Edit `/opt/tscan/tscan_ng/config/tscan-ng.conf` and set at minimum:
+Edit `/opt/tscan/tscan_ng/config/tscan_ng.conf` and set at minimum:
 ```ini
 [capture]
 iface = <your capture interface name>
@@ -136,7 +136,7 @@ All other values have safe defaults. See the config file itself for
 documentation of every setting.
 
 **Important:**  
-After editing `tscan-ng.conf`, both services must be restarted:
+After editing `tscan_ng.conf`, both services must be restarted:
 ```bash
 sudo systemctl restart tscan-dispatcher tscan-capture
 ```
@@ -236,7 +236,7 @@ sudo tail -f /var/log/tscan/results.jsonl
 | Item                                       | Owner      | Rationale                  |
 |--------------------------------------------|------------|----------------------------|
 | `/opt/tscan`                               | `tscan`    | Service integrity          |
-| `/opt/tscan/tscan_ng/config/tscan-ng.conf` | `tscan`    | Config security            |
+| `/opt/tscan/tscan_ng/config/tscan_ng.conf` | `tscan`    | Config security            |
 | `/opt/tscan/scripts/update.sh`             | `tscan`    | Ops script ownership       |
 | Git operations                             | `thoward`  | Developer access           |
 | No group sharing                           | enforced   | Least privilege            |
@@ -262,14 +262,14 @@ sudo systemctl restart tscan-dispatcher tscan-capture
 - Fix ownership and rerun logrotate
 
 ### Service starts but no output appears
-- Check `iface` is set correctly in `tscan-ng.conf`
+- Check `iface` is set correctly in `tscan_ng.conf`
 - Verify the capture NIC is receiving traffic:
 ```bash
 sudo tcpdump -ni <capture-interface> -c 10
 ```
 
 ### Config changes have no effect
-- Both services must be restarted after editing `tscan-ng.conf`:
+- Both services must be restarted after editing `tscan_ng.conf`:
 ```bash
 sudo systemctl restart tscan-dispatcher tscan-capture
 ```
@@ -286,7 +286,7 @@ sudo systemctl restart tscan-dispatcher tscan-capture
 - [ ] Service account created
 - [ ] Repo cloned
 - [ ] Virtualenv created
-- [ ] `tscan-ng.conf` permissions set and `iface` configured
+- [ ] `tscan_ng.conf` permissions set and `iface` configured
 - [ ] systemd units installed and enabled
 - [ ] logrotate installed
 - [ ] Capture NIC mirrored correctly
