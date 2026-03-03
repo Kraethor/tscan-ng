@@ -10,11 +10,17 @@ Flow affinity ensures all packets belonging to the same TCP/UDP session
 worker. Each worker maintains a SessionTable that buffers reassembled streams
 per flow in both directions.
 
+Per-packet detectors run on every parsed packet. Stream-aware detectors run
+after each packet is added to its session, operating on the full reassembled
+client and server buffers. Pending findings (credentials seen but no server
+response yet) are registered on the session and resolved when the response
+arrives, or closed out as no_response on session expiry.
+
 Phase status:
     Phase 1 - Flow affinity routing:        COMPLETE
     Phase 2 - Per-worker stream buffering:  COMPLETE
-    Phase 3 - Stream-aware detectors:       PENDING
-    Phase 4 - Response correlation:         PENDING
+    Phase 3 - Stream-aware detectors:       COMPLETE
+    Phase 4 - Response correlation:         COMPLETE
     Phase 5 - Session expiry and cleanup:   PARTIAL (expiry runs every 256 packets)
 
 Usage:
@@ -23,7 +29,7 @@ Usage:
 
 import argparse, os, struct, socket, multiprocessing as mp
 from tscan_ng.parsing.net import parse_basic
-from tscan_ng.detectors import DETECTORS
+from tscan_ng.detectors import DETECTORS, STREAM_DETECTORS
 from tscan_ng.sinks.jsonl import JSONLSink
 from tscan_ng.session import SessionTable
 
@@ -66,15 +72,12 @@ def worker_main(pipe, out_path: str | None):
 
     Receives (ts, l2type, buf) tuples from the dispatcher via a multiprocessing
     Pipe, parses each packet, accumulates it into the per-flow SessionTable,
-    runs all detectors, and writes any findings to the configured JSONLSink.
+    runs per-packet detectors, runs stream-aware detectors, resolves any
+    pending findings against newly arrived server responses, and writes all
+    findings to the configured JSONLSink.
 
-    All packets belonging to the same flow are guaranteed to arrive at this
-    worker due to flow-affinity routing in the dispatcher. The SessionTable
-    buffers client and server streams per flow in preparation for stream-aware
-    detection in Phase 3.
-
-    Session expiry runs every EXPIRY_INTERVAL packets to reclaim memory from
-    idle flows.
+    Session expiry runs every EXPIRY_INTERVAL packets. Expired sessions with
+    unresolved pending findings emit no_response findings before being removed.
 
     Args:
         pipe:     The child end of a multiprocessing.Pipe connection.
@@ -93,20 +96,45 @@ def worker_main(pipe, out_path: str | None):
         if not pkt:
             continue
 
-        # Accumulate packet into session stream buffers.
-        # Session object is available here for Phase 3 stream-aware detectors.
-        sessions.add_packet(pkt)
+        # Accumulate packet into session stream buffers
+        session = sessions.add_packet(pkt, ts)
 
-        # Run detectors (still per-packet in this phase)
+        # Run per-packet detectors
         for det in DETECTORS:
-            findings = det(pkt)
-            for f in findings:
+            for f in det(pkt):
                 sink.write({"ts": ts, **f})
 
-        # Periodically expire idle sessions to reclaim memory
+        # Run stream-aware detectors
+        for det in STREAM_DETECTORS:
+            for f in det(session, ts):
+                sink.write({"ts": ts, **f})
+
+        # Resolve any pending findings if a server response has now arrived
+        if session.pending and session.server_buf:
+            still_pending = []
+            for p in session.pending:
+                from tscan_ng.detectors.http_basic import _parse_response, _outcome
+                response = _parse_response(session.server_buf)
+                if response:
+                    status, status_text = response
+                    sink.write({
+                        **p.finding,
+                        "ts":          p.ts_start,
+                        "ts_start":    p.ts_start,
+                        "ts_end":      ts,
+                        "status":      status,
+                        "status_text": status_text,
+                        "outcome":     _outcome(status),
+                    })
+                else:
+                    still_pending.append(p)
+            session.pending = still_pending
+
+        # Periodically expire idle sessions and emit no_response findings
         packet_count += 1
         if packet_count & (EXPIRY_INTERVAL - 1) == 0:
-            sessions.expire()
+            for f in sessions.expire():
+                sink.write({"ts": f["ts_start"], **f})
 
 
 def dispatcher(socket_path: str, nworkers: int, out_path: str | None):
