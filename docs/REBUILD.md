@@ -40,17 +40,18 @@ Traffic generated *on this host* will **not** be seen by the capture NIC.
 
 ## Filesystem Layout
 
-| Path                          | Purpose                        |
-|-------------------------------|--------------------------------|
-| `/opt/tscan`                  | Application root               |
-| `/opt/tscan/tscan_ng`         | Python source                  |
-| `/opt/tscan/tscan-ng.conf`    | Runtime configuration          |
-| `/opt/tscan/systemd`          | systemd unit files             |
-| `/opt/tscan/logrotate`        | logrotate config               |
-| `/opt/tscan/docs`             | Documentation                  |
-| `/opt/tscan/venv`             | Python virtualenv              |
-| `/var/log/tscan`              | Runtime logs                   |
-| `/run/tscan`                  | Runtime socket (tmpfs)         |
+| Path                                      | Purpose                        |
+|-------------------------------------------|--------------------------------|
+| `/opt/tscan`                              | Application root               |
+| `/opt/tscan/tscan_ng`                     | Python source                  |
+| `/opt/tscan/tscan_ng/config/tscan-ng.conf`| Runtime configuration          |
+| `/opt/tscan/scripts`                      | Operational scripts            |
+| `/opt/tscan/systemd`                      | systemd unit files             |
+| `/opt/tscan/logrotate`                    | logrotate config               |
+| `/opt/tscan/docs`                         | Documentation                  |
+| `/opt/tscan/venv`                         | Python virtualenv              |
+| `/var/log/tscan`                          | Runtime logs                   |
+| `/run/tscan`                              | Runtime socket (tmpfs)         |
 
 ---
 
@@ -74,8 +75,7 @@ Create a **non-login** service user:
 ```bash
 sudo useradd \
   --system \
-  --create-home \
-  --home-dir /home/tscan \
+  --no-create-home \
   --shell /usr/sbin/nologin \
   tscan
 ```
@@ -84,6 +84,9 @@ Verify:
 ```bash
 getent passwd tscan
 ```
+**Note:**  
+This is a non-login service account with no home directory. It has no
+interactive access and exists solely to own and run the tscan-ng services.
 
 ---
 
@@ -117,13 +120,13 @@ sudo -u tscan -H bash -lc '
 
 ## Configuration
 
-Copy the example config and set ownership:
+Set ownership and permissions on the config file:
 ```bash
-sudo chown tscan:tscan /opt/tscan/tscan-ng/config/tscan-ng.conf
-sudo chmod 640 /opt/tscan/tscan-ng/config/tscan-ng.conf
+sudo chown tscan:tscan /opt/tscan/tscan_ng/config/tscan-ng.conf
+sudo chmod 640 /opt/tscan/tscan_ng/config/tscan-ng.conf
 ```
 
-Edit `/opt/tscan/tscan-ng/config/tscan-ng.conf` and set at minimum:
+Edit `/opt/tscan/tscan_ng/config/tscan-ng.conf` and set at minimum:
 ```ini
 [capture]
 iface = <your capture interface name>
@@ -187,6 +190,28 @@ su tscan tscan
 
 ---
 
+## Update Script
+
+For subsequent updates after initial deployment, use the update script:
+```bash
+sudo /opt/tscan/scripts/update.sh
+```
+
+The script will:
+- Stop both services in the correct order
+- Pull the latest code from the repository
+- Update Python dependencies if `requirements.txt` changed
+- Reinstall systemd units if they changed
+- Reload systemd if needed
+- Start both services in the correct order
+- Report final service status
+
+**Important:**  
+The update script must be run as root. It handles the correct service
+stop/start ordering automatically.
+
+---
+
 ## Runtime Verification
 
 ### Socket
@@ -208,13 +233,14 @@ sudo tail -f /var/log/tscan/results.jsonl
 
 ## Permissions Model (Intentional)
 
-| Item                  | Owner      | Rationale                  |
-|-----------------------|------------|----------------------------|
-| `/opt/tscan`          | `tscan`    | Service integrity          |
-| `tscan-ng.conf`       | `tscan`    | Config security            |
-| Git operations        | `thoward`  | Developer access           |
-| No group sharing      | enforced   | Least privilege            |
-| No login for `tscan`  | enforced   | Attack surface reduction   |
+| Item                                       | Owner      | Rationale                  |
+|--------------------------------------------|------------|----------------------------|
+| `/opt/tscan`                               | `tscan`    | Service integrity          |
+| `/opt/tscan/tscan_ng/config/tscan-ng.conf` | `tscan`    | Config security            |
+| `/opt/tscan/scripts/update.sh`             | `tscan`    | Ops script ownership       |
+| Git operations                             | `thoward`  | Developer access           |
+| No group sharing                           | enforced   | Least privilege            |
+| No login for `tscan`                       | enforced   | Attack surface reduction   |
 
 ---
 
@@ -228,7 +254,7 @@ sudo tail -f /var/log/tscan/results.jsonl
 - Dispatcher not running
 - Restart dispatcher first, then capture:
 ```bash
-  sudo systemctl restart tscan-dispatcher tscan-capture
+sudo systemctl restart tscan-dispatcher tscan-capture
 ```
 
 ### Logs stop updating after rotation
@@ -239,14 +265,18 @@ sudo tail -f /var/log/tscan/results.jsonl
 - Check `iface` is set correctly in `tscan-ng.conf`
 - Verify the capture NIC is receiving traffic:
 ```bash
-  sudo tcpdump -ni <capture-interface> -c 10
+sudo tcpdump -ni <capture-interface> -c 10
 ```
 
 ### Config changes have no effect
 - Both services must be restarted after editing `tscan-ng.conf`:
 ```bash
-  sudo systemctl restart tscan-dispatcher tscan-capture
+sudo systemctl restart tscan-dispatcher tscan-capture
 ```
+
+### Update script fails on git pull
+- GitHub credentials may have expired
+- Re-enter credentials when prompted, or configure SSH key auth for the `tscan` user
 
 ---
 
@@ -256,8 +286,9 @@ sudo tail -f /var/log/tscan/results.jsonl
 - [ ] Service account created
 - [ ] Repo cloned
 - [ ] Virtualenv created
-- [ ] `tscan-ng.conf` deployed and `iface` set correctly
-- [ ] systemd units installed
+- [ ] `tscan-ng.conf` permissions set and `iface` configured
+- [ ] systemd units installed and enabled
 - [ ] logrotate installed
 - [ ] Capture NIC mirrored correctly
-- [ ] Logs updating
+- [ ] Runtime verification complete (socket, NIC, output)
+- [ ] Update script tested: `sudo /opt/tscan/scripts/update.sh`
