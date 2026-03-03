@@ -5,6 +5,9 @@ Receives raw packets from the capture process via a Unix datagram socket,
 dispatches them to a pool of worker processes using flow-affinity routing,
 and writes detection findings to a JSONL sink.
 
+Configuration is loaded from /opt/tscan/tscan.conf at startup. See
+tscan_ng/config.py for all available settings and their defaults.
+
 Flow affinity ensures all packets belonging to the same TCP/UDP session
 (identified by src_ip, dst_ip, sport, dport) are always routed to the same
 worker. Each worker maintains a SessionTable that buffers reassembled streams
@@ -14,30 +17,25 @@ Per-packet detectors run on every parsed packet. Stream-aware detectors run
 after each packet is added to its session, operating on the full reassembled
 client and server buffers. Pending findings (credentials seen but no server
 response yet) are registered on the session and resolved when the response
-arrives, or closed out as no_response on session expiry.
+arrives, or closed out as no_response on session expiry or shutdown.
 
 Phase status:
     Phase 1 - Flow affinity routing:        COMPLETE
     Phase 2 - Per-worker stream buffering:  COMPLETE
     Phase 3 - Stream-aware detectors:       COMPLETE
     Phase 4 - Response correlation:         COMPLETE
-    Phase 5 - Session expiry and cleanup:   PARTIAL (expiry runs every 256 packets)
-
-Usage:
-    python -m tscan_ng.run --socket /run/tscan/tscan.sock [--workers N] [--out /path/to/results.jsonl]
+    Phase 5 - Session expiry and cleanup:   COMPLETE
 """
 
-import argparse, os, struct, socket, multiprocessing as mp
+import os, struct, socket, time, multiprocessing as mp
+from tscan_ng.config import Config
 from tscan_ng.parsing.net import parse_basic
 from tscan_ng.detectors import DETECTORS, STREAM_DETECTORS
+from tscan_ng.detectors.http_basic import _parse_response, _outcome
 from tscan_ng.sinks.jsonl import JSONLSink
 from tscan_ng.session import SessionTable
 
 HDR = struct.Struct("!IIIHH")  # sec, usec, caplen, l2type, pad
-
-# How often (in packets) each worker runs session expiry.
-# A power of 2 allows a cheap bitmask check instead of modulo.
-EXPIRY_INTERVAL = 256
 
 
 def _flow_key(src: str, dst: str, sport: int, dport: int) -> int:
@@ -66,7 +64,7 @@ def _flow_key(src: str, dst: str, sport: int, dport: int) -> int:
     return hash((a, b)) & 0x7FFFFFFF
 
 
-def worker_main(pipe, out_path: str | None):
+def worker_main(pipe, cfg: Config):
     """
     Worker process entry point.
 
@@ -76,21 +74,29 @@ def worker_main(pipe, out_path: str | None):
     pending findings against newly arrived server responses, and writes all
     findings to the configured JSONLSink.
 
-    Session expiry runs every EXPIRY_INTERVAL packets. Expired sessions with
-    unresolved pending findings emit no_response findings before being removed.
+    Session expiry runs on a wall-clock timer using cfg.expiry_interval.
+    On shutdown (None sentinel received), all remaining sessions are flushed
+    and any pending findings are emitted as no_response before exit.
 
     Args:
-        pipe:     The child end of a multiprocessing.Pipe connection.
-        out_path: Path to the JSONL output file, or None to write to stdout.
+        pipe: The child end of a multiprocessing.Pipe connection.
+        cfg:  Loaded Config object.
     """
-    sink = JSONLSink(out_path if out_path else None)
-    sessions = SessionTable()
-    packet_count = 0
+    sink = JSONLSink(cfg.out_path or None)
+    sessions = SessionTable(
+        max_buf=cfg.session_max_buf,
+        timeout=cfg.session_timeout,
+    )
+    last_expiry = time.monotonic()
 
     while True:
         msg = pipe.recv()
         if msg is None:
+            # Shutdown — flush all remaining sessions
+            for f in sessions.flush_all():
+                sink.write({"ts": f["ts_start"], **f})
             break
+
         ts, l2type, buf = msg
         pkt = parse_basic(l2type, buf)
         if not pkt:
@@ -113,7 +119,6 @@ def worker_main(pipe, out_path: str | None):
         if session.pending and session.server_buf:
             still_pending = []
             for p in session.pending:
-                from tscan_ng.detectors.http_basic import _parse_response, _outcome
                 response = _parse_response(session.server_buf)
                 if response:
                     status, status_text = response
@@ -130,14 +135,15 @@ def worker_main(pipe, out_path: str | None):
                     still_pending.append(p)
             session.pending = still_pending
 
-        # Periodically expire idle sessions and emit no_response findings
-        packet_count += 1
-        if packet_count & (EXPIRY_INTERVAL - 1) == 0:
+        # Run expiry on wall-clock timer
+        now = time.monotonic()
+        if now - last_expiry >= cfg.expiry_interval:
             for f in sessions.expire():
                 sink.write({"ts": f["ts_start"], **f})
+            last_expiry = now
 
 
-def dispatcher(socket_path: str, nworkers: int, out_path: str | None):
+def dispatcher(cfg: Config):
     """
     Main dispatcher loop.
 
@@ -151,27 +157,25 @@ def dispatcher(socket_path: str, nworkers: int, out_path: str | None):
     back to round-robin dispatch.
 
     Shuts down cleanly on KeyboardInterrupt, sending a None sentinel to each
-    worker to signal termination.
+    worker to signal termination and allow graceful session flushing.
 
     Args:
-        socket_path: Filesystem path for the Unix datagram socket.
-        nworkers:    Number of worker processes to spawn.
-        out_path:    Path to the JSONL output file, or None for stdout.
+        cfg: Loaded Config object.
     """
     # Spawn workers
     parents, procs = [], []
-    for _ in range(nworkers):
+    for _ in range(cfg.workers):
         p_end, c_end = mp.Pipe()
-        p = mp.Process(target=worker_main, args=(c_end, out_path), daemon=True)
+        p = mp.Process(target=worker_main, args=(c_end, cfg), daemon=True)
         p.start(); c_end.close()
         parents.append(p_end); procs.append(p)
 
     # Bind Unix datagram socket to receive from capture process
-    if os.path.exists(socket_path):
-        os.unlink(socket_path)
+    if os.path.exists(cfg.socket_path):
+        os.unlink(cfg.socket_path)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    s.bind(socket_path)
-    os.chmod(socket_path, 0o660)
+    s.bind(cfg.socket_path)
+    os.chmod(cfg.socket_path, 0o660)
 
     rr = 0  # round-robin fallback counter for unparseable packets
     try:
@@ -188,9 +192,9 @@ def dispatcher(socket_path: str, nworkers: int, out_path: str | None):
             pkt = parse_basic(l2type, payload)
             if pkt:
                 worker_idx = _flow_key(pkt["src"], pkt["dst"],
-                                       pkt["sport"], pkt["dport"]) % nworkers
+                                       pkt["sport"], pkt["dport"]) % cfg.workers
             else:
-                worker_idx = rr % nworkers
+                worker_idx = rr % cfg.workers
                 rr += 1
 
             parents[worker_idx].send((ts, l2type, payload))
@@ -202,15 +206,9 @@ def dispatcher(socket_path: str, nworkers: int, out_path: str | None):
             try: pe.send(None)
             except BrokenPipeError: pass
         for p in procs:
-            p.join(timeout=1)
+            p.join(timeout=5)
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="tscan-ng dispatcher and worker pool.")
-    ap.add_argument("--socket", required=True, help="Path to Unix datagram socket.")
-    ap.add_argument("--workers", type=int, default=max(1, os.cpu_count() or 1),
-                    help="Number of worker processes (default: CPU count).")
-    ap.add_argument("--out", default="/var/log/tscan/results.jsonl",
-                    help="Output JSONL file path (default: /var/log/tscan/results.jsonl).")
-    args = ap.parse_args()
-    dispatcher(args.socket, args.workers, args.out or None)
+    cfg = Config()
+    dispatcher(cfg)
