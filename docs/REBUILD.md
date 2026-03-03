@@ -297,6 +297,14 @@ sudo tcpdump -ni <capture-interface> -c 10
 sudo systemctl restart tscan-dispatcher tscan-capture
 ```
 
+### Capture fails with `Operation not permitted`
+- The Python binary is missing `CAP_NET_RAW` capability
+- Fix:
+```bash
+sudo setcap cap_net_raw+eip /usr/bin/python3.12
+sudo systemctl restart tscan-capture
+```
+
 ### Update script fails on git pull
 - GitHub credentials may have expired
 - Re-enter credentials when prompted, or configure SSH key auth for the `tscan` user
