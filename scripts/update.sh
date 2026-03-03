@@ -38,7 +38,7 @@ if [ -f "${APP_DIR}/requirements.txt" ]; then
     cd '${APP_DIR}'
     if [ -d 'venv' ]; then
       source venv/bin/activate
-      pip install --upgrade -r requirements.txt
+      PIP_NO_CACHE_DIR=1 pip install --upgrade -r requirements.txt
       deactivate
     else
       echo '[!] venv not found, skipping pip install' >&2
