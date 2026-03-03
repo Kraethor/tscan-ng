@@ -1,7 +1,26 @@
+"""
+detectors/http_basic.py - HTTP Basic Auth credential detector for tscan-ng.
+
+Detects credentials submitted via HTTP Basic Authentication by scanning
+raw TCP payloads for Authorization: Basic headers.
+
+Note: This is a naive MVP implementation that operates on raw TCP payloads
+and does not perform full HTTP request reassembly.
+"""
+
 from tscan_ng.detectors.common import decode_b64
 
-def detect(pkt):
-    """Find HTTP Basic creds in raw TCP payload (naive MVP)."""
+
+def detect(pkt: dict) -> list[dict]:
+    """
+    Detect HTTP Basic Auth credentials in a TCP packet.
+    Scans the raw TCP payload for an Authorization: Basic header and
+    decodes the base64-encoded credentials if found.
+    Args:
+        pkt: Normalized packet dict from parsing.net.parse_basic.
+    Returns:
+        List of finding dicts, empty if no credentials found.
+    """
     if not pkt["tcp"]:
         return []
     p = pkt["payload"]
