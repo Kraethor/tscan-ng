@@ -7,8 +7,15 @@ and writes detection findings to a JSONL sink.
 
 Flow affinity ensures all packets belonging to the same TCP/UDP session
 (identified by src_ip, dst_ip, sport, dport) are always routed to the same
-worker. This is a prerequisite for stateful stream reassembly and response
-correlation in later phases.
+worker. Each worker maintains a SessionTable that buffers reassembled streams
+per flow in both directions.
+
+Phase status:
+    Phase 1 - Flow affinity routing:        COMPLETE
+    Phase 2 - Per-worker stream buffering:  COMPLETE
+    Phase 3 - Stream-aware detectors:       PENDING
+    Phase 4 - Response correlation:         PENDING
+    Phase 5 - Session expiry and cleanup:   PARTIAL (expiry runs every 256 packets)
 
 Usage:
     python -m tscan_ng.run --socket /run/tscan/tscan.sock [--workers N] [--out /path/to/results.jsonl]
@@ -18,8 +25,13 @@ import argparse, os, struct, socket, multiprocessing as mp
 from tscan_ng.parsing.net import parse_basic
 from tscan_ng.detectors import DETECTORS
 from tscan_ng.sinks.jsonl import JSONLSink
+from tscan_ng.session import SessionTable
 
 HDR = struct.Struct("!IIIHH")  # sec, usec, caplen, l2type, pad
+
+# How often (in packets) each worker runs session expiry.
+# A power of 2 allows a cheap bitmask check instead of modulo.
+EXPIRY_INTERVAL = 256
 
 
 def _flow_key(src: str, dst: str, sport: int, dport: int) -> int:
@@ -42,7 +54,6 @@ def _flow_key(src: str, dst: str, sport: int, dport: int) -> int:
         A stable non-negative integer hash suitable for worker selection
         via modulo.
     """
-    # Sort src/dst so both directions of a flow hash identically
     a, b = (src, sport), (dst, dport)
     if a > b:
         a, b = b, a
@@ -54,19 +65,25 @@ def worker_main(pipe, out_path: str | None):
     Worker process entry point.
 
     Receives (ts, l2type, buf) tuples from the dispatcher via a multiprocessing
-    Pipe, parses each packet, runs all detectors, and writes any findings to
-    the configured JSONLSink.
+    Pipe, parses each packet, accumulates it into the per-flow SessionTable,
+    runs all detectors, and writes any findings to the configured JSONLSink.
 
-    All packets belonging to the same flow are guaranteed to arrive at the
-    same worker due to flow-affinity routing in the dispatcher. This makes
-    this function the correct place to add per-flow session state in later
-    phases.
+    All packets belonging to the same flow are guaranteed to arrive at this
+    worker due to flow-affinity routing in the dispatcher. The SessionTable
+    buffers client and server streams per flow in preparation for stream-aware
+    detection in Phase 3.
+
+    Session expiry runs every EXPIRY_INTERVAL packets to reclaim memory from
+    idle flows.
 
     Args:
         pipe:     The child end of a multiprocessing.Pipe connection.
         out_path: Path to the JSONL output file, or None to write to stdout.
     """
     sink = JSONLSink(out_path if out_path else None)
+    sessions = SessionTable()
+    packet_count = 0
+
     while True:
         msg = pipe.recv()
         if msg is None:
@@ -75,10 +92,21 @@ def worker_main(pipe, out_path: str | None):
         pkt = parse_basic(l2type, buf)
         if not pkt:
             continue
+
+        # Accumulate packet into session stream buffers.
+        # Session object is available here for Phase 3 stream-aware detectors.
+        sessions.add_packet(pkt)
+
+        # Run detectors (still per-packet in this phase)
         for det in DETECTORS:
             findings = det(pkt)
             for f in findings:
                 sink.write({"ts": ts, **f})
+
+        # Periodically expire idle sessions to reclaim memory
+        packet_count += 1
+        if packet_count & (EXPIRY_INTERVAL - 1) == 0:
+            sessions.expire()
 
 
 def dispatcher(socket_path: str, nworkers: int, out_path: str | None):
@@ -90,7 +118,7 @@ def dispatcher(socket_path: str, nworkers: int, out_path: str | None):
     flow-affinity hashing on (src_ip, dst_ip, sport, dport).
 
     Flow affinity guarantees that all packets from a given TCP/UDP session
-    are handled by the same worker, which is required for future stateful
+    are handled by the same worker, which is required for stateful stream
     processing. Packets that cannot be parsed for flow key extraction fall
     back to round-robin dispatch.
 
