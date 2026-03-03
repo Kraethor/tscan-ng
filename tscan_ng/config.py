@@ -32,7 +32,7 @@ Config file format:
 import configparser
 import os
 
-DEFAULT_CONFIG_PATH = "/opt/tscan/tscan-ng.conf"
+DEFAULT_CONFIG_PATH = "/opt/tscan/tscan-ng/config/tscan-ng.conf"
 
 
 class Config:
