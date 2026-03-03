@@ -32,18 +32,18 @@ Config file format:
 import configparser
 import os
 
-DEFAULT_CONFIG_PATH = "/opt/tscan/tscan-ng/config/tscan-ng.conf"
+DEFAULT_CONFIG_PATH = "/opt/tscan/tscan_ng/config/tscan_ng.conf"
 
 
 class Config:
     """
-    Typed configuration accessor for tscan-ng.
+    Typed configuration accessor for tscan_ng.
 
     Reads from an INI-style config file. All values have safe defaults
     so the service starts correctly even with a minimal config.
 
     Args:
-        path: Path to the config file. Defaults to /opt/tscan/tscan.conf.
+        path: Path to the config file. Defaults to /opt/tscan/tscan_ng/config/tscan_ng.conf.
     """
 
     def __init__(self, path: str = DEFAULT_CONFIG_PATH):
