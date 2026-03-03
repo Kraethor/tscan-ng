@@ -115,6 +115,29 @@ sudo -u tscan -H bash -lc '
   deactivate
 '
 ```
+## Grant Capture Capabilities
+
+Allow the Python binary to open raw sockets for pcap capture without
+running as root:
+```bash
+sudo setcap cap_net_raw+eip /usr/bin/python3.12
+```
+
+Verify:
+```bash
+getcap /usr/bin/python3.12
+```
+
+Expected output:
+```
+/usr/bin/python3.12 cap_net_raw=eip
+```
+
+**Important:**  
+This capability is set on the system Python binary directly. If Python
+is upgraded via `apt`, the new binary may not have this capability set
+and the capture service will fail with `Operation not permitted`. After
+any system Python upgrade, reapply this command and restart the services.
 
 ---
 
