@@ -5,8 +5,8 @@ Receives raw packets from the capture process via a Unix datagram socket,
 dispatches them to a pool of worker processes using flow-affinity routing,
 and writes detection findings to a JSONL sink.
 
-Configuration is loaded from /opt/tscan/tscan.conf at startup. See
-tscan_ng/config.py for all available settings and their defaults.
+Configuration is loaded from /opt/tscan/tscan_ng/config/tscan_ng.conf at
+startup. See tscan_ng/config.py for all available settings and their defaults.
 
 Flow affinity ensures all packets belonging to the same TCP/UDP session
 (identified by src_ip, dst_ip, sport, dport) are always routed to the same
@@ -32,6 +32,7 @@ from tscan_ng.config import Config
 from tscan_ng.parsing.net import parse_basic
 from tscan_ng.detectors import DETECTORS, STREAM_DETECTORS
 from tscan_ng.detectors.http_basic import _parse_response, _outcome
+from tscan_ng.detectors.imap import _IMAP_RESPONSE_RE, _outcome as _imap_outcome
 from tscan_ng.sinks.jsonl import JSONLSink
 from tscan_ng.session import SessionTable
 
@@ -62,6 +63,54 @@ def _flow_key(src: str, dst: str, sport: int, dport: int) -> int:
     if a > b:
         a, b = b, a
     return hash((a, b)) & 0x7FFFFFFF
+
+
+def _try_resolve(p, session, ts: float) -> dict | None:
+    """
+    Attempt to resolve a pending finding against available server buffer data.
+
+    Dispatches to the appropriate resolver based on the finding type.
+    Returns a completed finding dict if resolved, or None if still pending.
+
+    Args:
+        p:       PendingFinding object from the session.
+        session: Session object containing server_buf.
+        ts:      Unix timestamp of the current packet.
+
+    Returns:
+        Completed finding dict if resolved, None otherwise.
+    """
+    finding_type = p.finding.get("type", "")
+
+    if finding_type == "http_basic":
+        response = _parse_response(session.server_buf)
+        if response:
+            status, status_text = response
+            return {
+                **p.finding,
+                "ts":          p.ts_start,
+                "ts_start":    p.ts_start,
+                "ts_end":      ts,
+                "status":      status,
+                "status_text": status_text,
+                "outcome":     _outcome(status),
+            }
+
+    elif finding_type == "imap_creds":
+        tag = p.finding.get("tag", "")
+        server_text = session.server_buf.decode("utf-8", "ignore")
+        for resp_match in _IMAP_RESPONSE_RE.finditer(server_text):
+            if resp_match.group(1).upper() == tag.upper():
+                status = resp_match.group(2).upper()
+                return {
+                    **p.finding,
+                    "ts_start":    p.ts_start,
+                    "ts_end":      ts,
+                    "status":      status,
+                    "outcome":     _imap_outcome(status),
+                }
+
+    return None
 
 
 def worker_main(pipe, cfg: Config):
@@ -119,18 +168,9 @@ def worker_main(pipe, cfg: Config):
         if session.pending and session.server_buf:
             still_pending = []
             for p in session.pending:
-                response = _parse_response(session.server_buf)
-                if response:
-                    status, status_text = response
-                    sink.write({
-                        **p.finding,
-                        "ts":          p.ts_start,
-                        "ts_start":    p.ts_start,
-                        "ts_end":      ts,
-                        "status":      status,
-                        "status_text": status_text,
-                        "outcome":     _outcome(status),
-                    })
+                resolved = _try_resolve(p, session, ts)
+                if resolved:
+                    sink.write(resolved)
                 else:
                     still_pending.append(p)
             session.pending = still_pending
