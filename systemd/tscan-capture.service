@@ -1,20 +1,17 @@
 [Unit]
-Description=tscan-ng libpcap capture
-After=network.target tscan-dispatcher.service
+Description=tscan-ng pcap capture process
+After=tscan-dispatcher.service
 Requires=tscan-dispatcher.service
+Documentation=file:/opt/tscan/docs/REBUILD.md
 
 [Service]
 Type=simple
-User=root
-Group=root
-Environment="PATH=/opt/tscan/venv/bin:/usr/bin:/bin"
+User=tscan
+Group=tscan
 WorkingDirectory=/opt/tscan
-# Wait up to 30s for dispatcher to bind the socket
-ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -S /run/tscan/tscan.sock ] && exit 0; sleep 1; done; echo "socket not ready"; exit 1'
-ExecStart=/opt/tscan/venv/bin/python -u -m tscan_ng.capture -i enx606d3cba05d2 -s /run/tscan/tscan.sock -B 33554432
+ExecStart=/opt/tscan/venv/bin/python -m tscan_ng.capture
 Restart=on-failure
-RestartSec=2
-LimitNOFILE=65536
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
