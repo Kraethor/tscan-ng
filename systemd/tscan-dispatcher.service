@@ -1,20 +1,18 @@
 [Unit]
-Description=tscan-ng dispatcher + workers
+Description=tscan-ng dispatcher and worker pool
 After=network.target
-Wants=tscan-capture.service
+Documentation=file:/opt/tscan/docs/REBUILD.md
 
 [Service]
 Type=simple
 User=tscan
 Group=tscan
-Environment="PATH=/opt/tscan/venv/bin:/usr/bin:/bin"
 WorkingDirectory=/opt/tscan
-RuntimeDirectory=tscan
-RuntimeDirectoryMode=0755
-ExecStart=/opt/tscan/venv/bin/python -u -m tscan_ng.run --socket /run/tscan/tscan.sock --workers 4 --out /var/log/tscan/results.jsonl
+ExecStart=/opt/tscan/venv/bin/python -m tscan_ng.run
 Restart=on-failure
-LimitNOFILE=65536
-NoNewPrivileges=yes
+RestartSec=5
+RuntimeDirectory=tscan
+RuntimeDirectoryMode=0750
 
 [Install]
 WantedBy=multi-user.target
