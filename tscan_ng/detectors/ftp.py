@@ -83,6 +83,9 @@ def detect(pkt: dict) -> list[dict]:
 
 
 def detect_stream(session, ts: float) -> list[dict]:
+    # Only process FTP control connections
+    if session.dport != 21 and session.sport != 21:
+        return []
     import sys
     print(f"FTP detect_stream: sport={session.sport} dport={session.dport}", file=sys.stderr)
     print(f"  client_buf: {bytes(session.client_buf[:100])}", file=sys.stderr)
