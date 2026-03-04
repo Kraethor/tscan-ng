@@ -164,6 +164,10 @@ def worker_main(pipe, cfg: Config):
         if not pkt:
             continue
 
+        if pkt and (pkt.get("dport") == 21 or pkt.get("sport") == 21):
+            import sys
+            print(f"FTP packet: src={pkt['src']}:{pkt['sport']} dst={pkt['dst']}:{pkt['dport']}", file=sys.stderr)
+    
         # Accumulate packet into session stream buffers
         session = sessions.add_packet(pkt, ts)
 
