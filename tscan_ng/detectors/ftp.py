@@ -83,6 +83,10 @@ def detect(pkt: dict) -> list[dict]:
 
 
 def detect_stream(session, ts: float) -> list[dict]:
+    import sys
+    print(f"FTP detect_stream: sport={session.sport} dport={session.dport}", file=sys.stderr)
+    print(f"  client_buf: {bytes(session.client_buf[:100])}", file=sys.stderr)
+    print(f"  server_buf: {bytes(session.server_buf[:100])}", file=sys.stderr)
     """
     Stream-aware FTP credential detector.
 
