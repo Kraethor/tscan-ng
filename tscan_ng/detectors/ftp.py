@@ -39,7 +39,7 @@ _FTP_PASS_RE = re.compile(
 # Matches FTP server response codes we care about.
 # Handles both single-line (230 ) and multi-line (230-) responses.
 _FTP_RESPONSE_RE = re.compile(
-    rb"^(230|530|421)[ -]",
+    rb"^(230|530|421) ",
     re.MULTILINE
 )
 
