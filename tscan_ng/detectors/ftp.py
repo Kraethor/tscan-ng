@@ -13,6 +13,11 @@ Handles the standard FTP authentication flow:
 
 Also detects anonymous FTP logins and flags them separately.
 
+FTP is a server-initiated protocol — the server sends a 220 banner before
+the client sends USER. This means the session may be created with the server
+as the canonical src, causing client and server buffers to be inverted.
+The detector handles this by checking both buffers for USER/PASS commands.
+
 Finding outcomes:
     success      - Server responded with 230 Login successful
     failed       - Server responded with 530 Login incorrect
@@ -22,6 +27,7 @@ Finding outcomes:
 """
 
 import re
+import sys
 from tscan_ng.session import _make_filter
 
 # Matches FTP USER command
@@ -37,14 +43,12 @@ _FTP_PASS_RE = re.compile(
 )
 
 # Matches FTP server response codes we care about.
-# Handles both single-line (230 ) and multi-line (230-) responses.
+# Only matches terminating response lines (space after code, not hyphen).
+# Multi-line responses use 230- for continuation and 230 for termination.
 _FTP_RESPONSE_RE = re.compile(
     rb"^(230|530|421) ",
     re.MULTILINE
 )
-
-# Response codes that reset pending state without a successful login
-_FTP_RESET_CODES = {b"530", b"421"}
 
 
 def _outcome(code: bytes) -> str:
@@ -55,7 +59,7 @@ def _outcome(code: bytes) -> str:
         code: FTP 3-digit response code bytes.
 
     Returns:
-        One of: success, failed, server_error.
+        One of: success, failed, server_error, unknown.
     """
     if code == b"230":
         return "success"
@@ -83,19 +87,17 @@ def detect(pkt: dict) -> list[dict]:
 
 
 def detect_stream(session, ts: float) -> list[dict]:
-    # Only process FTP control connections
-    if session.dport != 21 and session.sport != 21:
-        return []
-    import sys
-    print(f"FTP detect_stream: sport={session.sport} dport={session.dport}", file=sys.stderr)
-    print(f"  client_buf: {bytes(session.client_buf[:100])}", file=sys.stderr)
-    print(f"  server_buf: {bytes(session.server_buf[:100])}", file=sys.stderr)
     """
     Stream-aware FTP credential detector.
 
     Scans the session's client buffer for FTP USER and PASS commands.
     Pairs them into credential findings and attempts to correlate with
     server response codes in the server buffer.
+
+    Handles the case where session direction is inverted for server-initiated
+    protocols like FTP, where the server sends the 220 banner before the
+    client sends USER. In this case the session may be created with the
+    server as the canonical src, so we check both buffers for USER/PASS.
 
     Handles anonymous FTP logins by flagging them with type
     "ftp_anonymous" instead of "ftp_creds".
@@ -113,8 +115,29 @@ def detect_stream(session, ts: float) -> list[dict]:
         List of resolved finding dicts. Pending findings are registered on
         the session and not returned until resolved.
     """
+    # Only process FTP control connections
+    if session.dport != 21 and session.sport != 21:
+        return []
+
+    # FTP is server-initiated (220 banner comes before USER) so the session
+    # may be created with the server as canonical src. Check both buffers
+    # for USER/PASS and use whichever contains the client commands.
+    if _FTP_USER_RE.search(bytes(session.client_buf)):
+        client_bytes = bytes(session.client_buf)
+        server_bytes = bytes(session.server_buf)
+        client_is_client = True
+    elif _FTP_USER_RE.search(bytes(session.server_buf)):
+        client_bytes = bytes(session.server_buf)
+        server_bytes = bytes(session.client_buf)
+        client_is_client = False
+    else:
+        return []
+
+    print(f"FTP detect_stream: sport={session.sport} dport={session.dport}", file=sys.stderr)
+    print(f"  client_bytes: {client_bytes[:100]}", file=sys.stderr)
+    print(f"  server_bytes: {server_bytes[:100]}", file=sys.stderr)
+
     findings = []
-    client_bytes = bytes(session.client_buf)
 
     # Find USER command
     user_match = _FTP_USER_RE.search(client_bytes)
@@ -144,7 +167,7 @@ def detect_stream(session, ts: float) -> list[dict]:
     }
 
     # Attempt to correlate with a server response
-    response = _FTP_RESPONSE_RE.search(bytes(session.server_buf))
+    response = _FTP_RESPONSE_RE.search(server_bytes)
     if response:
         code = response.group(1)
         findings.append({
@@ -154,12 +177,18 @@ def detect_stream(session, ts: float) -> list[dict]:
             "status":   code.decode("utf-8", "ignore"),
             "outcome":  _outcome(code),
         })
-        # Consume the matched response from server_buf
-        del session.server_buf[:response.end()]
+        # Consume the matched response from the correct buffer
+        if client_is_client:
+            del session.server_buf[:response.end()]
+        else:
+            del session.client_buf[:response.end()]
     else:
         session.add_pending(base, ts_start=ts)
 
-    # Consume processed USER and PASS from client_buf
-    del session.client_buf[:pass_match.end()]
+    # Consume processed USER and PASS from the correct buffer
+    if client_is_client:
+        del session.client_buf[:pass_match.end()]
+    else:
+        del session.server_buf[:pass_match.end()]
 
     return findings
