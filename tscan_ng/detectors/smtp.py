@@ -185,6 +185,15 @@ def detect_stream(session, ts: float) -> list[dict]:
     client_bytes = bytes(session.client_buf)
     server_bytes = bytes(session.server_buf)
 
+    # Debug — show which buffers contain AUTH commands
+    plain_in_client = bool(_SMTP_AUTH_PLAIN_RE.search(client_bytes))
+    login_in_client = bool(_SMTP_AUTH_LOGIN_RE.search(client_bytes))
+    plain_in_server = bool(_SMTP_AUTH_PLAIN_RE.search(server_bytes))
+    login_in_server = bool(_SMTP_AUTH_LOGIN_RE.search(server_bytes))
+    print(f"  plain_in_client={plain_in_client} login_in_client={login_in_client} "
+          f"plain_in_server={plain_in_server} login_in_server={login_in_server}",
+          file=sys.stderr)
+
     # If AUTH commands are in server_buf, direction is inverted
     if not (_SMTP_AUTH_PLAIN_RE.search(client_bytes) or
             _SMTP_AUTH_LOGIN_RE.search(client_bytes)):
