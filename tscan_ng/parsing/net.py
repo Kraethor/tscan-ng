@@ -43,6 +43,15 @@ def _ip_str(raw: bytes) -> str:
 
 
 def parse_basic(l2type: int, data: bytes) -> dict | None:
+    try:
+        ...existing code...
+        return {
+            ...
+        }
+    except Exception as e:
+        import sys
+        print(f"parse_basic exception: {e} l2type={l2type} len={len(data)}", file=sys.stderr)
+        return None
     """
     Parse a raw packet into a normalized dict for detector consumption.
 
