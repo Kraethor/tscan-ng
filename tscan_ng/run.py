@@ -238,6 +238,14 @@ def worker_main(pipe, cfg: Config):
         if not pkt:
             continue
 
+        # Temporary debug — SMTP packet tracing
+        import sys
+        if pkt.get("dport") == 25 or pkt.get("sport") == 25:
+            print(f"SMTP packet: src={pkt['src']}:{pkt['sport']} "
+                  f"dst={pkt['dst']}:{pkt['dport']} "
+                  f"payload={bytes(pkt.get('payload', b''))[:50]}",
+                  file=sys.stderr)
+
         # Accumulate packet into session stream buffers
         session = sessions.add_packet(pkt, ts)
 
