@@ -1,129 +1,280 @@
 """
 detectors/smtp.py - SMTP credential detector for tscan-ng.
 
-Detects cleartext credentials submitted via SMTP AUTH PLAIN and AUTH LOGIN
-mechanisms. Handles both inline and challenge-response variants of each.
+Stream-aware detector that operates on reassembled TCP streams rather than
+individual packets. Parses SMTP AUTH PLAIN and AUTH LOGIN commands from the
+client buffer and correlates them with server response codes.
 
-AUTH PLAIN: credentials are base64-encoded in the format \\x00user\\x00pass
-AUTH LOGIN: credentials are exchanged as separate base64-encoded responses
-            to server 334 challenges.
+Handles two SMTP authentication mechanisms:
+
+AUTH PLAIN:
+    CLIENT: AUTH PLAIN <base64(\x00username\x00password)>
+    SERVER: 235 Authentication successful
+    or split:
+    CLIENT: AUTH PLAIN
+    SERVER: 334
+    CLIENT: <base64(\x00username\x00password)>
+    SERVER: 235 Authentication successful
+
+AUTH LOGIN:
+    CLIENT: AUTH LOGIN
+    SERVER: 334 VXNlcm5hbWU6  (base64 "Username:")
+    CLIENT: <base64 username>
+    SERVER: 334 UGFzc3dvcmQ6  (base64 "Password:")
+    CLIENT: <base64 password>
+    SERVER: 235 Authentication successful
+
+Finding outcomes:
+    success      - Server responded with 235 Authentication successful
+    failed       - Server responded with 535 or 534 Authentication failed
+    server_error - Server responded with 432
+    no_response  - Session expired before a server response was seen
+                   (emitted by SessionTable.expire())
 """
 
 import re
-from tscan_ng.detectors.common import decode_b64
+import base64
+from tscan_ng.session import _make_filter
 
-_SMTP_RESPONSE_RE = re.compile(rb"^\d{3}[ -]")
+# Matches SMTP AUTH PLAIN with optional inline credentials
+_SMTP_AUTH_PLAIN_RE = re.compile(
+    rb"^AUTH PLAIN ?([A-Za-z0-9+/=]*)\r?$",
+    re.IGNORECASE | re.MULTILINE
+)
+
+# Matches SMTP AUTH LOGIN
+_SMTP_AUTH_LOGIN_RE = re.compile(
+    rb"^AUTH LOGIN\r?$",
+    re.IGNORECASE | re.MULTILINE
+)
+
+# Matches a bare base64 line (response to a 334 challenge)
+_BASE64_LINE_RE = re.compile(
+    rb"^([A-Za-z0-9+/]+=*)\r?$",
+    re.MULTILINE
+)
+
+# Matches SMTP server response codes we care about
+_SMTP_RESPONSE_RE = re.compile(
+    rb"^(235|535|534|432)[ -]",
+    re.MULTILINE
+)
+
+# SMTP ports
+_SMTP_PORTS = {25, 587, 465, 2525}
 
 
-def _next_client_tokens(lines: list[bytes], start_idx: int, count: int) -> list[bytes]:
+def _outcome(code: bytes) -> str:
     """
-    Collect the next `count` client-originated tokens from a list of SMTP lines.
-    Skips any line that matches a 3-digit SMTP server response code (e.g.
-    334, 235, 535), consuming only client-sent base64 tokens.
+    Map an SMTP response code to a human-readable outcome string.
+
     Args:
-        lines:     All lines from the TCP payload split on CRLF.
-        start_idx: Line index to start scanning from.
-        count:     Maximum number of client tokens to collect.
+        code: SMTP 3-digit response code bytes.
+
     Returns:
-        List of raw token bytes (not yet decoded).
+        One of: success, failed, server_error, unknown.
     """
-    tokens = []
-    idx = start_idx
-    while idx < len(lines) and len(tokens) < count:
-        token = lines[idx].strip()
-        if token and not _SMTP_RESPONSE_RE.match(token):
-            tokens.append(token)
-        idx += 1
-    return tokens
+    if code == b"235":
+        return "success"
+    elif code in (b"535", b"534"):
+        return "failed"
+    elif code == b"432":
+        return "server_error"
+    return "unknown"
 
 
-def _find_auth_plain(lines: list[bytes], src: str, dst: str) -> list[dict]:
+def _decode_plain(blob: bytes) -> tuple[str, str] | None:
     """
-    Detect credentials from SMTP AUTH PLAIN exchanges.
-    AUTH PLAIN credentials are a single base64 token encoding:
-        \\x00username\\x00password
-    The token may appear inline on the AUTH PLAIN line, or on the
-    following line after a 334 server challenge.
+    Decode an AUTH PLAIN base64 blob into (username, password).
+
+    AUTH PLAIN format after base64 decode: \x00username\x00password
+    or: authzid\x00username\x00password (with optional authorization id)
+
     Args:
-        lines: SMTP payload lines split on CRLF.
-        src:   Source IP address.
-        dst:   Destination IP address.
+        blob: Raw base64 encoded bytes.
+
     Returns:
-        List of finding dicts with keys: type, src, dst, creds.
+        (username, password) tuple, or None if decoding fails.
     """
-    findings = []
-    for idx, line in enumerate(lines):
-        upper = line.upper()
-        if b"AUTH PLAIN" not in upper:
-            continue
-        token = line.split(b"AUTH PLAIN", 1)[1].strip()
-        if not token and idx + 1 < len(lines):
-            token = lines[idx + 1].strip()
-        if not token:
-            continue
-        decoded = decode_b64(token)
-        parts = decoded.split("\x00")
-        if len(parts) >= 3:
-            user = parts[-2]
-            passwd = parts[-1]
-            findings.append({"type": "smtp_plain_creds", "src": src, "dst": dst,
-                             "creds": f"{user}:{passwd}"})
-    return findings
+    try:
+        decoded = base64.b64decode(blob)
+        parts = decoded.split(b"\x00")
+        if len(parts) == 3:
+            return parts[1].decode("utf-8", "ignore"), parts[2].decode("utf-8", "ignore")
+        elif len(parts) == 2:
+            return parts[0].decode("utf-8", "ignore"), parts[1].decode("utf-8", "ignore")
+    except Exception:
+        pass
+    return None
 
 
-def _find_auth_login(lines: list[bytes], src: str, dst: str) -> list[dict]:
+def _decode_b64(blob: bytes) -> str:
     """
-    Detect credentials from SMTP AUTH LOGIN exchanges.
-    AUTH LOGIN exchanges username and password as separate base64-encoded
-    responses to server 334 challenges. The username may appear inline on
-    the AUTH LOGIN line, or as the first challenge response.
+    Decode a base64 blob to a UTF-8 string.
+
     Args:
-        lines: SMTP payload lines split on CRLF.
-        src:   Source IP address.
-        dst:   Destination IP address.
+        blob: Raw base64 encoded bytes.
+
     Returns:
-        List of finding dicts with keys: type, src, dst, creds.
+        Decoded string, or empty string on failure.
     """
-    findings = []
-    for idx, line in enumerate(lines):
-        upper = line.upper()
-        if b"AUTH LOGIN" not in upper:
-            continue
-        parts = line.split(b"AUTH LOGIN", 1)[1].strip()
-        user = decode_b64(parts) if parts else ""
-        needed = 2 if not user else 1
-        tokens = _next_client_tokens(lines, idx + 1, needed)
-        passwd = ""
-        if user:
-            if tokens:
-                passwd = decode_b64(tokens[0])
-        elif len(tokens) >= 2:
-            user = decode_b64(tokens[0])
-            passwd = decode_b64(tokens[1])
-        elif len(tokens) == 1:
-            user = decode_b64(tokens[0])
-        if user or passwd:
-            findings.append({"type": "smtp_login_creds", "src": src, "dst": dst,
-                             "creds": f"{user}:{passwd}"})
-    return findings
+    try:
+        return base64.b64decode(blob).decode("utf-8", "ignore")
+    except Exception:
+        return ""
 
 
 def detect(pkt: dict) -> list[dict]:
     """
-    Detect SMTP AUTH LOGIN and AUTH PLAIN credentials in a TCP packet.
+    Per-packet interface — disabled in favour of stream detection.
+
+    Retained so the detector remains a valid entry in DETECTORS for
+    per-packet fallback if needed. Always returns empty in this phase.
+
     Args:
         pkt: Normalized packet dict from parsing.net.parse_basic.
+
     Returns:
-        List of finding dicts, empty if no credentials found.
+        Empty list.
     """
-    if not pkt["tcp"]:
+    return []
+
+
+def detect_stream(session, ts: float) -> list[dict]:
+    """
+    Stream-aware SMTP AUTH credential detector.
+
+    Scans the session's client buffer for SMTP AUTH PLAIN and AUTH LOGIN
+    commands. Decodes base64 credentials and attempts to correlate with
+    server response codes in the server buffer.
+
+    Handles both inline AUTH PLAIN (credentials on same line) and
+    challenge-response AUTH PLAIN and AUTH LOGIN flows.
+
+    Emits a finding with outcome "pending" if no server response is
+    available yet, and registers it on the session for later resolution.
+    Consumes matched commands from the client buffer to avoid re-detection
+    on subsequent packets.
+
+    Args:
+        session: Session object from session.SessionTable.
+        ts:      Unix timestamp of the current packet.
+
+    Returns:
+        List of resolved finding dicts. Pending findings are registered on
+        the session and not returned until resolved.
+    """
+    # Only process SMTP connections
+    if session.sport not in _SMTP_PORTS and session.dport not in _SMTP_PORTS:
         return []
-    payload = pkt["payload"]
-    if not payload:
-        return []
-    lines = payload.split(b"\r\n")
-    src, dst = pkt["src"], pkt["dst"]
+
+    # SMTP is server-initiated (220 banner) so check both buffers
+    client_bytes = bytes(session.client_buf)
+    server_bytes = bytes(session.server_buf)
+
+    # If AUTH commands are in server_buf, direction is inverted
+    if not (_SMTP_AUTH_PLAIN_RE.search(client_bytes) or
+            _SMTP_AUTH_LOGIN_RE.search(client_bytes)):
+        if (_SMTP_AUTH_PLAIN_RE.search(server_bytes) or
+                _SMTP_AUTH_LOGIN_RE.search(server_bytes)):
+            client_bytes, server_bytes = server_bytes, client_bytes
+        else:
+            return []
+
     findings = []
-    findings.extend(_find_auth_plain(lines, src, dst))
-    findings.extend(_find_auth_login(lines, src, dst))
+
+    # --- AUTH PLAIN ---
+    plain_match = _SMTP_AUTH_PLAIN_RE.search(client_bytes)
+    if plain_match:
+        blob = plain_match.group(1)
+
+        # Inline credentials on AUTH PLAIN line
+        if blob:
+            result = _decode_plain(blob)
+        else:
+            # Credentials on next line after 334 challenge
+            next_line = _BASE64_LINE_RE.search(client_bytes, plain_match.end())
+            result = _decode_plain(next_line.group(1)) if next_line else None
+
+        if result:
+            user, passwd = result
+            base = {
+                "type":       "smtp_creds",
+                "mechanism":  "PLAIN",
+                "session_id": session.session_id,
+                "src":        session.src,
+                "dst":        session.dst,
+                "sport":      session.sport,
+                "dport":      session.dport,
+                "creds":      f"{user}:{passwd}",
+                "filter":     _make_filter(session.src, session.dst,
+                                           session.sport, session.dport),
+            }
+
+            response = _SMTP_RESPONSE_RE.search(server_bytes.encode()
+                                                if isinstance(server_bytes, str)
+                                                else server_bytes)
+            if response:
+                code = response.group(1)
+                findings.append({
+                    **base,
+                    "ts_start": ts,
+                    "ts_end":   session.last_ts,
+                    "status":   code.decode("utf-8", "ignore"),
+                    "outcome":  _outcome(code),
+                })
+            else:
+                session.add_pending(base, ts_start=ts)
+
+            # Consume from correct buffer
+            end = next_line.end() if not blob and next_line else plain_match.end()
+            if bytes(session.client_buf).startswith(client_bytes[:10]):
+                del session.client_buf[:end]
+            else:
+                del session.server_buf[:end]
+
+    # --- AUTH LOGIN ---
+    login_match = _SMTP_AUTH_LOGIN_RE.search(client_bytes)
+    if login_match and not plain_match:
+        # Find the two base64 responses after AUTH LOGIN
+        b64_matches = list(_BASE64_LINE_RE.finditer(
+            client_bytes, login_match.end()
+        ))
+        if len(b64_matches) >= 2:
+            user   = _decode_b64(b64_matches[0].group(1))
+            passwd = _decode_b64(b64_matches[1].group(1))
+
+            base = {
+                "type":       "smtp_creds",
+                "mechanism":  "LOGIN",
+                "session_id": session.session_id,
+                "src":        session.src,
+                "dst":        session.dst,
+                "sport":      session.sport,
+                "dport":      session.dport,
+                "creds":      f"{user}:{passwd}",
+                "filter":     _make_filter(session.src, session.dst,
+                                           session.sport, session.dport),
+            }
+
+            response = _SMTP_RESPONSE_RE.search(server_bytes)
+            if response:
+                code = response.group(1)
+                findings.append({
+                    **base,
+                    "ts_start": ts,
+                    "ts_end":   session.last_ts,
+                    "status":   code.decode("utf-8", "ignore"),
+                    "outcome":  _outcome(code),
+                })
+            else:
+                session.add_pending(base, ts_start=ts)
+
+            # Consume from correct buffer
+            end = b64_matches[1].end()
+            if bytes(session.client_buf).startswith(client_bytes[:10]):
+                del session.client_buf[:end]
+            else:
+                del session.server_buf[:end]
+
     return findings
