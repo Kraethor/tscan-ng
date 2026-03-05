@@ -220,8 +220,9 @@ def detect_stream(session, ts: float) -> list[dict]:
         ))
 
         print(f"  AUTH LOGIN found, b64_matches={[m.group(0) for m in b64_matches]}", file=sys.stderr)
-
+        print(f"  b64_matches count={len(b64_matches)}", file=sys.stderr)
         if len(b64_matches) >= 2:
+            print(f"  CONSUMING up to pos {b64_matches[1].end()}", file=sys.stderr)
             user   = _decode_b64(b64_matches[0].group(1))
             passwd = _decode_b64(b64_matches[1].group(1))
 
