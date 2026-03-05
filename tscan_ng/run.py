@@ -121,9 +121,6 @@ def _try_resolve(p, session, ts: float) -> dict | None:
                 }
 
     elif finding_type in ("ftp_creds", "ftp_anonymous"):
-        # Use the direction flag stored by detect_stream to find the correct
-        # buffer — FTP sessions may have inverted direction since the server
-        # sends the 220 banner before the client sends USER.
         client_is_client = p.finding.get("_client_is_client", True)
         server_bytes = (bytes(session.server_buf) if client_is_client
                         else bytes(session.client_buf))
@@ -169,7 +166,6 @@ def worker_main(pipe, cfg: Config):
     while True:
         msg = pipe.recv()
         if msg is None:
-            # Shutdown — flush all remaining sessions
             for f in sessions.flush_all():
                 sink.write({"ts": f["ts_start"], **f})
             break
@@ -179,10 +175,6 @@ def worker_main(pipe, cfg: Config):
         if not pkt:
             continue
 
-        if pkt and (pkt.get("dport") == 21 or pkt.get("sport") == 21):
-            import sys
-            print(f"FTP packet: src={pkt['src']}:{pkt['sport']} dst={pkt['dst']}:{pkt['dport']}", file=sys.stderr)
-    
         # Accumulate packet into session stream buffers
         session = sessions.add_packet(pkt, ts)
 
@@ -234,7 +226,6 @@ def dispatcher(cfg: Config):
     Args:
         cfg: Loaded Config object.
     """
-    # Spawn workers
     parents, procs = [], []
     for _ in range(cfg.workers):
         p_end, c_end = mp.Pipe()
@@ -242,14 +233,13 @@ def dispatcher(cfg: Config):
         p.start(); c_end.close()
         parents.append(p_end); procs.append(p)
 
-    # Bind Unix datagram socket to receive from capture process
     if os.path.exists(cfg.socket_path):
         os.unlink(cfg.socket_path)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     s.bind(cfg.socket_path)
     os.chmod(cfg.socket_path, 0o660)
 
-    rr = 0  # round-robin fallback counter for unparseable packets
+    rr = 0
     try:
         while True:
             buf = s.recv(65536 + HDR.size)
@@ -259,8 +249,6 @@ def dispatcher(cfg: Config):
             payload = memoryview(buf)[HDR.size:HDR.size + caplen].tobytes()
             ts = sec + usec / 1_000_000.0
 
-            # Attempt to extract flow key for affinity routing.
-            # Fall back to round-robin for non-IP or unparseable packets.
             pkt = parse_basic(l2type, payload)
             if pkt:
                 worker_idx = _flow_key(pkt["src"], pkt["dst"],
