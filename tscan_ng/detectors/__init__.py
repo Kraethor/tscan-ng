@@ -27,11 +27,11 @@ from tscan_ng.detectors import http_basic, ftp, pop3, imap, smtp
 
 DETECTORS = [
     pop3.detect,
-    smtp.detect,
 ]
 
 STREAM_DETECTORS = [
     http_basic.detect_stream,
     imap.detect_stream,
     ftp.detect_stream,
+    smtp.detect_stream,
 ]
