@@ -252,7 +252,7 @@ def worker_main(pipe, cfg: Config):
                 sink.write({"ts": ts, **f})
 
         # Resolve any pending findings if a server response has now arrived
-        if session.pending and session.server_buf:
+        if session.pending:
             still_pending = []
             for p in session.pending:
                 resolved = _try_resolve(p, session, ts)
