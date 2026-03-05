@@ -133,10 +133,6 @@ def detect_stream(session, ts: float) -> list[dict]:
     else:
         return []
 
-    print(f"FTP detect_stream: sport={session.sport} dport={session.dport}", file=sys.stderr)
-    print(f"  client_bytes: {client_bytes[:100]}", file=sys.stderr)
-    print(f"  server_bytes: {server_bytes[:100]}", file=sys.stderr)
-
     findings = []
 
     # Find USER command
@@ -155,15 +151,15 @@ def detect_stream(session, ts: float) -> list[dict]:
     is_anonymous = user.lower() == "anonymous"
 
     base = {
-        "type":             "ftp_anonymous" if is_anonymous else "ftp_creds",
-        "session_id":       session.session_id,
-        "src":              session.src,
-        "dst":              session.dst,
-        "sport":            session.sport,
-        "dport":            session.dport,
-        "creds":            f"{user}:{passwd}",
-        "filter":           _make_filter(session.src, session.dst,
-                                         session.sport, session.dport),
+        "type":              "ftp_anonymous" if is_anonymous else "ftp_creds",
+        "session_id":        session.session_id,
+        "src":               session.src,
+        "dst":               session.dst,
+        "sport":             session.sport,
+        "dport":             session.dport,
+        "creds":             f"{user}:{passwd}",
+        "filter":            _make_filter(session.src, session.dst,
+                                          session.sport, session.dport),
         "_client_is_client": client_is_client,
     }
 
@@ -172,7 +168,7 @@ def detect_stream(session, ts: float) -> list[dict]:
     if response:
         code = response.group(1)
         findings.append({
-            **base,
+            **{k: v for k, v in base.items() if not k.startswith("_")},
             "ts_start": ts,
             "ts_end":   session.last_ts,
             "status":   code.decode("utf-8", "ignore"),
