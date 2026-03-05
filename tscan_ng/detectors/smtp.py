@@ -164,10 +164,15 @@ def detect_stream(session, ts: float) -> list[dict]:
         List of resolved finding dicts. Pending findings are registered on
         the session and not returned until resolved.
     """
+    import sys
     # Only process SMTP connections
     if session.sport not in _SMTP_PORTS and session.dport not in _SMTP_PORTS:
         return []
+    print(f"SMTP detect_stream: sport={session.sport} dport={session.dport}", file=sys.stderr)
+    print(f"  client_buf: {bytes(session.client_buf[:100])}", file=sys.stderr)
+    print(f"  server_buf: {bytes(session.server_buf[:100])}", file=sys.stderr)
 
+    
     # SMTP is server-initiated (220 banner) so check both buffers
     client_bytes = bytes(session.client_buf)
     server_bytes = bytes(session.server_buf)
