@@ -15,6 +15,7 @@ Returned dict fields:
     payload (bytes) - Transport layer payload
 """
 
+import sys
 import socket
 import dpkt
 
@@ -26,11 +27,15 @@ DLT_LINUX_SLL = 113  # Linux cooked capture
 def _ip_str(raw: bytes) -> str:
     """
     Convert raw IP address bytes to a human-readable string.
+
     Handles both IPv4 (4 bytes) and IPv6 (16 bytes).
+
     Args:
         raw: Raw IP address bytes from a dpkt IP/IP6 header.
+
     Returns:
-        Dotted-decimal (IPv4) or colon-hex (IPv6) string, or empty string on error.
+        Dotted-decimal (IPv4) or colon-hex (IPv6) string, or empty string
+        on error.
     """
     try:
         if len(raw) == 4:
@@ -43,15 +48,6 @@ def _ip_str(raw: bytes) -> str:
 
 
 def parse_basic(l2type: int, data: bytes) -> dict | None:
-    try:
-        ...existing code...
-        return {
-            ...
-        }
-    except Exception as e:
-        import sys
-        print(f"parse_basic exception: {e} l2type={l2type} len={len(data)}", file=sys.stderr)
-        return None
     """
     Parse a raw packet into a normalized dict for detector consumption.
 
@@ -59,7 +55,8 @@ def parse_basic(l2type: int, data: bytes) -> dict | None:
     is not IPv4/IPv6, not TCP/UDP, or cannot be parsed.
 
     Args:
-        l2type: libpcap datalink type (e.g. DLT_EN10MB, DLT_RAW, DLT_LINUX_SLL).
+        l2type: libpcap datalink type (e.g. DLT_EN10MB, DLT_RAW,
+                DLT_LINUX_SLL).
         data:   Raw packet bytes as captured by libpcap.
 
     Returns:
@@ -76,6 +73,8 @@ def parse_basic(l2type: int, data: bytes) -> dict | None:
             sll = dpkt.sll.SLL(data)
             ip = sll.data
         else:
+            print(f"parse_basic: unhandled l2type={l2type} len={len(data)}",
+                  file=sys.stderr)
             return None
 
         if not isinstance(ip, (dpkt.ip.IP, dpkt.ip6.IP6)):
@@ -95,5 +94,7 @@ def parse_basic(l2type: int, data: bytes) -> dict | None:
             "payload": bytes(l4.data) if l4.data else b"",
         }
 
-    except Exception:
+    except Exception as e:
+        print(f"parse_basic: exception l2type={l2type} len={len(data)} err={e}",
+              file=sys.stderr)
         return None
