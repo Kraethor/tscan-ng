@@ -191,8 +191,12 @@ def detect_stream(session, ts: float) -> list[dict]:
         if (_SMTP_AUTH_PLAIN_RE.search(server_bytes) or
                 _SMTP_AUTH_LOGIN_RE.search(server_bytes)):
             client_bytes, server_bytes = server_bytes, client_bytes
+            print(f"  Direction inverted", file=sys.stderr)
         else:
+            print(f"  No AUTH found in either buffer — returning", file=sys.stderr)
             return []
+    else:
+        print(f"  Direction normal", file=sys.stderr)
 
     findings = []
 
