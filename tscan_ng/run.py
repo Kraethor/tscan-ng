@@ -239,9 +239,9 @@ def worker_main(pipe, cfg: Config):
             continue
 
         # Temporary debug — SMTP packet tracing
-        import sys
         if pkt.get("dport") == 25 or pkt.get("sport") == 25:
-            print(f"SMTP packet: src={pkt['src']}:{pkt['sport']} "
+            import sys, os
+            print(f"SMTP packet pid={os.getpid()} src={pkt['src']}:{pkt['sport']} "
                   f"dst={pkt['dst']}:{pkt['dport']} "
                   f"payload={bytes(pkt.get('payload', b''))[:50]}",
                   file=sys.stderr)
