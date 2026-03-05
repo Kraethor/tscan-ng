@@ -73,9 +73,15 @@ def _try_resolve(p, session, ts: float) -> dict | None:
     Dispatches to the appropriate resolver based on the finding type.
     Returns a completed finding dict if resolved, or None if still pending.
 
+    For protocols where session direction may be inverted (e.g. FTP, where
+    the server sends the first packet), the pending finding stores a
+    '_client_is_client' flag set by the detector to indicate which buffer
+    contains server responses. Private fields prefixed with '_' are stripped
+    from the final emitted finding.
+
     Args:
         p:       PendingFinding object from the session.
-        session: Session object containing server_buf.
+        session: Session object containing server_buf and client_buf.
         ts:      Unix timestamp of the current packet.
 
     Returns:
@@ -83,12 +89,15 @@ def _try_resolve(p, session, ts: float) -> dict | None:
     """
     finding_type = p.finding.get("type", "")
 
+    # Strip private fields (prefixed with _) from the emitted finding
+    clean_finding = {k: v for k, v in p.finding.items() if not k.startswith("_")}
+
     if finding_type == "http_basic":
         response = _parse_response(session.server_buf)
         if response:
             status, status_text = response
             return {
-                **p.finding,
+                **clean_finding,
                 "ts":          p.ts_start,
                 "ts_start":    p.ts_start,
                 "ts_end":      ts,
@@ -104,7 +113,7 @@ def _try_resolve(p, session, ts: float) -> dict | None:
             if resp_match.group(1).upper() == tag.upper():
                 status = resp_match.group(2).upper()
                 return {
-                    **p.finding,
+                    **clean_finding,
                     "ts_start":    p.ts_start,
                     "ts_end":      ts,
                     "status":      status,
@@ -112,11 +121,17 @@ def _try_resolve(p, session, ts: float) -> dict | None:
                 }
 
     elif finding_type in ("ftp_creds", "ftp_anonymous"):
-        response = _FTP_RESPONSE_RE.search(bytes(session.server_buf))
+        # Use the direction flag stored by detect_stream to find the correct
+        # buffer — FTP sessions may have inverted direction since the server
+        # sends the 220 banner before the client sends USER.
+        client_is_client = p.finding.get("_client_is_client", True)
+        server_bytes = (bytes(session.server_buf) if client_is_client
+                        else bytes(session.client_buf))
+        response = _FTP_RESPONSE_RE.search(server_bytes)
         if response:
             code = response.group(1)
             return {
-                **p.finding,
+                **clean_finding,
                 "ts_start":    p.ts_start,
                 "ts_end":      ts,
                 "status":      code.decode("utf-8", "ignore"),
