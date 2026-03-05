@@ -15,7 +15,6 @@ Returned dict fields:
     payload (bytes) - Transport layer payload
 """
 
-import sys
 import socket
 import dpkt
 
@@ -73,8 +72,6 @@ def parse_basic(l2type: int, data: bytes) -> dict | None:
             sll = dpkt.sll.SLL(data)
             ip = sll.data
         else:
-            print(f"parse_basic: unhandled l2type={l2type} len={len(data)}",
-                  file=sys.stderr)
             return None
 
         if not isinstance(ip, (dpkt.ip.IP, dpkt.ip6.IP6)):
@@ -94,7 +91,5 @@ def parse_basic(l2type: int, data: bytes) -> dict | None:
             "payload": bytes(l4.data) if l4.data else b"",
         }
 
-    except Exception as e:
-        print(f"parse_basic: exception l2type={l2type} len={len(data)} err={e}",
-              file=sys.stderr)
+    except Exception:
         return None
