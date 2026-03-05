@@ -154,16 +154,17 @@ def detect_stream(session, ts: float) -> list[dict]:
 
     is_anonymous = user.lower() == "anonymous"
 
-    base = {
-        "type":       "ftp_anonymous" if is_anonymous else "ftp_creds",
-        "session_id": session.session_id,
-        "src":        session.src,
-        "dst":        session.dst,
-        "sport":      session.sport,
-        "dport":      session.dport,
-        "creds":      f"{user}:{passwd}",
-        "filter":     _make_filter(session.src, session.dst,
-                                   session.sport, session.dport),
+   base = {
+        "type":             "ftp_anonymous" if is_anonymous else "ftp_creds",
+        "session_id":       session.session_id,
+        "src":              session.src,
+        "dst":              session.dst,
+        "sport":            session.sport,
+        "dport":            session.dport,
+        "creds":            f"{user}:{passwd}",
+        "filter":           _make_filter(session.src, session.dst,
+                                         session.sport, session.dport),
+        "_client_is_client": client_is_client,
     }
 
     # Attempt to correlate with a server response
