@@ -34,7 +34,10 @@ from tscan_ng.detectors import DETECTORS, STREAM_DETECTORS
 from tscan_ng.detectors.http_basic import _parse_response, _outcome
 from tscan_ng.detectors.imap import _IMAP_RESPONSE_RE, _outcome as _imap_outcome
 from tscan_ng.detectors.ftp import _FTP_RESPONSE_RE, _outcome as _ftp_outcome
-from tscan_ng.detectors.smtp import _SMTP_RESPONSE_RE, _outcome as _smtp_outcome
+from tscan_ng.detectors.smtp import (
+    _SMTP_RESPONSE_RE, _SMTP_AUTH_LOGIN_RE, _BASE64_LINE_RE,
+    _decode_b64, _outcome as _smtp_outcome
+)
 from tscan_ng.sinks.jsonl import JSONLSink
 from tscan_ng.session import SessionTable
 
@@ -74,11 +77,10 @@ def _try_resolve(p, session, ts: float) -> dict | None:
     Dispatches to the appropriate resolver based on the finding type.
     Returns a completed finding dict if resolved, or None if still pending.
 
-    For protocols where session direction may be inverted (e.g. FTP, where
-    the server sends the first packet), the pending finding stores a
-    '_client_is_client' flag set by the detector to indicate which buffer
-    contains server responses. Private fields prefixed with '_' are stripped
-    from the final emitted finding.
+    For protocols where session direction may be inverted (e.g. FTP, SMTP,
+    where the server sends the first packet), the pending finding stores
+    direction metadata set by the detector. Private fields prefixed with '_'
+    are stripped from the final emitted finding.
 
     Args:
         p:       PendingFinding object from the session.
@@ -139,7 +141,6 @@ def _try_resolve(p, session, ts: float) -> dict | None:
     elif finding_type == "smtp_creds":
         response = _SMTP_RESPONSE_RE.search(bytes(session.server_buf))
         if not response:
-            # Check inverted direction
             response = _SMTP_RESPONSE_RE.search(bytes(session.client_buf))
         if response:
             code = response.group(1)
@@ -150,6 +151,53 @@ def _try_resolve(p, session, ts: float) -> dict | None:
                 "status":      code.decode("utf-8", "ignore"),
                 "outcome":     _smtp_outcome(code),
             }
+
+    elif finding_type == "smtp_auth_login_partial":
+        # Re-check session buffers for completed AUTH LOGIN credentials.
+        # Credentials arrive across multiple packets interleaved with server
+        # 334 challenges, so this partial state is upgraded to a full
+        # smtp_creds pending once both base64 lines are present.
+        client_bytes = bytes(session.client_buf)
+        server_bytes = bytes(session.server_buf)
+
+        login_match = _SMTP_AUTH_LOGIN_RE.search(client_bytes)
+        if not login_match:
+            login_match = _SMTP_AUTH_LOGIN_RE.search(server_bytes)
+            if login_match:
+                client_bytes, server_bytes = server_bytes, client_bytes
+
+        if login_match:
+            b64_matches = list(_BASE64_LINE_RE.finditer(
+                client_bytes, login_match.end()
+            ))
+            if len(b64_matches) >= 2:
+                user   = _decode_b64(b64_matches[0].group(1))
+                passwd = _decode_b64(b64_matches[1].group(1))
+                base = {
+                    "type":       "smtp_creds",
+                    "mechanism":  "LOGIN",
+                    "session_id": p.finding["session_id"],
+                    "src":        p.finding["src"],
+                    "dst":        p.finding["dst"],
+                    "sport":      p.finding["sport"],
+                    "dport":      p.finding["dport"],
+                    "creds":      f"{user}:{passwd}",
+                    "filter":     p.finding["filter"],
+                }
+                response = _SMTP_RESPONSE_RE.search(server_bytes)
+                if response:
+                    code = response.group(1)
+                    return {
+                        **base,
+                        "ts_start": p.ts_start,
+                        "ts_end":   ts,
+                        "status":   code.decode("utf-8", "ignore"),
+                        "outcome":  _smtp_outcome(code),
+                    }
+                else:
+                    # Upgrade partial to full smtp_creds pending
+                    p.finding = base
+
     return None
 
 
