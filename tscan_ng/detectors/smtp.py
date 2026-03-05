@@ -260,6 +260,7 @@ def detect_stream(session, ts: float) -> list[dict]:
 
             # Only consume buffer once we have complete credentials
             end = b64_matches[1].end()
+            print(f"  CONSUMING client_buf up to pos {end}: {client_bytes[:end]}", file=sys.stderr)
             if bytes(session.client_buf) == client_bytes:
                 del session.client_buf[:end]
             else:
