@@ -154,7 +154,7 @@ def detect_stream(session, ts: float) -> list[dict]:
 
     is_anonymous = user.lower() == "anonymous"
 
-   base = {
+    base = {
         "type":             "ftp_anonymous" if is_anonymous else "ftp_creds",
         "session_id":       session.session_id,
         "src":              session.src,
