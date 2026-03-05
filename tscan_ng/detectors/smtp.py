@@ -156,7 +156,9 @@ def detect_stream(session, ts: float) -> list[dict]:
     with server 334 challenges. If AUTH LOGIN is seen but credentials are
     not yet complete, registers a partial pending state
     (smtp_auth_login_partial) on the session. On subsequent packets, checks
-    for the partial state and attempts to complete it.
+    for the partial state and attempts to complete it. The buffer is NOT
+    consumed until both base64 lines are present, so AUTH LOGIN remains
+    as an anchor for subsequent searches.
 
     Emits a finding with outcome "pending" if no server response is
     available yet, and registers it on the session for later resolution.
@@ -207,7 +209,6 @@ def detect_stream(session, ts: float) -> list[dict]:
         print(f"  AUTH LOGIN found, b64_matches={[m.group(0) for m in b64_matches]}", file=sys.stderr)
 
         if len(b64_matches) >= 2:
-            # We have both username and password
             user   = _decode_b64(b64_matches[0].group(1))
             passwd = _decode_b64(b64_matches[1].group(1))
 
@@ -244,7 +245,7 @@ def detect_stream(session, ts: float) -> list[dict]:
             else:
                 session.add_pending(base, ts_start=ts)
 
-            # Consume AUTH LOGIN and both base64 lines from correct buffer
+            # Only consume buffer once we have complete credentials
             end = b64_matches[1].end()
             if bytes(session.client_buf) == client_bytes:
                 del session.client_buf[:end]
@@ -252,8 +253,9 @@ def detect_stream(session, ts: float) -> list[dict]:
                 del session.server_buf[:end]
 
         else:
-            # AUTH LOGIN seen but credentials not yet complete — register
-            # partial pending so we check again on next packet
+            # AUTH LOGIN seen but not enough base64 lines yet — do NOT
+            # consume anything from the buffer. Just register partial
+            # pending if not already registered.
             already_partial = any(
                 p.finding.get("type") == "smtp_auth_login_partial"
                 for p in session.pending
