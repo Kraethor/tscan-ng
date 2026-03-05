@@ -33,6 +33,7 @@ Finding outcomes:
 """
 
 import re
+import sys
 import base64
 from tscan_ng.session import _make_filter
 
@@ -151,6 +152,12 @@ def detect_stream(session, ts: float) -> list[dict]:
     Handles both inline AUTH PLAIN (credentials on same line) and
     challenge-response AUTH PLAIN and AUTH LOGIN flows.
 
+    For AUTH LOGIN, credentials arrive across multiple packets interleaved
+    with server 334 challenges. If AUTH LOGIN is seen but credentials are
+    not yet complete, registers a partial pending state
+    (smtp_auth_login_partial) on the session. On subsequent packets, checks
+    for the partial state and attempts to complete it.
+
     Emits a finding with outcome "pending" if no server response is
     available yet, and registers it on the session for later resolution.
     Consumes matched commands from the client buffer to avoid re-detection
@@ -164,15 +171,14 @@ def detect_stream(session, ts: float) -> list[dict]:
         List of resolved finding dicts. Pending findings are registered on
         the session and not returned until resolved.
     """
-    import sys
     # Only process SMTP connections
     if session.sport not in _SMTP_PORTS and session.dport not in _SMTP_PORTS:
         return []
-    print(f"SMTP detect_stream: sport={session.sport} dport={session.dport}", file=sys.stderr)
-    print(f"  client_buf: {bytes(session.client_buf[:100])}", file=sys.stderr)
-    print(f"  server_buf: {bytes(session.server_buf[:100])}", file=sys.stderr)
 
-    
+    print(f"SMTP detect_stream: sport={session.sport} dport={session.dport}", file=sys.stderr)
+    print(f"  client_buf: {bytes(session.client_buf[:200])}", file=sys.stderr)
+    print(f"  server_buf: {bytes(session.server_buf[:200])}", file=sys.stderr)
+
     # SMTP is server-initiated (220 banner) so check both buffers
     client_bytes = bytes(session.client_buf)
     server_bytes = bytes(session.server_buf)
@@ -188,66 +194,24 @@ def detect_stream(session, ts: float) -> list[dict]:
 
     findings = []
 
-    # --- AUTH PLAIN ---
-    plain_match = _SMTP_AUTH_PLAIN_RE.search(client_bytes)
-    if plain_match:
-        blob = plain_match.group(1)
-
-        # Inline credentials on AUTH PLAIN line
-        if blob:
-            result = _decode_plain(blob)
-        else:
-            # Credentials on next line after 334 challenge
-            next_line = _BASE64_LINE_RE.search(client_bytes, plain_match.end())
-            result = _decode_plain(next_line.group(1)) if next_line else None
-
-        if result:
-            user, passwd = result
-            base = {
-                "type":       "smtp_creds",
-                "mechanism":  "PLAIN",
-                "session_id": session.session_id,
-                "src":        session.src,
-                "dst":        session.dst,
-                "sport":      session.sport,
-                "dport":      session.dport,
-                "creds":      f"{user}:{passwd}",
-                "filter":     _make_filter(session.src, session.dst,
-                                           session.sport, session.dport),
-            }
-
-            response = _SMTP_RESPONSE_RE.search(server_bytes.encode()
-                                                if isinstance(server_bytes, str)
-                                                else server_bytes)
-            if response:
-                code = response.group(1)
-                findings.append({
-                    **base,
-                    "ts_start": ts,
-                    "ts_end":   session.last_ts,
-                    "status":   code.decode("utf-8", "ignore"),
-                    "outcome":  _outcome(code),
-                })
-            else:
-                session.add_pending(base, ts_start=ts)
-
-            # Consume from correct buffer
-            end = next_line.end() if not blob and next_line else plain_match.end()
-            if bytes(session.client_buf).startswith(client_bytes[:10]):
-                del session.client_buf[:end]
-            else:
-                del session.server_buf[:end]
-
-    # --- AUTH LOGIN ---
+    # -----------------------------------------------------------------------
+    # AUTH LOGIN
+    # -----------------------------------------------------------------------
     login_match = _SMTP_AUTH_LOGIN_RE.search(client_bytes)
-    if login_match and not plain_match:
-        # Find the two base64 responses after AUTH LOGIN
+    if login_match:
+        # Find all base64 lines after AUTH LOGIN in client buffer
         b64_matches = list(_BASE64_LINE_RE.finditer(
             client_bytes, login_match.end()
         ))
+
+        print(f"  AUTH LOGIN found, b64_matches={[m.group(0) for m in b64_matches]}", file=sys.stderr)
+
         if len(b64_matches) >= 2:
+            # We have both username and password
             user   = _decode_b64(b64_matches[0].group(1))
             passwd = _decode_b64(b64_matches[1].group(1))
+
+            print(f"  Decoded: user={user} passwd={passwd}", file=sys.stderr)
 
             base = {
                 "type":       "smtp_creds",
@@ -272,12 +236,91 @@ def detect_stream(session, ts: float) -> list[dict]:
                     "status":   code.decode("utf-8", "ignore"),
                     "outcome":  _outcome(code),
                 })
+                # Consume response from correct buffer
+                if bytes(session.server_buf) == server_bytes:
+                    del session.server_buf[:response.end()]
+                else:
+                    del session.client_buf[:response.end()]
             else:
                 session.add_pending(base, ts_start=ts)
 
-            # Consume from correct buffer
+            # Consume AUTH LOGIN and both base64 lines from correct buffer
             end = b64_matches[1].end()
-            if bytes(session.client_buf).startswith(client_bytes[:10]):
+            if bytes(session.client_buf) == client_bytes:
+                del session.client_buf[:end]
+            else:
+                del session.server_buf[:end]
+
+        else:
+            # AUTH LOGIN seen but credentials not yet complete — register
+            # partial pending so we check again on next packet
+            already_partial = any(
+                p.finding.get("type") == "smtp_auth_login_partial"
+                for p in session.pending
+            )
+            if not already_partial:
+                print(f"  AUTH LOGIN partial — waiting for credentials", file=sys.stderr)
+                session.add_pending({
+                    "type":       "smtp_auth_login_partial",
+                    "session_id": session.session_id,
+                    "src":        session.src,
+                    "dst":        session.dst,
+                    "sport":      session.sport,
+                    "dport":      session.dport,
+                    "filter":     _make_filter(session.src, session.dst,
+                                               session.sport, session.dport),
+                }, ts_start=ts)
+
+    # -----------------------------------------------------------------------
+    # AUTH PLAIN
+    # -----------------------------------------------------------------------
+    plain_match = _SMTP_AUTH_PLAIN_RE.search(client_bytes)
+    if plain_match and not login_match:
+        blob = plain_match.group(1)
+
+        # Inline credentials on AUTH PLAIN line
+        if blob:
+            result = _decode_plain(blob)
+            end = plain_match.end()
+        else:
+            # Credentials on next line after 334 challenge
+            next_line = _BASE64_LINE_RE.search(client_bytes, plain_match.end())
+            result = _decode_plain(next_line.group(1)) if next_line else None
+            end = next_line.end() if next_line else plain_match.end()
+
+        if result:
+            user, passwd = result
+            base = {
+                "type":       "smtp_creds",
+                "mechanism":  "PLAIN",
+                "session_id": session.session_id,
+                "src":        session.src,
+                "dst":        session.dst,
+                "sport":      session.sport,
+                "dport":      session.dport,
+                "creds":      f"{user}:{passwd}",
+                "filter":     _make_filter(session.src, session.dst,
+                                           session.sport, session.dport),
+            }
+
+            response = _SMTP_RESPONSE_RE.search(server_bytes)
+            if response:
+                code = response.group(1)
+                findings.append({
+                    **base,
+                    "ts_start": ts,
+                    "ts_end":   session.last_ts,
+                    "status":   code.decode("utf-8", "ignore"),
+                    "outcome":  _outcome(code),
+                })
+                if bytes(session.server_buf) == server_bytes:
+                    del session.server_buf[:response.end()]
+                else:
+                    del session.client_buf[:response.end()]
+            else:
+                session.add_pending(base, ts_start=ts)
+
+            if bytes(session.client_buf) == client_bytes:
                 del session.client_buf[:end]
             else:
                 del session.server_buf[:end]
