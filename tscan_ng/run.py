@@ -34,6 +34,7 @@ from tscan_ng.detectors import DETECTORS, STREAM_DETECTORS
 from tscan_ng.detectors.http_basic import _parse_response, _outcome
 from tscan_ng.detectors.imap import _IMAP_RESPONSE_RE, _outcome as _imap_outcome
 from tscan_ng.detectors.ftp import _FTP_RESPONSE_RE, _outcome as _ftp_outcome
+from tscan_ng.detectors.smtp import _SMTP_RESPONSE_RE, _outcome as _smtp_outcome
 from tscan_ng.sinks.jsonl import JSONLSink
 from tscan_ng.session import SessionTable
 
@@ -135,6 +136,20 @@ def _try_resolve(p, session, ts: float) -> dict | None:
                 "outcome":     _ftp_outcome(code),
             }
 
+    elif finding_type == "smtp_creds":
+        response = _SMTP_RESPONSE_RE.search(bytes(session.server_buf))
+        if not response:
+            # Check inverted direction
+            response = _SMTP_RESPONSE_RE.search(bytes(session.client_buf))
+        if response:
+            code = response.group(1)
+            return {
+                **clean_finding,
+                "ts_start":    p.ts_start,
+                "ts_end":      ts,
+                "status":      code.decode("utf-8", "ignore"),
+                "outcome":     _smtp_outcome(code),
+            }
     return None
 
 
