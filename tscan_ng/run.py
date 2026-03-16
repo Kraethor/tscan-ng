@@ -194,38 +194,31 @@ def worker_main(pipe, cfg: Config):
                 sink.write({"ts": f["ts_start"], **f})
             break
 
-        ts, pkt = msg
-
-        # Accumulate packet into session stream buffers
-        session = sessions.add_packet(pkt, ts)
-
-        # Run per-packet detectors
-        for det in DETECTORS:
-            for f in det(pkt):
-                sink.write({"ts": ts, **f})
-
-        # Run stream-aware detectors
-        for det in STREAM_DETECTORS:
-            for f in det(session, ts):
-                sink.write({"ts": ts, **f})
-
-        # Resolve any pending findings
-        if session.pending:
-            still_pending = []
-            for p in session.pending:
-                resolved = _try_resolve(p, session, ts)
-                if resolved:
-                    sink.write(resolved)
-                else:
-                    still_pending.append(p)
-            session.pending = still_pending
-
-        # Run expiry on wall-clock timer
-        now = time.monotonic()
-        if now - last_expiry >= cfg.expiry_interval:
-            for f in sessions.expire():
-                sink.write({"ts": f["ts_start"], **f})
-            last_expiry = now
+        try:
+            ts, pkt = msg
+            session = sessions.add_packet(pkt, ts)
+            for det in DETECTORS:
+                for f in det(pkt):
+                    sink.write({"ts": ts, **f})
+            for det in STREAM_DETECTORS:
+                for f in det(session, ts):
+                    sink.write({"ts": ts, **f})
+            if session.pending:
+                still_pending = []
+                for p in session.pending:
+                    resolved = _try_resolve(p, session, ts)
+                    if resolved:
+                        sink.write(resolved)
+                    else:
+                        still_pending.append(p)
+                session.pending = still_pending
+            now = time.monotonic()
+            if now - last_expiry >= cfg.expiry_interval:
+                for f in sessions.expire():
+                    sink.write({"ts": f["ts_start"], **f})
+                last_expiry = now
+        except Exception:
+            logging.exception("worker_main unhandled exception processing packet")
 
 
 def dispatcher(cfg: Config):
