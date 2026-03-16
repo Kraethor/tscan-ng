@@ -5,6 +5,10 @@ Stream-aware detector that operates on reassembled TCP streams rather than
 individual packets. Parses SMTP AUTH PLAIN and AUTH LOGIN commands from the
 client buffer and correlates them with server response codes.
 
+Because session direction is normalised at creation time (see session.py),
+client_buf always contains client-originated bytes and server_buf always
+contains server-originated bytes. No direction sniffing is required here.
+
 Handles two SMTP authentication mechanisms:
 
 AUTH PLAIN:
@@ -24,6 +28,10 @@ AUTH LOGIN:
     CLIENT: <base64 password>
     SERVER: 235 Authentication successful
 
+For AUTH LOGIN the credentials arrive across multiple packets.  The client
+buffer is not consumed until both base64 lines are present so that AUTH LOGIN
+remains as a stable anchor across successive detect_stream calls.
+
 Finding outcomes:
     success      - Server responded with 235 Authentication successful
     failed       - Server responded with 535 or 534 Authentication failed
@@ -33,7 +41,6 @@ Finding outcomes:
 """
 
 import re
-import sys
 import base64
 from tscan_ng.session import _make_filter
 
@@ -84,7 +91,7 @@ def _outcome(code: bytes) -> str:
     return "unknown"
 
 
-def _decode_plain(blob: bytes) -> tuple[str, str] | None:
+def _decode_plain(blob: bytes) -> tuple | None:
     """
     Decode an AUTH PLAIN base64 blob into (username, password).
 
@@ -125,7 +132,7 @@ def _decode_b64(blob: bytes) -> str:
         return ""
 
 
-def detect(pkt: dict) -> list[dict]:
+def detect(pkt: dict) -> list:
     """
     Per-packet interface — disabled in favour of stream detection.
 
@@ -141,29 +148,24 @@ def detect(pkt: dict) -> list[dict]:
     return []
 
 
-def detect_stream(session, ts: float) -> list[dict]:
+def detect_stream(session, ts: float) -> list:
     """
     Stream-aware SMTP AUTH credential detector.
 
-    Scans the session's client buffer for SMTP AUTH PLAIN and AUTH LOGIN
-    commands. Decodes base64 credentials and attempts to correlate with
-    server response codes in the server buffer.
+    Scans session.client_buf for SMTP AUTH PLAIN and AUTH LOGIN commands
+    and session.server_buf for response codes.  Session direction is always
+    normalised to the client perspective by the session layer, so no
+    direction sniffing is needed here.
 
-    Handles both inline AUTH PLAIN (credentials on same line) and
-    challenge-response AUTH PLAIN and AUTH LOGIN flows.
+    AUTH PLAIN: credentials may be inline or on the next line after a 334
+    challenge.  The client buffer is consumed once credentials are extracted.
 
-    For AUTH LOGIN, credentials arrive across multiple packets interleaved
-    with server 334 challenges. If AUTH LOGIN is seen but credentials are
-    not yet complete, registers a partial pending state
-    (smtp_auth_login_partial) on the session. On subsequent packets, checks
-    for the partial state and attempts to complete it. The buffer is NOT
-    consumed until both base64 lines are present, so AUTH LOGIN remains
-    as an anchor for subsequent searches.
-
-    Emits a finding with outcome "pending" if no server response is
-    available yet, and registers it on the session for later resolution.
-    Consumes matched commands from the client buffer to avoid re-detection
-    on subsequent packets.
+    AUTH LOGIN: credentials arrive across multiple client packets interleaved
+    with server 334 challenges.  The client buffer is NOT consumed until both
+    base64 lines are present, keeping AUTH LOGIN as a stable anchor for
+    successive calls.  Once complete, a pending finding is registered (or
+    resolved immediately if the 235 response is already in server_buf), and
+    the consumed portion of client_buf is removed.
 
     Args:
         session: Session object from session.SessionTable.
@@ -173,39 +175,11 @@ def detect_stream(session, ts: float) -> list[dict]:
         List of resolved finding dicts. Pending findings are registered on
         the session and not returned until resolved.
     """
-    # Only process SMTP connections
     if session.sport not in _SMTP_PORTS and session.dport not in _SMTP_PORTS:
         return []
 
-    print(f"SMTP detect_stream: sport={session.sport} dport={session.dport}", file=sys.stderr)
-    print(f"  client_buf: {bytes(session.client_buf[:200])}", file=sys.stderr)
-    print(f"  server_buf: {bytes(session.server_buf[:200])}", file=sys.stderr)
-
-    # SMTP is server-initiated (220 banner) so check both buffers
     client_bytes = bytes(session.client_buf)
     server_bytes = bytes(session.server_buf)
-
-    # Debug — show which buffers contain AUTH commands
-    plain_in_client = bool(_SMTP_AUTH_PLAIN_RE.search(client_bytes))
-    login_in_client = bool(_SMTP_AUTH_LOGIN_RE.search(client_bytes))
-    plain_in_server = bool(_SMTP_AUTH_PLAIN_RE.search(server_bytes))
-    login_in_server = bool(_SMTP_AUTH_LOGIN_RE.search(server_bytes))
-    print(f"  plain_in_client={plain_in_client} login_in_client={login_in_client} "
-          f"plain_in_server={plain_in_server} login_in_server={login_in_server}",
-          file=sys.stderr)
-
-    # If AUTH commands are in server_buf, direction is inverted
-    if not (_SMTP_AUTH_PLAIN_RE.search(client_bytes) or
-            _SMTP_AUTH_LOGIN_RE.search(client_bytes)):
-        if (_SMTP_AUTH_PLAIN_RE.search(server_bytes) or
-                _SMTP_AUTH_LOGIN_RE.search(server_bytes)):
-            client_bytes, server_bytes = server_bytes, client_bytes
-            print(f"  Direction inverted", file=sys.stderr)
-        else:
-            print(f"  No AUTH found in either buffer — returning", file=sys.stderr)
-            return []
-    else:
-        print(f"  Direction normal", file=sys.stderr)
 
     findings = []
 
@@ -214,19 +188,11 @@ def detect_stream(session, ts: float) -> list[dict]:
     # -----------------------------------------------------------------------
     login_match = _SMTP_AUTH_LOGIN_RE.search(client_bytes)
     if login_match:
-        # Find all base64 lines after AUTH LOGIN in client buffer
-        b64_matches = list(_BASE64_LINE_RE.finditer(
-            client_bytes, login_match.end()
-        ))
+        b64_matches = list(_BASE64_LINE_RE.finditer(client_bytes, login_match.end()))
 
-        print(f"  AUTH LOGIN found, b64_matches={[m.group(0) for m in b64_matches]}", file=sys.stderr)
-        print(f"  b64_matches count={len(b64_matches)}", file=sys.stderr)
         if len(b64_matches) >= 2:
-            print(f"  CONSUMING up to pos {b64_matches[1].end()}", file=sys.stderr)
             user   = _decode_b64(b64_matches[0].group(1))
             passwd = _decode_b64(b64_matches[1].group(1))
-
-            print(f"  Decoded: user={user} passwd={passwd}", file=sys.stderr)
 
             base = {
                 "type":       "smtp_creds",
@@ -251,56 +217,30 @@ def detect_stream(session, ts: float) -> list[dict]:
                     "status":   code.decode("utf-8", "ignore"),
                     "outcome":  _outcome(code),
                 })
-                # Consume response from correct buffer
-                if bytes(session.server_buf) == server_bytes:
-                    del session.server_buf[:response.end()]
-                else:
-                    del session.client_buf[:response.end()]
+                del session.server_buf[:response.end()]
             else:
                 session.add_pending(base, ts_start=ts)
 
-            # Only consume buffer once we have complete credentials
-            end = b64_matches[1].end()
-            print(f"  CONSUMING client_buf up to pos {end}: {client_bytes[:end]}", file=sys.stderr)
-            if bytes(session.client_buf) == client_bytes:
-                del session.client_buf[:end]
-            else:
-                del session.server_buf[:end]
+            # Consume AUTH LOGIN + both credential lines from client buffer
+            del session.client_buf[:b64_matches[1].end()]
 
-        else:
-            # AUTH LOGIN seen but not enough base64 lines yet — do NOT
-            # consume anything from the buffer. Just register partial
-            # pending if not already registered.
-            already_partial = any(
-                p.finding.get("type") == "smtp_auth_login_partial"
-                for p in session.pending
-            )
-            if not already_partial:
-                print(f"  AUTH LOGIN partial — waiting for credentials", file=sys.stderr)
-                session.add_pending({
-                    "type":       "smtp_auth_login_partial",
-                    "session_id": session.session_id,
-                    "src":        session.src,
-                    "dst":        session.dst,
-                    "sport":      session.sport,
-                    "dport":      session.dport,
-                    "filter":     _make_filter(session.src, session.dst,
-                                               session.sport, session.dport),
-                }, ts_start=ts)
+        # If fewer than 2 base64 lines are present, do nothing: leave the
+        # buffer intact so AUTH LOGIN remains an anchor for the next packet.
+        return findings
 
     # -----------------------------------------------------------------------
     # AUTH PLAIN
     # -----------------------------------------------------------------------
     plain_match = _SMTP_AUTH_PLAIN_RE.search(client_bytes)
-    if plain_match and not login_match:
+    if plain_match:
         blob = plain_match.group(1)
 
-        # Inline credentials on AUTH PLAIN line
         if blob:
+            # Credentials inline on the AUTH PLAIN line
             result = _decode_plain(blob)
             end = plain_match.end()
         else:
-            # Credentials on next line after 334 challenge
+            # Credentials on the next line (after server 334 challenge)
             next_line = _BASE64_LINE_RE.search(client_bytes, plain_match.end())
             result = _decode_plain(next_line.group(1)) if next_line else None
             end = next_line.end() if next_line else plain_match.end()
@@ -330,16 +270,10 @@ def detect_stream(session, ts: float) -> list[dict]:
                     "status":   code.decode("utf-8", "ignore"),
                     "outcome":  _outcome(code),
                 })
-                if bytes(session.server_buf) == server_bytes:
-                    del session.server_buf[:response.end()]
-                else:
-                    del session.client_buf[:response.end()]
+                del session.server_buf[:response.end()]
             else:
                 session.add_pending(base, ts_start=ts)
 
-            if bytes(session.client_buf) == client_bytes:
-                del session.client_buf[:end]
-            else:
-                del session.server_buf[:end]
+            del session.client_buf[:end]
 
     return findings
