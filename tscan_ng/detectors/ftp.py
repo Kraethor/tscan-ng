@@ -13,10 +13,9 @@ Handles the standard FTP authentication flow:
 
 Also detects anonymous FTP logins and flags them separately.
 
-FTP is a server-initiated protocol — the server sends a 220 banner before
-the client sends USER. This means the session may be created with the server
-as the canonical src, causing client and server buffers to be inverted.
-The detector handles this by checking both buffers for USER/PASS commands.
+Because session direction is normalised at creation time (see session.py),
+client_buf always contains client-originated bytes and server_buf always
+contains server-originated bytes. No direction sniffing is required here.
 
 Finding outcomes:
     success      - Server responded with 230 Login successful
@@ -27,7 +26,6 @@ Finding outcomes:
 """
 
 import re
-import sys
 from tscan_ng.session import _make_filter
 
 # Matches FTP USER command
@@ -70,7 +68,7 @@ def _outcome(code: bytes) -> str:
     return "unknown"
 
 
-def detect(pkt: dict) -> list[dict]:
+def detect(pkt: dict) -> list:
     """
     Per-packet interface — disabled in favour of stream detection.
 
@@ -86,26 +84,21 @@ def detect(pkt: dict) -> list[dict]:
     return []
 
 
-def detect_stream(session, ts: float) -> list[dict]:
+def detect_stream(session, ts: float) -> list:
     """
     Stream-aware FTP credential detector.
 
-    Scans the session's client buffer for FTP USER and PASS commands.
-    Pairs them into credential findings and attempts to correlate with
-    server response codes in the server buffer.
-
-    Handles the case where session direction is inverted for server-initiated
-    protocols like FTP, where the server sends the 220 banner before the
-    client sends USER. In this case the session may be created with the
-    server as the canonical src, so we check both buffers for USER/PASS.
+    Scans session.client_buf for FTP USER and PASS commands and
+    session.server_buf for response codes.  Session direction is always
+    normalised to the client perspective by the session layer, so
+    client_buf reliably contains the USER/PASS commands.
 
     Handles anonymous FTP logins by flagging them with type
     "ftp_anonymous" instead of "ftp_creds".
 
-    Emits a finding with outcome "pending" if no server response is
-    available yet, and registers it on the session for later resolution.
-    Consumes matched commands from the client buffer to avoid re-detection
-    on subsequent packets.
+    Registers a pending finding if no server response is available yet,
+    and consumes the matched commands from the client buffer to avoid
+    re-detection on subsequent packets.
 
     Args:
         session: Session object from session.SessionTable.
@@ -115,32 +108,15 @@ def detect_stream(session, ts: float) -> list[dict]:
         List of resolved finding dicts. Pending findings are registered on
         the session and not returned until resolved.
     """
-    # Only process FTP control connections
     if session.dport != 21 and session.sport != 21:
         return []
 
-    # FTP is server-initiated (220 banner comes before USER) so the session
-    # may be created with the server as canonical src. Check both buffers
-    # for USER/PASS and use whichever contains the client commands.
-    if _FTP_USER_RE.search(bytes(session.client_buf)):
-        client_bytes = bytes(session.client_buf)
-        server_bytes = bytes(session.server_buf)
-        client_is_client = True
-    elif _FTP_USER_RE.search(bytes(session.server_buf)):
-        client_bytes = bytes(session.server_buf)
-        server_bytes = bytes(session.client_buf)
-        client_is_client = False
-    else:
-        return []
+    client_bytes = bytes(session.client_buf)
 
-    findings = []
-
-    # Find USER command
     user_match = _FTP_USER_RE.search(client_bytes)
     if not user_match:
         return []
 
-    # Find PASS command after USER
     pass_match = _FTP_PASS_RE.search(client_bytes, user_match.end())
     if not pass_match:
         return []
@@ -151,41 +127,35 @@ def detect_stream(session, ts: float) -> list[dict]:
     is_anonymous = user.lower() == "anonymous"
 
     base = {
-        "type":              "ftp_anonymous" if is_anonymous else "ftp_creds",
-        "session_id":        session.session_id,
-        "src":               session.src,
-        "dst":               session.dst,
-        "sport":             session.sport,
-        "dport":             session.dport,
-        "creds":             f"{user}:{passwd}",
-        "filter":            _make_filter(session.src, session.dst,
-                                          session.sport, session.dport),
-        "_client_is_client": client_is_client,
+        "type":       "ftp_anonymous" if is_anonymous else "ftp_creds",
+        "session_id": session.session_id,
+        "src":        session.src,
+        "dst":        session.dst,
+        "sport":      session.sport,
+        "dport":      session.dport,
+        "creds":      f"{user}:{passwd}",
+        "filter":     _make_filter(session.src, session.dst,
+                                   session.sport, session.dport),
     }
 
-    # Attempt to correlate with a server response
+    findings = []
+    server_bytes = bytes(session.server_buf)
     response = _FTP_RESPONSE_RE.search(server_bytes)
+
     if response:
         code = response.group(1)
         findings.append({
-            **{k: v for k, v in base.items() if not k.startswith("_")},
+            **base,
             "ts_start": ts,
             "ts_end":   session.last_ts,
             "status":   code.decode("utf-8", "ignore"),
             "outcome":  _outcome(code),
         })
-        # Consume the matched response from the correct buffer
-        if client_is_client:
-            del session.server_buf[:response.end()]
-        else:
-            del session.client_buf[:response.end()]
+        del session.server_buf[:response.end()]
     else:
         session.add_pending(base, ts_start=ts)
 
-    # Consume processed USER and PASS from the correct buffer
-    if client_is_client:
-        del session.client_buf[:pass_match.end()]
-    else:
-        del session.server_buf[:pass_match.end()]
+    # Consume USER and PASS from client buffer
+    del session.client_buf[:pass_match.end()]
 
     return findings
