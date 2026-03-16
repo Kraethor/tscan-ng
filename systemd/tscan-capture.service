@@ -2,6 +2,7 @@
 Description=tscan-ng pcap capture process
 After=tscan-dispatcher.service
 Requires=tscan-dispatcher.service
+BindsTo=tscan-dispatcher.service
 Documentation=file:/opt/tscan/docs/REBUILD.md
 
 [Service]
