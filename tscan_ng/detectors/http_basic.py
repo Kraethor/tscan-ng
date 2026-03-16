@@ -21,6 +21,7 @@ Finding outcomes:
 
 import re
 from tscan_ng.detectors.common import decode_b64
+from tscan_ng.session import _make_filter
 
 # Matches the HTTP request line e.g. "GET /path HTTP/1.1"
 _REQUEST_LINE_RE = re.compile(rb"^([A-Z]+)\s+(\S+)\s+HTTP/\d+\.\d+\r\n", re.MULTILINE)
@@ -182,19 +183,3 @@ def detect_stream(session, ts: float) -> list[dict]:
         session.client_buf = bytearray(client_bytes)
 
     return findings
-
-
-def _make_filter(src: str, dst: str, sport: int, dport: int) -> str:
-    """
-    Build a Wireshark/tcpdump display filter string for this flow.
-
-    Args:
-        src:   Source IP address string.
-        dst:   Destination IP address string.
-        sport: Source port number.
-        dport: Destination port number.
-
-    Returns:
-        A tcpdump/Wireshark compatible filter string.
-    """
-    return f"host {src} and host {dst} and tcp port {sport} and tcp port {dport}"
