@@ -25,13 +25,12 @@ Each stream detector must implement:
 
 from tscan_ng.detectors import http_basic, ftp, pop3, imap, smtp
 
-DETECTORS = [
-    pop3.detect,
-]
+DETECTORS = []
 
 STREAM_DETECTORS = [
     http_basic.detect_stream,
     imap.detect_stream,
     ftp.detect_stream,
     smtp.detect_stream,
+    pop3.detect_stream,
 ]
