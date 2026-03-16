@@ -13,6 +13,10 @@ Flow affinity ensures all packets belonging to the same TCP/UDP session
 worker. Each worker maintains a SessionTable that buffers reassembled streams
 per flow in both directions.
 
+The dispatcher performs packet parsing once to extract the flow key and then
+forwards the parsed packet dict to the appropriate worker, avoiding a second
+parse in the worker process.
+
 Per-packet detectors run on every parsed packet. Stream-aware detectors run
 after each packet is added to its session, operating on the full reassembled
 client and server buffers. Pending findings (credentials seen but no server
@@ -35,9 +39,9 @@ from tscan_ng.detectors.http_basic import _parse_response, _outcome
 from tscan_ng.detectors.imap import _IMAP_RESPONSE_RE, _outcome as _imap_outcome
 from tscan_ng.detectors.ftp import _FTP_RESPONSE_RE, _outcome as _ftp_outcome
 from tscan_ng.detectors.smtp import (
-    _SMTP_RESPONSE_RE, _SMTP_AUTH_LOGIN_RE, _BASE64_LINE_RE,
-    _decode_b64, _outcome as _smtp_outcome
+    _SMTP_RESPONSE_RE, _outcome as _smtp_outcome
 )
+from tscan_ng.detectors.pop3 import _POP3_RESPONSE_RE, _outcome as _pop3_outcome
 from tscan_ng.sinks.jsonl import JSONLSink
 from tscan_ng.session import SessionTable
 
@@ -77,10 +81,8 @@ def _try_resolve(p, session, ts: float) -> dict | None:
     Dispatches to the appropriate resolver based on the finding type.
     Returns a completed finding dict if resolved, or None if still pending.
 
-    For protocols where session direction may be inverted (e.g. FTP, SMTP,
-    where the server sends the first packet), the pending finding stores
-    direction metadata set by the detector. Private fields prefixed with '_'
-    are stripped from the final emitted finding.
+    Private fields prefixed with '_' are stripped from the final emitted
+    finding.
 
     Args:
         p:       PendingFinding object from the session.
@@ -91,8 +93,6 @@ def _try_resolve(p, session, ts: float) -> dict | None:
         Completed finding dict if resolved, None otherwise.
     """
     finding_type = p.finding.get("type", "")
-
-    # Strip private fields (prefixed with _) from the emitted finding
     clean_finding = {k: v for k, v in p.finding.items() if not k.startswith("_")}
 
     if finding_type == "http_basic":
@@ -124,10 +124,7 @@ def _try_resolve(p, session, ts: float) -> dict | None:
                 }
 
     elif finding_type in ("ftp_creds", "ftp_anonymous"):
-        client_is_client = p.finding.get("_client_is_client", True)
-        server_bytes = (bytes(session.server_buf) if client_is_client
-                        else bytes(session.client_buf))
-        response = _FTP_RESPONSE_RE.search(server_bytes)
+        response = _FTP_RESPONSE_RE.search(bytes(session.server_buf))
         if response:
             code = response.group(1)
             return {
@@ -140,8 +137,6 @@ def _try_resolve(p, session, ts: float) -> dict | None:
 
     elif finding_type == "smtp_creds":
         response = _SMTP_RESPONSE_RE.search(bytes(session.server_buf))
-        if not response:
-            response = _SMTP_RESPONSE_RE.search(bytes(session.client_buf))
         if response:
             code = response.group(1)
             return {
@@ -152,51 +147,17 @@ def _try_resolve(p, session, ts: float) -> dict | None:
                 "outcome":     _smtp_outcome(code),
             }
 
-    elif finding_type == "smtp_auth_login_partial":
-        # Re-check session buffers for completed AUTH LOGIN credentials.
-        # Credentials arrive across multiple packets interleaved with server
-        # 334 challenges, so this partial state is upgraded to a full
-        # smtp_creds pending once both base64 lines are present.
-        client_bytes = bytes(session.client_buf)
-        server_bytes = bytes(session.server_buf)
-
-        login_match = _SMTP_AUTH_LOGIN_RE.search(client_bytes)
-        if not login_match:
-            login_match = _SMTP_AUTH_LOGIN_RE.search(server_bytes)
-            if login_match:
-                client_bytes, server_bytes = server_bytes, client_bytes
-
-        if login_match:
-            b64_matches = list(_BASE64_LINE_RE.finditer(
-                client_bytes, login_match.end()
-            ))
-            if len(b64_matches) >= 2:
-                user   = _decode_b64(b64_matches[0].group(1))
-                passwd = _decode_b64(b64_matches[1].group(1))
-                base = {
-                    "type":       "smtp_creds",
-                    "mechanism":  "LOGIN",
-                    "session_id": p.finding["session_id"],
-                    "src":        p.finding["src"],
-                    "dst":        p.finding["dst"],
-                    "sport":      p.finding["sport"],
-                    "dport":      p.finding["dport"],
-                    "creds":      f"{user}:{passwd}",
-                    "filter":     p.finding["filter"],
-                }
-                response = _SMTP_RESPONSE_RE.search(server_bytes)
-                if response:
-                    code = response.group(1)
-                    return {
-                        **base,
-                        "ts_start": p.ts_start,
-                        "ts_end":   ts,
-                        "status":   code.decode("utf-8", "ignore"),
-                        "outcome":  _smtp_outcome(code),
-                    }
-                else:
-                    # Upgrade partial to full smtp_creds pending
-                    p.finding = base
+    elif finding_type == "pop3_creds":
+        responses = list(_POP3_RESPONSE_RE.finditer(bytes(session.server_buf)))
+        if len(responses) >= 2:
+            code = responses[1].group(1)
+            return {
+                **clean_finding,
+                "ts_start":    p.ts_start,
+                "ts_end":      ts,
+                "status":      code.decode("utf-8", "ignore"),
+                "outcome":     _pop3_outcome(code),
+            }
 
     return None
 
@@ -205,11 +166,11 @@ def worker_main(pipe, cfg: Config):
     """
     Worker process entry point.
 
-    Receives (ts, l2type, buf) tuples from the dispatcher via a multiprocessing
-    Pipe, parses each packet, accumulates it into the per-flow SessionTable,
-    runs per-packet detectors, runs stream-aware detectors, resolves any
-    pending findings against newly arrived server responses, and writes all
-    findings to the configured JSONLSink.
+    Receives (ts, pkt) tuples from the dispatcher via a multiprocessing
+    Pipe, accumulates each packet into the per-flow SessionTable, runs
+    per-packet detectors, runs stream-aware detectors, resolves any
+    pending findings against newly arrived server responses, and writes
+    all findings to the configured JSONLSink.
 
     Session expiry runs on a wall-clock timer using cfg.expiry_interval.
     On shutdown (None sentinel received), all remaining sessions are flushed
@@ -233,17 +194,7 @@ def worker_main(pipe, cfg: Config):
                 sink.write({"ts": f["ts_start"], **f})
             break
 
-        ts, l2type, buf = msg
-        pkt = parse_basic(l2type, buf)
-        if not pkt:
-            continue
-
-        # Temporary debug — log every packet sport/dport
-        import sys, os
-        print(f"PKT pid={os.getpid()} src={pkt['src']}:{pkt['sport']} "
-              f"dst={pkt['dst']}:{pkt['dport']} "
-              f"payload={bytes(pkt.get('payload', b''))[:30]}",
-              file=sys.stderr)
+        ts, pkt = msg
 
         # Accumulate packet into session stream buffers
         session = sessions.add_packet(pkt, ts)
@@ -285,10 +236,13 @@ def dispatcher(cfg: Config):
     spawns a pool of worker processes, and routes packets to workers using
     flow-affinity hashing on (src_ip, dst_ip, sport, dport).
 
+    Parses each packet once in the dispatcher to extract the flow key, then
+    forwards the parsed pkt dict to the worker to avoid a redundant parse.
+    Packets that cannot be parsed fall back to round-robin dispatch.
+
     Flow affinity guarantees that all packets from a given TCP/UDP session
     are handled by the same worker, which is required for stateful stream
-    processing. Packets that cannot be parsed for flow key extraction fall
-    back to round-robin dispatch.
+    processing.
 
     Shuts down cleanly on KeyboardInterrupt, sending a None sentinel to each
     worker to signal termination and allow graceful session flushing.
@@ -326,8 +280,9 @@ def dispatcher(cfg: Config):
             else:
                 worker_idx = rr % cfg.workers
                 rr += 1
+                continue  # Don't forward unparseable packets to workers
 
-            parents[worker_idx].send((ts, l2type, payload))
+            parents[worker_idx].send((ts, pkt))
 
     except KeyboardInterrupt:
         pass
