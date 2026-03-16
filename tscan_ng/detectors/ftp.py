@@ -111,6 +111,34 @@ def detect_stream(session, ts: float) -> list:
     if session.dport != 21 and session.sport != 21:
         return []
 
+    # -------------------------------------------------------------------------
+    # Resolution pass: if a previous call registered a pending FTP finding,
+    # check whether the server response has arrived since then and emit it now
+    # rather than waiting for session expiry.  USER+PASS and the 230/530
+    # response frequently arrive in separate TCP segments, so the pending path
+    # is the common case, not the exception.
+    # -------------------------------------------------------------------------
+    findings = []
+    ftp_pending = [p for p in session.pending
+                   if p.finding.get("type") in ("ftp_creds", "ftp_anonymous")]
+    if ftp_pending:
+        server_bytes = bytes(session.server_buf)
+        response = _FTP_RESPONSE_RE.search(server_bytes)
+        if response:
+            code = response.group(1)
+            for p in ftp_pending:
+                findings.append({
+                    **p.finding,
+                    "ts_start": p.ts_start,
+                    "ts_end":   session.last_ts,
+                    "status":   code.decode("utf-8", "ignore"),
+                    "outcome":  _outcome(code),
+                })
+            session.pending = [p for p in session.pending
+                               if p not in ftp_pending]
+            del session.server_buf[:response.end()]
+            return findings
+
     client_bytes = bytes(session.client_buf)
 
     user_match = _FTP_USER_RE.search(client_bytes)
@@ -138,7 +166,6 @@ def detect_stream(session, ts: float) -> list:
                                    session.sport, session.dport),
     }
 
-    findings = []
     server_bytes = bytes(session.server_buf)
     response = _FTP_RESPONSE_RE.search(server_bytes)
 
