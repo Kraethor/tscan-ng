@@ -12,7 +12,7 @@ Each packet is prefixed with a fixed-size header:
     HDR = struct.Struct("!IIIHH")  # sec, usec, caplen, l2type, pad
 """
 
-import os, sys, ctypes, ctypes.util
+import os, sys, ctypes, ctypes.util, logging, time
 from tscan_ng.config import Config
 
 PCAP_ERRBUF_SIZE = 256
@@ -86,6 +86,50 @@ def _err(pc):
     return (pcap_geterr(pc) or b"unknown").decode("utf-8", "ignore")
 
 
+def _connect_with_retry(sock_path: str,
+                        retries: int = 20,
+                        delay: float = 0.5) -> "socket.socket":
+    """
+    Connect a Unix datagram socket to sock_path, retrying until the socket
+    file appears.
+
+    Dispatcher creates the socket shortly after its process starts.  Because
+    the capture unit starts immediately after systemd considers dispatcher
+    active (Type=simple), there is a small window where the socket file does
+    not yet exist.  Rather than failing hard and relying on systemd's restart
+    loop, we wait here so the two services converge cleanly on every start and
+    on every dispatcher restart.
+
+    Args:
+        sock_path: Filesystem path of the dispatcher's Unix datagram socket.
+        retries:   Maximum number of attempts (default 20 → up to 10 seconds).
+        delay:     Seconds to wait between attempts (default 0.5 s).
+
+    Returns:
+        A connected AF_UNIX SOCK_DGRAM socket.
+
+    Raises:
+        FileNotFoundError: If the socket is still absent after all retries.
+    """
+    import socket
+    for attempt in range(1, retries + 1):
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            s.connect(sock_path)
+            if attempt > 1:
+                logging.info("capture: connected to dispatcher socket after "
+                             "%d attempt(s)", attempt)
+            return s
+        except FileNotFoundError:
+            if attempt == retries:
+                logging.error("capture: dispatcher socket %s not found after "
+                              "%d attempts — giving up", sock_path, retries)
+                raise
+            logging.debug("capture: socket %s not ready (attempt %d/%d), "
+                          "retrying in %.1fs", sock_path, attempt, retries, delay)
+            time.sleep(delay)
+
+
 def capture_into_unix_dgram(iface: str, sock_path: str,
                              buf_bytes: int = 32 * 1024 * 1024,
                              snaplen: int = 65535,
@@ -96,6 +140,9 @@ def capture_into_unix_dgram(iface: str, sock_path: str,
     Opens the specified interface with libpcap in promiscuous mode and sends
     each captured packet — prefixed with a metadata header — to the dispatcher
     via a connected Unix datagram socket.
+
+    Waits up to 10 seconds for the dispatcher socket to appear before giving
+    up, tolerating the startup race between the two services.
 
     The packet header format is:
         struct { uint32 sec; uint32 usec; uint32 caplen; uint16 l2type; uint16 pad; }
@@ -108,11 +155,10 @@ def capture_into_unix_dgram(iface: str, sock_path: str,
         immediate:  If True, enable immediate mode for low-latency capture.
                     Falls back to 1ms timeout if immediate mode is unavailable.
     """
-    import struct, socket
+    import struct
     HDR = struct.Struct("!IIIHH")  # sec, usec, caplen, l2type, pad
 
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    s.connect(sock_path)
+    s = _connect_with_retry(sock_path)
 
     errbuf = ctypes.create_string_buffer(PCAP_ERRBUF_SIZE)
     pc = pcap_create(iface.encode(), errbuf)
@@ -167,6 +213,10 @@ def capture_into_unix_dgram(iface: str, sock_path: str,
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(message)s",
+    )
     cfg = Config()
     if not cfg.iface:
         print("Error: 'iface' must be set in [capture] section of tscan.conf",
