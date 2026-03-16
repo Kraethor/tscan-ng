@@ -31,7 +31,7 @@ Phase status:
     Phase 5 - Session expiry and cleanup:   COMPLETE
 """
 
-import os, struct, socket, time, multiprocessing as mp
+import os, struct, socket, time, logging, multiprocessing as mp
 from tscan_ng.config import Config
 from tscan_ng.parsing.net import parse_basic
 from tscan_ng.detectors import DETECTORS, STREAM_DETECTORS
@@ -186,6 +186,9 @@ def worker_main(pipe, cfg: Config):
         timeout=cfg.session_timeout,
     )
     last_expiry = time.monotonic()
+    logging.basicConfig(level=logging.DEBUG,
+                        format="%(levelname)s worker pid=%(process)d %(message)s")
+    logging.info("worker_main started")
 
     while True:
         msg = pipe.recv()
