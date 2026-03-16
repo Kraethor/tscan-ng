@@ -16,9 +16,12 @@ Each session tracks:
 Flow identity is based on the canonical 4-tuple:
     (src_ip, dst_ip, sport, dport)
 
-Direction is determined by comparing the packet's src/sport against the
-session's canonical src/sport. Packets in the reverse direction are
-accumulated in the server stream.
+Direction is normalised at session creation time: if the first packet arrives
+from a well-known server port (e.g. the server sent the protocol banner first),
+the session is created with src/dst/sport/dport swapped so that session.src and
+session.sport always refer to the *client* endpoint.  This means client_buf
+always contains client-originated bytes and server_buf always contains
+server-originated bytes, without any per-detector direction sniffing.
 
 Phase status:
     Phase 1 - Flow affinity routing:        COMPLETE
@@ -30,6 +33,53 @@ Phase status:
 
 import time
 from dataclasses import dataclass, field
+
+# Ports on which servers are expected to initiate the conversation
+# (i.e. the server sends the first data packet — banner, greeting, etc.).
+# When a packet arrives whose *source* port is in this set and whose
+# *destination* port is not, we treat the packet as server->client and
+# store the session from the client's perspective by swapping src/dst.
+_SERVER_PORTS: frozenset = frozenset({
+    21,    # FTP control
+    22,    # SSH
+    23,    # Telnet
+    25,    # SMTP
+    80,    # HTTP
+    110,   # POP3
+    143,   # IMAP
+    443,   # HTTPS
+    465,   # SMTPS
+    587,   # SMTP submission
+    993,   # IMAPS
+    995,   # POP3S
+    2525,  # SMTP alternate
+})
+
+
+def _normalize_direction(pkt: dict) -> dict:
+    """
+    Return a copy of pkt with src/dst/sport/dport normalised to client perspective.
+
+    If the packet's source port is a known server port and the destination
+    port is not (i.e. the server sent the first data packet), the addresses
+    are swapped so that the client is always represented as the source.
+
+    Args:
+        pkt: Normalized packet dict from parsing.net.parse_basic.
+
+    Returns:
+        pkt unchanged if already client-perspective, or a new dict with
+        src/dst and sport/dport swapped if direction was inverted.
+    """
+    if pkt["sport"] in _SERVER_PORTS and pkt["dport"] not in _SERVER_PORTS:
+        return {
+            **pkt,
+            "src":   pkt["dst"],
+            "dst":   pkt["src"],
+            "sport": pkt["dport"],
+            "dport": pkt["sport"],
+        }
+    return pkt
 
 
 def _make_session_id(src: str, dst: str, sport: int, dport: int,
@@ -64,10 +114,10 @@ def _make_filter(src: str, dst: str, sport: int, dport: int) -> str:
     capture on a corroborating device.
 
     Args:
-        src:   Source IP address string.
-        dst:   Destination IP address string.
-        sport: Source port number.
-        dport: Destination port number.
+        src:   Source IP address string (client).
+        dst:   Destination IP address string (server).
+        sport: Source port number (client).
+        dport: Destination port number (server).
 
     Returns:
         A tcpdump/Wireshark compatible filter string.
@@ -94,11 +144,16 @@ class Session:
     """
     Represents a single active network flow.
 
+    src/dst/sport/dport are always stored from the *client* perspective:
+    session.src is the client IP, session.dst is the server IP, etc.
+    This invariant is enforced by SessionTable.get_or_create via
+    _normalize_direction().
+
     Attributes:
         src:        Source IP of the flow initiator (client).
         dst:        Destination IP of the flow target (server).
-        sport:      Source port of the flow initiator.
-        dport:      Destination port of the flow target.
+        sport:      Source port of the flow initiator (ephemeral).
+        dport:      Destination port of the flow target (well-known).
         session_id: Stable 8-char hex identifier for this flow.
         client_buf: Reassembled byte stream from client to server.
         server_buf: Reassembled byte stream from server to client.
@@ -130,9 +185,10 @@ class Session:
         """
         Append a packet's payload to the appropriate directional buffer.
 
-        Determines direction by comparing the packet's src/sport against
-        the session's canonical src/sport. Packets originating from the
-        session initiator go to client_buf; all others go to server_buf.
+        Because session.src/sport are always normalised to the *client*
+        perspective, direction assignment is straightforward: packets
+        whose source matches the client endpoint go to client_buf;
+        all others go to server_buf.
 
         Args:
             pkt: Normalized packet dict from parsing.net.parse_basic.
@@ -180,7 +236,12 @@ class SessionTable:
     Keyed on a canonical flow tuple that is direction-independent —
     both directions of a flow map to the same session entry. The
     canonical form always places the lower (src, sport) pair first
-    so that client→server and server→client packets match the same key.
+    so that client->server and server->client packets match the same key.
+
+    Sessions are always created with src/sport normalised to the client
+    endpoint (see _normalize_direction), so client_buf and server_buf
+    reliably contain client-originated and server-originated bytes
+    respectively.
 
     Attributes:
         _sessions:  Dict mapping flow keys to Session objects.
@@ -198,7 +259,7 @@ class SessionTable:
             max_buf: Maximum bytes to buffer per directional stream.
             timeout: Idle timeout in seconds before a session is expired.
         """
-        self._sessions: dict[tuple, Session] = {}
+        self._sessions: dict = {}
         self._max_buf = max_buf
         self._timeout = timeout
 
@@ -224,6 +285,11 @@ class SessionTable:
         """
         Return the existing session for a packet's flow, or create a new one.
 
+        New sessions are created with src/sport normalised to the client
+        perspective via _normalize_direction(), ensuring that client_buf
+        always accumulates client bytes and server_buf accumulates server
+        bytes regardless of which endpoint sent the first packet.
+
         Args:
             pkt: Normalized packet dict from parsing.net.parse_basic.
 
@@ -233,11 +299,12 @@ class SessionTable:
         key = self._make_key(pkt["src"], pkt["dst"],
                              pkt["sport"], pkt["dport"])
         if key not in self._sessions:
+            norm = _normalize_direction(pkt)
             self._sessions[key] = Session(
-                src=pkt["src"],
-                dst=pkt["dst"],
-                sport=pkt["sport"],
-                dport=pkt["dport"],
+                src=norm["src"],
+                dst=norm["dst"],
+                sport=norm["sport"],
+                dport=norm["dport"],
             )
         return self._sessions[key]
 
@@ -266,7 +333,7 @@ class SessionTable:
 
         return session
 
-    def expire(self) -> list[dict]:
+    def expire(self) -> list:
         """
         Remove sessions that have been idle longer than the configured timeout.
 
@@ -283,8 +350,10 @@ class SessionTable:
         for k in expired_keys:
             session = self._sessions[k]
             for p in session.pending:
+                clean = {kk: v for kk, v in p.finding.items()
+                         if not kk.startswith("_")}
                 expired_findings.append({
-                    **p.finding,
+                    **clean,
                     "ts_start":    p.ts_start,
                     "ts_end":      session.last_ts,
                     "outcome":     "no_response",
@@ -294,7 +363,7 @@ class SessionTable:
             del self._sessions[k]
         return expired_findings
 
-    def flush_all(self) -> list[dict]:
+    def flush_all(self) -> list:
         """
         Expire all sessions immediately regardless of idle time.
 
@@ -310,8 +379,10 @@ class SessionTable:
         flushed = []
         for session in self._sessions.values():
             for p in session.pending:
+                clean = {k: v for k, v in p.finding.items()
+                         if not k.startswith("_")}
                 flushed.append({
-                    **p.finding,
+                    **clean,
                     "ts_start":    p.ts_start,
                     "ts_end":      session.last_ts,
                     "outcome":     "no_response",
