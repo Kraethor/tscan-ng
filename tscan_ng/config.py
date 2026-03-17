@@ -60,6 +60,7 @@ class Config:
         if os.path.exists(path):
             self._cfg.read(path)
         self._path = path
+        self._validate()
 
     def _get(self, section: str, key: str, fallback):
         """
@@ -171,6 +172,33 @@ class Config:
         """How often (in seconds) each worker runs session expiry."""
         return float(self._getint("sessions", "expiry_interval_sec",
                                   fallback=30))
+
+    def _validate(self):
+        """
+        Validate configuration values and raise ValueError for any that
+        would cause undefined behaviour or silent failures at runtime.
+        """
+        errors = []
+
+        if not self.iface:
+            errors.append("capture.iface must be set")
+        if self.snaplen < 64:
+            errors.append(f"capture.snaplen must be >= 64 (got {self.snaplen})")
+        if self.buffer_bytes <= 0:
+            errors.append(f"capture.buffer_bytes must be > 0 (got {self.buffer_bytes})")
+        if self.workers < 1:
+            errors.append(f"dispatcher.workers must be >= 1 (got {self.workers})")
+        if not self.socket_path:
+            errors.append("dispatcher.socket must be set")
+        if self.session_timeout <= 0:
+            errors.append(f"sessions.timeout_seconds must be > 0 (got {self.session_timeout})")
+        if self.session_max_buf < 1024:
+            errors.append(f"sessions.max_buf_bytes must be >= 1024 (got {self.session_max_buf})")
+        if self.expiry_interval <= 0:
+            errors.append(f"sessions.expiry_interval_sec must be > 0 (got {self.expiry_interval})")
+
+        if errors:
+            raise ValueError("Invalid configuration:\n" + "\n".join(f"  - {e}" for e in errors))
 
     def __repr__(self) -> str:
         return (

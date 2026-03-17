@@ -253,11 +253,16 @@ def dispatcher(cfg: Config):
         p.start(); c_end.close()
         parents.append(p_end); procs.append(p)
 
-    if os.path.exists(cfg.socket_path):
+    try:
         os.unlink(cfg.socket_path)
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    s.bind(cfg.socket_path)
-    os.chmod(cfg.socket_path, 0o660)
+    except FileNotFoundError:
+        pass
+    old_umask = os.umask(0o117)  # Results in 0o660 permissions on bind
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        s.bind(cfg.socket_path)
+    finally:
+        os.umask(old_umask)
 
     rr = 0
     try:
