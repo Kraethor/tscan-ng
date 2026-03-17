@@ -270,15 +270,13 @@ def dispatcher(cfg: Config):
             ts = sec + usec / 1_000_000.0
 
             pkt = parse_basic(l2type, payload)
-            if pkt:
-                worker_idx = _flow_key(pkt["src"], pkt["dst"],
-                                       pkt["sport"], pkt["dport"]) % cfg.workers
-            else:
-                worker_idx = rr % cfg.workers
-                rr += 1
+            if not pkt:
                 continue  # Don't forward unparseable packets to workers
 
+            worker_idx = _flow_key(pkt["src"], pkt["dst"],
+                                   pkt["sport"], pkt["dport"]) % cfg.workers
             parents[worker_idx].send((ts, pkt))
+
 
     except KeyboardInterrupt:
         pass
