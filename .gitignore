@@ -19,3 +19,6 @@ pcaps/
 
 # Runtime sockets/tmp
 /run/tscan/
+
+# Conf file
+tscan_ng.conf

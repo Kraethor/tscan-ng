@@ -4,12 +4,12 @@ sinks/jsonl.py - JSONL output sink for tscan-ng detection findings.
 Writes detection findings as newline-delimited JSON (JSONL) to either a file
 or stdout. Uses orjson for fast serialization.
 
-Each worker process opens its own file handle. On Linux, O_APPEND writes
-are atomic for small payloads, making concurrent multi-worker writes safe
-in practice for typical finding sizes.
+Each worker process opens its own file handle. flock() ensures writes from
+concurrent worker processes do not interleave.
 """
 
 import os
+import fcntl
 import orjson as json
 
 
@@ -38,7 +38,11 @@ class JSONLSink:
         """
         line = json.dumps(obj) + b"\n"
         if self._fd:
-            self._fd.write(line)
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+            try:
+                self._fd.write(line)
+            finally:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
         else:
             try:
                 os.write(1, line)
