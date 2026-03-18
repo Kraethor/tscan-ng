@@ -15,6 +15,14 @@ Because session direction is normalised at creation time (see session.py),
 client_buf always contains client-originated bytes and server_buf always
 contains server-originated bytes.
 
+Port handling:
+    The detector gates on _POP3_PORTS (a frozenset of known POP3 ports).
+    Sessions where neither endpoint port is in the set are skipped immediately,
+    keeping per-packet overhead negligible for non-POP3 traffic.
+
+    The scan for USER and PASS is bounded to _MAX_CMD_SCAN bytes so that a
+    large client buffer does not cause O(n) work on every arriving packet.
+
 Finding outcomes:
     success     - Server responded with +OK after PASS
     failed      - Server responded with -ERR after PASS
@@ -22,8 +30,22 @@ Finding outcomes:
                   (emitted by SessionTable.expire())
 """
 
+import logging
 import re
 from tscan_ng.session import _make_filter
+
+# Well-known POP3 ports.
+# Sessions whose dport or sport is in this set are scanned for credentials.
+_POP3_PORTS: frozenset = frozenset({
+    110,   # POP3 (RFC 1939)
+    995,   # POP3S (still seen in cleartext on internal networks)
+    1100,  # Non-standard POP3 port (site-specific)
+})
+
+# Maximum bytes of the client buffer to scan for USER and PASS commands.
+# POP3 commands are short; 4 KB is well above any realistic auth exchange.
+# Bounding the scan keeps per-packet work O(1) regardless of buffer lifetime.
+_MAX_CMD_SCAN = 4096
 
 # Matches POP3 USER command
 _POP3_USER_RE = re.compile(
@@ -43,8 +65,6 @@ _POP3_RESPONSE_RE = re.compile(
     re.MULTILINE
 )
 
-# POP3 port
-_POP3_PORT = 110
 
 
 def _outcome(status: bytes) -> str:
@@ -87,6 +107,9 @@ def detect_stream(session, ts: float) -> list:
     and consumes the matched commands from the client buffer to avoid
     re-detection on subsequent packets.
 
+    The scan is bounded to _MAX_CMD_SCAN bytes per call to keep per-packet
+    work O(1) regardless of buffer lifetime.
+
     Args:
         session: Session object from session.SessionTable.
         ts:      Unix timestamp of the current packet.
@@ -95,10 +118,12 @@ def detect_stream(session, ts: float) -> list:
         List of resolved finding dicts. Pending findings are registered on
         the session and not returned until resolved.
     """
-    if session.dport != _POP3_PORT and session.sport != _POP3_PORT:
+    # Skip sessions that are not on a known POP3 port.
+    if session.dport not in _POP3_PORTS and session.sport not in _POP3_PORTS:
         return []
 
-    client_bytes = bytes(session.client_buf)
+    # Cap the scan to _MAX_CMD_SCAN bytes to bound per-packet CPU cost.
+    client_bytes = bytes(session.client_buf[:_MAX_CMD_SCAN])
 
     user_match = _POP3_USER_RE.search(client_bytes)
     if not user_match:
@@ -110,6 +135,15 @@ def detect_stream(session, ts: float) -> list:
 
     user   = user_match.group(1).decode("utf-8", "ignore")
     passwd = pass_match.group(1).decode("utf-8", "ignore")
+
+    # Guard against empty captures — emit nothing rather than a finding
+    # with blank credentials, which would be noise in the output.
+    if not user or not passwd:
+        logging.debug(
+            "pop3: session %s: USER or PASS matched but captured empty string",
+            session.session_id)
+        del session.client_buf[:pass_match.end()]
+        return []
 
     base = {
         "type":       "pop3_creds",
