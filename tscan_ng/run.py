@@ -31,7 +31,7 @@ Phase status:
     Phase 5 - Session expiry and cleanup:   COMPLETE
 """
 
-import os, struct, socket, time, logging, multiprocessing as mp
+import os, queue as _queue, struct, socket, time, logging, multiprocessing as mp
 from tscan_ng.config import Config
 from tscan_ng.parsing.net import parse_basic
 from tscan_ng.detectors import DETECTORS, STREAM_DETECTORS
@@ -162,31 +162,33 @@ def _try_resolve(p, session, ts: float) -> dict | None:
     return None
 
 
-def worker_main(pipe, cfg: Config):
+def worker_main(q: mp.Queue, cfg: Config):
     """
     Worker process entry point.
 
-    Receives (ts, pkt) tuples from the dispatcher via a multiprocessing
-    Pipe, accumulates each packet into the per-flow SessionTable, runs
-    per-packet detectors, runs stream-aware detectors, resolves any
-    pending findings against newly arrived server responses, and writes
-    all findings to the configured JSONLSink.
+    Receives (ts, pkt) tuples from the dispatcher via a bounded
+    multiprocessing Queue, accumulates each packet into the per-flow
+    SessionTable, runs per-packet detectors, runs stream-aware detectors,
+    resolves any pending findings against newly arrived server responses,
+    and writes all findings to the configured JSONLSink.
 
     Session expiry runs on a wall-clock timer using cfg.expiry_interval.
+    The queue get() uses a 1-second timeout so expiry fires even during
+    quiet periods with no incoming traffic.
 
     Shutdown paths:
-      - Normal: dispatcher sends a None sentinel; worker flushes all sessions
+      - Normal: dispatcher puts a None sentinel; worker flushes all sessions
         (emitting no_response for any unresolved pending findings) and exits.
-      - Unexpected: if the dispatcher process dies the pipe is closed and
-        pipe.recv() raises EOFError; the worker flushes sessions and exits
-        cleanly rather than hanging.
+      - Unexpected: workers are daemon processes and are killed by the OS
+        when the dispatcher process exits. Sessions are not flushed in this
+        case; it is an abnormal exit scenario.
       - Runaway failures: if packet processing raises 100 consecutive
         exceptions the worker logs an error and exits to avoid silently
         consuming packets without producing any output.
 
     Args:
-        pipe: The child end of a multiprocessing.Pipe connection.
-        cfg:  Loaded Config object.
+        q:   Bounded multiprocessing Queue shared with the dispatcher.
+        cfg: Loaded Config object.
     """
     sink = JSONLSink(cfg.out_path or None)
     sessions = SessionTable(
@@ -202,14 +204,15 @@ def worker_main(pipe, cfg: Config):
     fail_count = 0
     while True:
         try:
-            msg = pipe.recv()
-        except EOFError:
-            # Dispatcher process died; pipe was closed from the other end.
-            # Flush sessions so findings are not lost, then exit cleanly.
-            logging.warning("worker_main: pipe closed unexpectedly, flushing and exiting")
-            for f in sessions.flush_all():
-                sink.write({"ts": f["ts_start"], **f})
-            break
+            msg = q.get(timeout=1.0)
+        except _queue.Empty:
+            # No packets for 1 second. Run session expiry and loop.
+            now = time.monotonic()
+            if now - last_expiry >= cfg.expiry_interval:
+                for f in sessions.expire():
+                    sink.write({"ts": f["ts_start"], **f})
+                last_expiry = now
+            continue
 
         if msg is None:
             # Normal shutdown sentinel from the dispatcher.
@@ -257,6 +260,13 @@ def dispatcher(cfg: Config):
     spawns a pool of worker processes, and routes packets to workers using
     flow-affinity hashing on (src_ip, dst_ip, sport, dport).
 
+    Each worker receives packets via a bounded multiprocessing Queue
+    (maxsize=2000).  The dispatcher uses put_nowait() so that a slow or
+    overwhelmed worker never blocks packet processing for other workers.
+    If a worker's queue is full, the packet for that flow is dropped and
+    counted.  This prevents a single high-volume session from stalling the
+    entire pipeline.
+
     Parses each packet once in the dispatcher to extract the flow key, then
     forwards the parsed pkt dict to the worker to avoid a redundant parse in
     the worker.  Packets that cannot be parsed (non-IP, non-TCP/UDP) are
@@ -270,18 +280,21 @@ def dispatcher(cfg: Config):
     reassembly and response correlation.
 
     Shuts down cleanly on KeyboardInterrupt, sending a None sentinel to each
-    worker to trigger graceful session flushing.  Workers that do not exit
-    within 5 seconds are forcibly terminated to prevent process leaks.
+    worker queue to trigger graceful session flushing.  Workers that do not
+    exit within 5 seconds are forcibly terminated to prevent process leaks.
 
     Args:
         cfg: Loaded Config object.
     """
-    parents, procs = [], []
+    queues, procs = [], []
     for _ in range(cfg.workers):
-        p_end, c_end = mp.Pipe()
-        p = mp.Process(target=worker_main, args=(c_end, cfg), daemon=True)
-        p.start(); c_end.close()
-        parents.append(p_end); procs.append(p)
+        # Bounded queue — put_nowait() in the dispatch loop drops packets
+        # rather than blocking when a worker falls behind.
+        q = mp.Queue(maxsize=2000)
+        p = mp.Process(target=worker_main, args=(q, cfg), daemon=True)
+        p.start()
+        queues.append(q)
+        procs.append(p)
 
     try:
         os.unlink(cfg.socket_path)
@@ -294,8 +307,9 @@ def dispatcher(cfg: Config):
     finally:
         os.umask(old_umask)
 
-    # Running total of packets skipped because parse_basic() returned None.
-    parse_drops = 0
+    # Running totals for observability.
+    parse_drops = 0   # packets dropped because parse_basic() returned None
+    worker_drops = 0  # packets dropped because a worker queue was full
     try:
         while True:
             buf = s.recv(65536 + HDR.size)
@@ -319,14 +333,25 @@ def dispatcher(cfg: Config):
 
             worker_idx = _flow_key(pkt["src"], pkt["dst"],
                                    pkt["sport"], pkt["dport"]) % cfg.workers
-            parents[worker_idx].send((ts, pkt))
+            try:
+                queues[worker_idx].put_nowait((ts, pkt))
+            except _queue.Full:
+                # Worker queue is full — drop this packet rather than blocking
+                # the dispatcher and stalling all other workers.
+                worker_drops += 1
+                if worker_drops % 1000 == 1:
+                    logging.warning(
+                        "dispatcher: %d packet(s) dropped — worker %d queue full",
+                        worker_drops, worker_idx)
 
     except KeyboardInterrupt:
         pass
     finally:
-        for pe in parents:
-            try: pe.send(None)
-            except BrokenPipeError: pass
+        for q in queues:
+            try:
+                q.put(None, timeout=5)
+            except _queue.Full:
+                pass
         for p in procs:
             p.join(timeout=5)
             if p.is_alive():

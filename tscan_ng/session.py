@@ -163,6 +163,10 @@ class Session:
         created_at: Monotonic timestamp when the session was first created.
         ts_first:   Unix timestamp of the first packet seen (for findings).
         last_ts:    Unix timestamp of the most recently processed packet.
+        _client_trim_warned: True after the first client_buf trim warning has
+                    been emitted. Suppresses repeat warnings on the same session
+                    to prevent log flooding on high-volume persistent connections.
+        _server_trim_warned: Same as above for server_buf.
     """
     src:        str
     dst:        str
@@ -176,6 +180,10 @@ class Session:
     created_at: float     = field(default_factory=time.monotonic)
     ts_first:   float     = 0.0
     last_ts:    float     = 0.0
+    # Trim warning suppression: warn once per direction, then go silent.
+    # Prevents log flooding on high-volume persistent connections.
+    _client_trim_warned: bool = field(default=False, repr=False)
+    _server_trim_warned: bool = field(default=False, repr=False)
 
     def __post_init__(self):
         self.session_id = _make_session_id(
@@ -342,16 +350,20 @@ class SessionTable:
         session.add_packet(pkt, ts)
 
         if len(session.client_buf) > self._max_buf:
-            logging.warning(
-                "session %s: client_buf trimmed (%d bytes) — "
-                "increase session_max_buf to reduce credential data loss",
-                session.session_id, len(session.client_buf))
+            if not session._client_trim_warned:
+                logging.warning(
+                    "session %s: client_buf trimmed (%d bytes) — "
+                    "increase session_max_buf to reduce credential data loss",
+                    session.session_id, len(session.client_buf))
+                session._client_trim_warned = True
             del session.client_buf[:-self._max_buf]
         if len(session.server_buf) > self._max_buf:
-            logging.warning(
-                "session %s: server_buf trimmed (%d bytes) — "
-                "increase session_max_buf to reduce credential data loss",
-                session.session_id, len(session.server_buf))
+            if not session._server_trim_warned:
+                logging.warning(
+                    "session %s: server_buf trimmed (%d bytes) — "
+                    "increase session_max_buf to reduce credential data loss",
+                    session.session_id, len(session.server_buf))
+                session._server_trim_warned = True
             del session.server_buf[:-self._max_buf]
 
         return session

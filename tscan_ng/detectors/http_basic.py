@@ -9,6 +9,17 @@ Detects credentials submitted via HTTP Basic Authentication and emits
 findings with full request context (method, URI, host) and response
 correlation (status code, outcome).
 
+Buffer handling:
+    The scan for HTTP header boundaries is capped at _MAX_HEADER_SCAN bytes
+    per call. This keeps per-packet work O(1) regardless of buffer size, and
+    avoids O(n²) behaviour at high line speed where detect_stream() is called
+    on every arriving packet.
+
+    The client buffer is consumed (via del) before request processing, not
+    after. This guarantees the buffer always advances even if an exception
+    occurs mid-processing, preventing the same headers from being re-examined
+    on every subsequent packet.
+
 Finding outcomes:
     success      - Server responded with 2xx
     failed       - Server responded with 401
@@ -19,9 +30,15 @@ Finding outcomes:
                    (emitted by SessionTable.expire())
 """
 
+import logging
 import re
 from tscan_ng.detectors.common import decode_b64
 from tscan_ng.session import _make_filter
+
+# Maximum bytes to scan for an HTTP header boundary (\r\n\r\n) per call.
+# 16 KB is well above any realistic HTTP request header. Capping the scan
+# here bounds per-packet CPU to O(1) rather than O(n) over buffer lifetime.
+_MAX_HEADER_SCAN = 16384
 
 # Matches the HTTP request line e.g. "GET /path HTTP/1.1"
 _REQUEST_LINE_RE = re.compile(rb"^([A-Z]+)\s+(\S+)\s+HTTP/\d+\.\d+\r\n", re.MULTILINE)
@@ -95,13 +112,18 @@ def detect_stream(session, ts: float) -> list[dict]:
     Stream-aware HTTP Basic Auth detector.
 
     Scans the session's client buffer for complete HTTP requests containing
-    an Authorization: Basic header. For each one found, attempts to correlate
-    with a server response already present in the server buffer.
+    an Authorization: Basic header. For each request found, attempts to
+    correlate with a server response already present in the server buffer.
 
-    Emits a finding with outcome "pending" if no server response is available
-    yet, and registers it on the session for later resolution. Consumes
-    matched requests from the client buffer to avoid re-detection on
-    subsequent packets.
+    Emits a finding immediately if a server response is available, or
+    registers a pending finding on the session for later resolution when the
+    response arrives. Consumes matched requests from the client buffer to
+    avoid re-detection on subsequent packets.
+
+    The scan is bounded to _MAX_HEADER_SCAN bytes per call to prevent O(n²)
+    CPU usage at high line speed. The client buffer is consumed before
+    per-request processing so the buffer always advances, even if processing
+    raises an exception.
 
     Args:
         session: Session object from session.SessionTable.
@@ -112,37 +134,49 @@ def detect_stream(session, ts: float) -> list[dict]:
         the session and not returned until resolved.
     """
     findings = []
-    client_bytes = bytes(session.client_buf)
 
-    # Find all complete HTTP request headers (terminated by double CRLF)
     while True:
-        header_end = client_bytes.find(b"\r\n\r\n")
+        # Limit the scan to _MAX_HEADER_SCAN bytes to keep per-packet work
+        # O(1). If no complete header is found within this window, wait for
+        # more data to arrive.
+        scan = bytes(session.client_buf[:_MAX_HEADER_SCAN + 4])
+        header_end = scan.find(b"\r\n\r\n")
         if header_end == -1:
-            break  # No complete request headers yet
+            break
 
-        headers = client_bytes[:header_end + 4]
+        # Consume the request headers from the session buffer NOW, before any
+        # processing that could raise. This guarantees the buffer always
+        # advances and prevents re-processing the same request on every
+        # subsequent packet if an exception occurs below.
+        consume = header_end + 4
+        headers = bytes(session.client_buf[:consume])
+        del session.client_buf[:consume]
 
-        # Check for Authorization: Basic header
+        # Skip requests with no Basic Auth credentials
         auth_match = _AUTH_HEADER_RE.search(headers)
         if not auth_match:
-            # No credentials in this request — consume and move on
-            client_bytes = client_bytes[header_end + 4:]
-            session.client_buf = bytearray(client_bytes)
             continue
 
-        # Extract request line components
+        # Extract request line (method + URI)
         req_match = _REQUEST_LINE_RE.search(headers)
         method = req_match.group(1).decode("utf-8", "ignore") if req_match else ""
         uri    = req_match.group(2).decode("utf-8", "ignore") if req_match else ""
+
+        if not method:
+            # Authorization header present but no parseable request line.
+            # Still emit the finding — credentials are the primary artifact —
+            # but log so anomalous requests are visible during troubleshooting.
+            logging.debug(
+                "http_basic: session %s: Authorization header with no request line",
+                session.session_id)
 
         # Extract Host header
         host_match = _HOST_HEADER_RE.search(headers)
         host = host_match.group(1).decode("utf-8", "ignore") if host_match else ""
 
-        # Decode credentials
+        # Decode Base64 credentials
         creds = decode_b64(auth_match.group(1))
 
-        # Build the base finding
         base = {
             "type":       "http_basic",
             "session_id": session.session_id,
@@ -158,7 +192,7 @@ def detect_stream(session, ts: float) -> list[dict]:
                                        session.sport, session.dport),
         }
 
-        # Attempt to correlate with a server response
+        # Attempt to correlate with a server response already in server_buf
         response = _parse_response(session.server_buf)
         if response:
             status, status_text = response
@@ -170,16 +204,12 @@ def detect_stream(session, ts: float) -> list[dict]:
                 "status_text": status_text,
                 "outcome":     _outcome(status),
             })
-            # Consume the response from server_buf
+            # Consume the matched response from server_buf
             m = _RESPONSE_LINE_RE.search(bytes(session.server_buf))
             if m:
                 del session.server_buf[:m.end()]
         else:
-            # No response yet — register as pending
+            # No server response yet — register as pending for later resolution
             session.add_pending(base, ts_start=ts)
-
-        # Consume this request from client_buf
-        client_bytes = client_bytes[header_end + 4:]
-        session.client_buf = bytearray(client_bytes)
 
     return findings
