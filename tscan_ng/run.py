@@ -173,8 +173,16 @@ def worker_main(pipe, cfg: Config):
     all findings to the configured JSONLSink.
 
     Session expiry runs on a wall-clock timer using cfg.expiry_interval.
-    On shutdown (None sentinel received), all remaining sessions are flushed
-    and any pending findings are emitted as no_response before exit.
+
+    Shutdown paths:
+      - Normal: dispatcher sends a None sentinel; worker flushes all sessions
+        (emitting no_response for any unresolved pending findings) and exits.
+      - Unexpected: if the dispatcher process dies the pipe is closed and
+        pipe.recv() raises EOFError; the worker flushes sessions and exits
+        cleanly rather than hanging.
+      - Runaway failures: if packet processing raises 100 consecutive
+        exceptions the worker logs an error and exits to avoid silently
+        consuming packets without producing any output.
 
     Args:
         pipe: The child end of a multiprocessing.Pipe connection.
@@ -190,9 +198,21 @@ def worker_main(pipe, cfg: Config):
                         format="%(levelname)s worker pid=%(process)d %(message)s")
     logging.info("worker_main started")
 
+    # Consecutive failure counter — reset to 0 on every successful packet.
+    fail_count = 0
     while True:
-        msg = pipe.recv()
+        try:
+            msg = pipe.recv()
+        except EOFError:
+            # Dispatcher process died; pipe was closed from the other end.
+            # Flush sessions so findings are not lost, then exit cleanly.
+            logging.warning("worker_main: pipe closed unexpectedly, flushing and exiting")
+            for f in sessions.flush_all():
+                sink.write({"ts": f["ts_start"], **f})
+            break
+
         if msg is None:
+            # Normal shutdown sentinel from the dispatcher.
             for f in sessions.flush_all():
                 sink.write({"ts": f["ts_start"], **f})
             break
@@ -220,8 +240,13 @@ def worker_main(pipe, cfg: Config):
                 for f in sessions.expire():
                     sink.write({"ts": f["ts_start"], **f})
                 last_expiry = now
+            fail_count = 0  # Reset on success
         except Exception:
             logging.exception("worker_main unhandled exception processing packet")
+            fail_count += 1
+            if fail_count >= 100:
+                logging.error("worker_main: %d consecutive failures, exiting", fail_count)
+                break
 
 
 def dispatcher(cfg: Config):
@@ -233,15 +258,20 @@ def dispatcher(cfg: Config):
     flow-affinity hashing on (src_ip, dst_ip, sport, dport).
 
     Parses each packet once in the dispatcher to extract the flow key, then
-    forwards the parsed pkt dict to the worker to avoid a redundant parse.
-    Packets that cannot be parsed fall back to round-robin dispatch.
+    forwards the parsed pkt dict to the worker to avoid a redundant parse in
+    the worker.  Packets that cannot be parsed (non-IP, non-TCP/UDP) are
+    counted and discarded; they are not forwarded to workers.
+
+    A caplen bounds check is applied before slicing the payload to guard
+    against corrupt headers from the capture process.
 
     Flow affinity guarantees that all packets from a given TCP/UDP session
     are handled by the same worker, which is required for stateful stream
-    processing.
+    reassembly and response correlation.
 
     Shuts down cleanly on KeyboardInterrupt, sending a None sentinel to each
-    worker to signal termination and allow graceful session flushing.
+    worker to trigger graceful session flushing.  Workers that do not exit
+    within 5 seconds are forcibly terminated to prevent process leaks.
 
     Args:
         cfg: Loaded Config object.
@@ -264,24 +294,32 @@ def dispatcher(cfg: Config):
     finally:
         os.umask(old_umask)
 
-    rr = 0
+    # Running total of packets skipped because parse_basic() returned None.
+    parse_drops = 0
     try:
         while True:
             buf = s.recv(65536 + HDR.size)
             if len(buf) < HDR.size:
                 continue
             sec, usec, caplen, l2type, _ = HDR.unpack_from(buf, 0)
+            # Reject packets where the claimed caplen exceeds available bytes.
+            if caplen > len(buf) - HDR.size:
+                continue
             payload = memoryview(buf)[HDR.size:HDR.size + caplen].tobytes()
             ts = sec + usec / 1_000_000.0
 
             pkt = parse_basic(l2type, payload)
             if not pkt:
-                continue  # Don't forward unparseable packets to workers
+                # Expected for non-IP or non-TCP/UDP traffic (ARP, ICMP, etc.).
+                parse_drops += 1
+                if parse_drops % 1000 == 1:
+                    logging.debug("dispatcher: %d packet(s) unparseable (non-IP/non-TCP/UDP)",
+                                  parse_drops)
+                continue
 
             worker_idx = _flow_key(pkt["src"], pkt["dst"],
                                    pkt["sport"], pkt["dport"]) % cfg.workers
             parents[worker_idx].send((ts, pkt))
-
 
     except KeyboardInterrupt:
         pass
@@ -291,6 +329,12 @@ def dispatcher(cfg: Config):
             except BrokenPipeError: pass
         for p in procs:
             p.join(timeout=5)
+            if p.is_alive():
+                # Worker did not respond to the None sentinel in time.
+                logging.warning("dispatcher: worker pid=%d did not exit cleanly, terminating",
+                                p.pid)
+                p.terminate()
+                p.join(timeout=1)
 
 
 if __name__ == "__main__":

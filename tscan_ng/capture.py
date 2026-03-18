@@ -147,6 +147,15 @@ def capture_into_unix_dgram(iface: str, sock_path: str,
     Waits up to 10 seconds for the dispatcher socket to appear before giving
     up, tolerating the startup race between the two services.
 
+    The socket is set non-blocking so that a slow or stalled dispatcher cannot
+    block the capture loop.  If the dispatcher's receive buffer is full
+    (BlockingIOError), the packet is dropped and counted.  If the socket
+    itself is broken (OSError), a reconnect is attempted automatically so
+    capture survives a dispatcher restart without losing the pcap session.
+
+    caplen values outside the range (0, snaplen] are skipped to guard
+    against malformed or corrupt pcap headers.
+
     The packet header format is:
         struct { uint32 sec; uint32 usec; uint32 caplen; uint16 l2type; uint16 pad; }
 
@@ -162,6 +171,7 @@ def capture_into_unix_dgram(iface: str, sock_path: str,
     HDR = struct.Struct("!IIIHH")  # sec, usec, caplen, l2type, pad
 
     s = _connect_with_retry(sock_path)
+    # Non-blocking so a stalled dispatcher cannot pause the capture loop.
     s.setblocking(False)
 
     errbuf = ctypes.create_string_buffer(PCAP_ERRBUF_SIZE)
@@ -194,6 +204,7 @@ def capture_into_unix_dgram(iface: str, sock_path: str,
     dlt = pcap_datalink(pc)
     hdr_ptr = ctypes.POINTER(pcap_pkthdr)()
     data_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+    # Running total of packets dropped due to dispatcher backpressure.
     drop_count = 0
 
     try:
@@ -202,6 +213,7 @@ def capture_into_unix_dgram(iface: str, sock_path: str,
             if rc == 1:
                 hdr = hdr_ptr.contents
                 caplen = int(hdr.caplen)
+                # Guard against corrupt or malformed pcap headers.
                 if caplen == 0 or caplen > snaplen:
                     continue
                 sec = int(hdr.ts.tv_sec)
@@ -210,12 +222,17 @@ def capture_into_unix_dgram(iface: str, sock_path: str,
                 try:
                     s.send(HDR.pack(sec, usec, caplen, dlt, 0) + pkt)
                 except BlockingIOError:
+                    # Dispatcher receive buffer is full; drop this packet rather
+                    # than blocking the capture loop.  Log every 1000 drops so
+                    # sustained backpressure is visible without flooding the log.
                     drop_count += 1
                     if drop_count % 1000 == 1:
                         logging.warning(
                             "capture: %d packet(s) dropped — dispatcher backpressure",
                             drop_count)
                 except OSError as exc:
+                    # Socket is broken (dispatcher restarted, etc.).  Reconnect
+                    # so capture can resume without restarting the pcap session.
                     logging.error("capture: send error (%s), reconnecting", exc)
                     try:
                         s.close()
@@ -223,11 +240,11 @@ def capture_into_unix_dgram(iface: str, sock_path: str,
                         pass
                     s = _connect_with_retry(sock_path)
                     s.setblocking(False)
-            elif rc == 0:   # timeout
+            elif rc == 0:   # timeout — no packet available yet
                 continue
-            elif rc == -2:  # breakloop
+            elif rc == -2:  # pcap_breakloop() called
                 break
-            else:
+            else:           # rc == -1: error; keep running
                 continue
     finally:
         try:
