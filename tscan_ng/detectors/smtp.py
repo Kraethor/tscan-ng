@@ -32,6 +32,13 @@ For AUTH LOGIN the credentials arrive across multiple packets.  The client
 buffer is not consumed until both base64 lines are present so that AUTH LOGIN
 remains as a stable anchor across successive detect_stream calls.
 
+Port handling:
+    The detector gates on _SMTP_PORTS (a frozenset of known SMTP ports).
+    Sessions where neither endpoint port is in the set are skipped immediately.
+
+    The scan for AUTH commands is bounded to _MAX_CMD_SCAN bytes so that a
+    large client buffer does not cause O(n) work on every arriving packet.
+
 Finding outcomes:
     success      - Server responded with 235 Authentication successful
     failed       - Server responded with 535 or 534 Authentication failed
@@ -40,6 +47,7 @@ Finding outcomes:
                    (emitted by SessionTable.expire())
 """
 
+import logging
 import re
 import base64
 from tscan_ng.session import _make_filter
@@ -68,8 +76,19 @@ _SMTP_RESPONSE_RE = re.compile(
     re.MULTILINE
 )
 
-# SMTP ports
-_SMTP_PORTS = {25, 587, 465, 2525}
+# Well-known SMTP control ports (standard and submission variants).
+# Sessions whose dport or sport is in this set are scanned for credentials.
+_SMTP_PORTS: frozenset = frozenset({
+    25,    # SMTP (RFC 5321)
+    587,   # SMTP submission (RFC 6409)
+    465,   # SMTPS (legacy; still widely used)
+    2525,  # Common alternate SMTP port
+})
+
+# Maximum bytes of the client buffer to scan for AUTH commands per call.
+# SMTP auth exchanges are short; 4 KB is well above any realistic exchange.
+# Bounding the scan keeps per-packet work O(1) regardless of buffer lifetime.
+_MAX_CMD_SCAN = 4096
 
 
 def _outcome(code: bytes) -> str:
@@ -175,10 +194,12 @@ def detect_stream(session, ts: float) -> list:
         List of resolved finding dicts. Pending findings are registered on
         the session and not returned until resolved.
     """
+    # Skip sessions that are not on a known SMTP port.
     if session.sport not in _SMTP_PORTS and session.dport not in _SMTP_PORTS:
         return []
 
-    client_bytes = bytes(session.client_buf)
+    # Cap the scan to _MAX_CMD_SCAN bytes to bound per-packet CPU cost.
+    client_bytes = bytes(session.client_buf[:_MAX_CMD_SCAN])
     server_bytes = bytes(session.server_buf)
 
     findings = []
@@ -245,8 +266,19 @@ def detect_stream(session, ts: float) -> list:
             result = _decode_plain(next_line.group(1)) if next_line else None
             end = next_line.end() if next_line else plain_match.end()
 
-        if result:
+        # Use `is not None` rather than truthiness: a valid result is always a
+        # 2-tuple, but an explicit None check is more robust if _decode_plain()
+        # is ever extended to return other falsy values.
+        if result is not None:
             user, passwd = result
+            # Guard against empty captures — emit nothing rather than
+            # a finding with blank credentials.
+            if not user and not passwd:
+                logging.debug(
+                    "smtp: session %s: AUTH PLAIN decoded empty credentials",
+                    session.session_id)
+                del session.client_buf[:end]
+                return findings
             base = {
                 "type":       "smtp_creds",
                 "mechanism":  "PLAIN",
