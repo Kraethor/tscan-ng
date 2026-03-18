@@ -17,6 +17,14 @@ Because session direction is normalised at creation time (see session.py),
 client_buf always contains client-originated bytes and server_buf always
 contains server-originated bytes. No direction sniffing is required here.
 
+Port handling:
+    The detector gates on _FTP_PORTS (a frozenset of known FTP control ports).
+    Sessions where neither endpoint port is in the set are skipped immediately,
+    keeping per-packet overhead negligible for non-FTP traffic.
+
+    The scan for USER and PASS is bounded to _MAX_CMD_SCAN bytes so that a
+    large client buffer does not cause O(n) work on every arriving packet.
+
 Finding outcomes:
     success      - Server responded with 230 Login successful
     failed       - Server responded with 530 Login incorrect
@@ -25,8 +33,22 @@ Finding outcomes:
                    (emitted by SessionTable.expire())
 """
 
+import logging
 import re
 from tscan_ng.session import _make_filter
+
+# Well-known and commonly-used FTP control ports.
+# Sessions whose dport or sport is in this set are scanned for credentials.
+# Add site-specific alternate ports here if needed.
+_FTP_PORTS: frozenset = frozenset({
+    21,    # Standard FTP control port (RFC 959)
+    2121,  # Common alternate FTP port
+})
+
+# Maximum bytes of the client buffer to scan for USER and PASS commands.
+# FTP commands are short; 4 KB is well above any realistic auth exchange.
+# Bounding the scan keeps per-packet work O(1) regardless of buffer lifetime.
+_MAX_CMD_SCAN = 4096
 
 # Matches FTP USER command
 _FTP_USER_RE = re.compile(
@@ -100,6 +122,9 @@ def detect_stream(session, ts: float) -> list:
     and consumes the matched commands from the client buffer to avoid
     re-detection on subsequent packets.
 
+    The scan is bounded to _MAX_CMD_SCAN bytes so that a large client
+    buffer does not cause O(n) work on every arriving packet.
+
     Args:
         session: Session object from session.SessionTable.
         ts:      Unix timestamp of the current packet.
@@ -108,21 +133,36 @@ def detect_stream(session, ts: float) -> list:
         List of resolved finding dicts. Pending findings are registered on
         the session and not returned until resolved.
     """
-    if session.dport != 21 and session.sport != 21:
+    # Skip sessions that are not on a known FTP control port.
+    # Neither dport nor sport in _FTP_PORTS means this is definitely not FTP.
+    if session.dport not in _FTP_PORTS and session.sport not in _FTP_PORTS:
         return []
 
-    client_bytes = bytes(session.client_buf)
+    # Cap the scan to _MAX_CMD_SCAN bytes to bound per-packet CPU cost.
+    client_bytes = bytes(session.client_buf[:_MAX_CMD_SCAN])
 
     user_match = _FTP_USER_RE.search(client_bytes)
     if not user_match:
         return []
 
+    # Search for PASS only within the remaining scan window after USER.
+    # user_match.end() is always within client_bytes, so this is safe.
     pass_match = _FTP_PASS_RE.search(client_bytes, user_match.end())
     if not pass_match:
         return []
 
     user   = user_match.group(1).decode("utf-8", "ignore")
     passwd = pass_match.group(1).decode("utf-8", "ignore")
+
+    # Guard against empty captures — regex group(1) can theoretically match
+    # an empty string if the pattern allows it. Emit nothing rather than a
+    # finding with blank credentials, which would be noise in the output.
+    if not user or not passwd:
+        logging.debug(
+            "ftp: session %s: USER or PASS matched but captured empty string",
+            session.session_id)
+        del session.client_buf[:pass_match.end()]
+        return []
 
     is_anonymous = user.lower() == "anonymous"
 
