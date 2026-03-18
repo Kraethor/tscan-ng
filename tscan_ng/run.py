@@ -338,5 +338,13 @@ def dispatcher(cfg: Config):
 
 
 if __name__ == "__main__":
-    cfg = Config()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(message)s",
+    )
+    try:
+        cfg = Config()
+    except ValueError as exc:
+        logging.critical("tscan-dispatcher: configuration error — %s", exc)
+        raise SystemExit(1)
     dispatcher(cfg)

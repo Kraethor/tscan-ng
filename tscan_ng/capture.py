@@ -258,11 +258,11 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(levelname)s %(message)s",
     )
-    cfg = Config()
-    if not cfg.iface:
-        print("Error: 'iface' must be set in [capture] section of tscan.conf",
-              file=sys.stderr)
-        sys.exit(1)
+    try:
+        cfg = Config()
+    except ValueError as exc:
+        logging.critical("tscan-capture: configuration error — %s", exc)
+        raise SystemExit(1)
     capture_into_unix_dgram(
         iface=cfg.iface,
         sock_path=cfg.socket_path,

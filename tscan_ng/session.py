@@ -32,6 +32,7 @@ Phase status:
 """
 
 import time
+import logging
 from dataclasses import dataclass, field
 
 # Ports on which servers are expected to initiate the conversation
@@ -190,12 +191,23 @@ class Session:
         whose source matches the client endpoint go to client_buf;
         all others go to server_buf.
 
+        pkt is guaranteed to contain the keys src, dst, sport, dport, and
+        payload by parsing.net.parse_basic(), which is the only source of
+        pkt dicts in this pipeline.
+
+        last_ts is only advanced forward to guard against backward system
+        clock adjustments (e.g. NTP step corrections) producing inverted
+        ts_start/ts_end timestamps in findings.
+
         Args:
             pkt: Normalized packet dict from parsing.net.parse_basic.
             ts:  Unix timestamp of this packet.
         """
         self.last_seen = time.monotonic()
-        self.last_ts = ts
+        # Only advance last_ts forward — guard against backward clock jumps
+        # producing inverted timestamps in emitted findings.
+        if ts > self.last_ts:
+            self.last_ts = ts
         if self.ts_first == 0.0:
             self.ts_first = ts
         payload = pkt.get("payload", b"")
@@ -313,7 +325,11 @@ class SessionTable:
         Add a packet to its corresponding session, creating one if needed.
 
         Enforces the per-direction buffer size limit by trimming the oldest
-        bytes from the front of the buffer if it exceeds max_buf.
+        bytes from the front of the buffer if it exceeds max_buf.  Trimming
+        is logged at WARNING level because it can cause partial protocol state
+        loss — for example, a USER command trimmed before its PASS arrives will
+        prevent credential correlation for that exchange.  If trims are frequent,
+        increase session_max_buf in tscan_ng.conf.
 
         Args:
             pkt: Normalized packet dict from parsing.net.parse_basic.
@@ -325,10 +341,17 @@ class SessionTable:
         session = self.get_or_create(pkt)
         session.add_packet(pkt, ts)
 
-        # Trim buffers if they exceed the maximum size
         if len(session.client_buf) > self._max_buf:
+            logging.warning(
+                "session %s: client_buf trimmed (%d bytes) — "
+                "increase session_max_buf to reduce credential data loss",
+                session.session_id, len(session.client_buf))
             del session.client_buf[:-self._max_buf]
         if len(session.server_buf) > self._max_buf:
+            logging.warning(
+                "session %s: server_buf trimmed (%d bytes) — "
+                "increase session_max_buf to reduce credential data loss",
+                session.session_id, len(session.server_buf))
             del session.server_buf[:-self._max_buf]
 
         return session

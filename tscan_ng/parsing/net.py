@@ -15,6 +15,7 @@ Returned dict fields:
     payload (bytes) - Transport layer payload
 """
 
+import logging
 import socket
 import dpkt
 
@@ -34,7 +35,8 @@ def _ip_str(raw: bytes) -> str:
 
     Returns:
         Dotted-decimal (IPv4) or colon-hex (IPv6) string, or empty string
-        on error.
+        if the bytes are not a valid IP address length or inet_ntop fails.
+        Callers must treat an empty return as a parse failure.
     """
     try:
         if len(raw) == 4:
@@ -50,8 +52,18 @@ def parse_basic(l2type: int, data: bytes) -> dict | None:
     """
     Parse a raw packet into a normalized dict for detector consumption.
 
-    Walks the packet from Layer 2 through Layer 4. Returns None if the packet
-    is not IPv4/IPv6, not TCP/UDP, or cannot be parsed.
+    Walks the packet from Layer 2 through Layer 4. Returns None for any
+    packet that should not be forwarded to workers:
+      - Unsupported link-layer type
+      - Non-IP payload (ARP, LLDP, etc.)
+      - Non-TCP/UDP transport (ICMP, etc.)
+      - Malformed packet that dpkt cannot parse
+      - Malformed IP address bytes that cannot be converted to a string
+
+    All expected non-TCP/UDP cases are handled with explicit return None
+    before the except block.  Any exception that reaches the except clause
+    therefore indicates a genuinely malformed packet and is logged at DEBUG
+    level.  In production (INFO level), this has no overhead.
 
     Args:
         l2type: libpcap datalink type (e.g. DLT_EN10MB, DLT_RAW,
@@ -81,9 +93,18 @@ def parse_basic(l2type: int, data: bytes) -> dict | None:
         if not isinstance(l4, (dpkt.tcp.TCP, dpkt.udp.UDP)):
             return None
 
+        src = _ip_str(ip.src)
+        dst = _ip_str(ip.dst)
+        if not src or not dst:
+            # Malformed IP address bytes — dpkt parsed the header but the
+            # address field is invalid.  Drop rather than forwarding an
+            # empty-src/dst packet that would corrupt session flow keys.
+            logging.debug("parse_basic: invalid IP address bytes, dropping packet")
+            return None
+
         return {
-            "src":     _ip_str(ip.src),
-            "dst":     _ip_str(ip.dst),
+            "src":     src,
+            "dst":     dst,
             "tcp":     isinstance(l4, dpkt.tcp.TCP),
             "udp":     isinstance(l4, dpkt.udp.UDP),
             "sport":   l4.sport,
@@ -92,4 +113,8 @@ def parse_basic(l2type: int, data: bytes) -> dict | None:
         }
 
     except Exception:
+        # Reached only for packets dpkt cannot parse at all (truncated frames,
+        # corrupt headers, etc.).  Expected non-IP/non-TCP/UDP traffic exits
+        # via explicit return None above, so this path is genuinely unexpected.
+        logging.debug("parse_basic: malformed packet dropped", exc_info=True)
         return None

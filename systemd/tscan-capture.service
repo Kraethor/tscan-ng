@@ -13,6 +13,7 @@ WorkingDirectory=/opt/tscan
 ExecStart=/opt/tscan/venv/bin/python -m tscan_ng.capture
 Restart=on-failure
 RestartSec=5
+SyslogIdentifier=tscan-capture
 
 [Install]
 WantedBy=multi-user.target

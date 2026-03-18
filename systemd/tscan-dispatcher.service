@@ -13,6 +13,7 @@ Restart=on-failure
 RestartSec=5
 RuntimeDirectory=tscan
 RuntimeDirectoryMode=0750
+SyslogIdentifier=tscan-dispatcher
 
 [Install]
 WantedBy=multi-user.target

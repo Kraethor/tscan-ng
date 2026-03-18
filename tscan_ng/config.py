@@ -30,6 +30,7 @@ Config file format:
 """
 
 import configparser
+import logging
 import os
 
 DEFAULT_CONFIG_PATH = "/opt/tscan/tscan_ng/config/tscan_ng.conf"
@@ -177,28 +178,96 @@ class Config:
         """
         Validate configuration values and raise ValueError for any that
         would cause undefined behaviour or silent failures at runtime.
+
+        Checks performed:
+          - capture.iface is set and exists in /sys/class/net
+          - capture.snaplen and buffer_bytes are within sane bounds
+          - dispatcher.workers is at least 1
+          - dispatcher.socket is an absolute path; its parent directory is
+            checked for world-writable permissions (warning only — the
+            directory may not exist yet when running outside systemd)
+          - dispatcher.out directory exists and is writable by the current
+            process (silent failures here are very hard to diagnose)
+          - sessions values are positive
         """
         errors = []
 
+        # --- capture ---------------------------------------------------------
+
         if not self.iface:
             errors.append("capture.iface must be set")
+        else:
+            # Validate against the kernel's interface list so misconfigured
+            # interface names fail at startup rather than at pcap_create().
+            try:
+                available = sorted(os.listdir("/sys/class/net"))
+                if self.iface not in available:
+                    errors.append(
+                        f"capture.iface '{self.iface}' not found "
+                        f"(available: {', '.join(available)})"
+                    )
+            except OSError:
+                pass  # Non-Linux host or unusual environment — skip the check
+
         if self.snaplen < 64:
             errors.append(f"capture.snaplen must be >= 64 (got {self.snaplen})")
         if self.buffer_bytes <= 0:
             errors.append(f"capture.buffer_bytes must be > 0 (got {self.buffer_bytes})")
+
+        # --- dispatcher ------------------------------------------------------
+
         if self.workers < 1:
             errors.append(f"dispatcher.workers must be >= 1 (got {self.workers})")
+
         if not self.socket_path:
             errors.append("dispatcher.socket must be set")
+        elif not os.path.isabs(self.socket_path):
+            errors.append(
+                f"dispatcher.socket must be an absolute path "
+                f"(got {self.socket_path!r})"
+            )
+        else:
+            sock_dir = os.path.dirname(os.path.normpath(self.socket_path))
+            if os.path.isdir(sock_dir):
+                try:
+                    if os.stat(sock_dir).st_mode & 0o002:
+                        # World-writable socket directory allows any local user
+                        # to delete and replace the socket, intercepting packets.
+                        logging.warning(
+                            "config: dispatcher.socket parent directory '%s' is "
+                            "world-writable — any local user can replace the socket",
+                            sock_dir)
+                except OSError:
+                    pass
+
+        if self.out_path:
+            out_dir = os.path.dirname(self.out_path) or "."
+            if not os.path.isdir(out_dir):
+                errors.append(
+                    f"dispatcher.out directory '{out_dir}' does not exist — "
+                    "create it and grant write permission to the service user"
+                )
+            elif not os.access(out_dir, os.W_OK):
+                errors.append(
+                    f"dispatcher.out directory '{out_dir}' is not writable "
+                    "by the current user"
+                )
+
+        # --- sessions --------------------------------------------------------
+
         if self.session_timeout <= 0:
-            errors.append(f"sessions.timeout_seconds must be > 0 (got {self.session_timeout})")
+            errors.append(
+                f"sessions.timeout_seconds must be > 0 (got {self.session_timeout})")
         if self.session_max_buf < 1024:
-            errors.append(f"sessions.max_buf_bytes must be >= 1024 (got {self.session_max_buf})")
+            errors.append(
+                f"sessions.max_buf_bytes must be >= 1024 (got {self.session_max_buf})")
         if self.expiry_interval <= 0:
-            errors.append(f"sessions.expiry_interval_sec must be > 0 (got {self.expiry_interval})")
+            errors.append(
+                f"sessions.expiry_interval_sec must be > 0 (got {self.expiry_interval})")
 
         if errors:
-            raise ValueError("Invalid configuration:\n" + "\n".join(f"  - {e}" for e in errors))
+            raise ValueError(
+                "Invalid configuration:\n" + "\n".join(f"  - {e}" for e in errors))
 
     def __repr__(self) -> str:
         return (
