@@ -74,6 +74,9 @@ pcap_next_ex.argtypes = [
 ]
 pcap_next_ex.restype = ctypes.c_int
 
+pcap_close = pcap.pcap_close
+pcap_close.argtypes = [pcap_t]
+
 try:
     pcap_set_immediate_mode = pcap.pcap_set_immediate_mode
     pcap_set_immediate_mode.argtypes = [pcap_t, ctypes.c_int]
@@ -83,7 +86,7 @@ except AttributeError:
 
 def _err(pc):
     """Return a human-readable error string from a pcap handle."""
-    return (pcap_geterr(pc) or b"unknown").decode("utf-8", "ignore")
+    return (pcap_geterr(pc) or b"unknown").decode("utf-8", "replace")
 
 
 def _connect_with_retry(sock_path: str,
@@ -159,10 +162,12 @@ def capture_into_unix_dgram(iface: str, sock_path: str,
     HDR = struct.Struct("!IIIHH")  # sec, usec, caplen, l2type, pad
 
     s = _connect_with_retry(sock_path)
+    s.setblocking(False)
 
     errbuf = ctypes.create_string_buffer(PCAP_ERRBUF_SIZE)
     pc = pcap_create(iface.encode(), errbuf)
     if not pc:
+        s.close()
         print(f"pcap_create failed: {errbuf.value.decode()}", file=sys.stderr)
         os._exit(2)
 
@@ -180,12 +185,16 @@ def capture_into_unix_dgram(iface: str, sock_path: str,
 
     r = pcap_activate(pc)
     if r != 0:
-        print(f"pcap_activate: {_err(pc)}", file=sys.stderr)
+        msg = _err(pc)
+        pcap_close(pc)
+        s.close()
+        print(f"pcap_activate: {msg}", file=sys.stderr)
         os._exit(3)
 
     dlt = pcap_datalink(pc)
     hdr_ptr = ctypes.POINTER(pcap_pkthdr)()
     data_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+    drop_count = 0
 
     try:
         while True:
@@ -193,10 +202,27 @@ def capture_into_unix_dgram(iface: str, sock_path: str,
             if rc == 1:
                 hdr = hdr_ptr.contents
                 caplen = int(hdr.caplen)
+                if caplen == 0 or caplen > snaplen:
+                    continue
                 sec = int(hdr.ts.tv_sec)
                 usec = int(hdr.ts.tv_usec)
                 pkt = ctypes.string_at(data_ptr, caplen)
-                s.send(HDR.pack(sec, usec, caplen, dlt, 0) + pkt)
+                try:
+                    s.send(HDR.pack(sec, usec, caplen, dlt, 0) + pkt)
+                except BlockingIOError:
+                    drop_count += 1
+                    if drop_count % 1000 == 1:
+                        logging.warning(
+                            "capture: %d packet(s) dropped — dispatcher backpressure",
+                            drop_count)
+                except OSError as exc:
+                    logging.error("capture: send error (%s), reconnecting", exc)
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+                    s = _connect_with_retry(sock_path)
+                    s.setblocking(False)
             elif rc == 0:   # timeout
                 continue
             elif rc == -2:  # breakloop
@@ -205,11 +231,9 @@ def capture_into_unix_dgram(iface: str, sock_path: str,
                 continue
     finally:
         try:
-            pcap_close = pcap.pcap_close
-            pcap_close.argtypes = [pcap_t]
             pcap_close(pc)
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("capture: pcap_close failed: %s", exc)
 
 
 if __name__ == "__main__":
