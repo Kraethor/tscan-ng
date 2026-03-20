@@ -172,6 +172,8 @@ smtp   = 25, 465, 587, 2525
 imap   = 143, 993, 1430
 pop3   = 110, 995, 1100
 telnet = 23, 2323
+ldap   = 389, 3268
+redis  = 6379, 6380
 ```
 
 Add non-standard ports by appending to the comma-separated list. No

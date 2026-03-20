@@ -29,6 +29,8 @@ Two systemd services work together:
 | IMAP     | LOGIN command scan         | 143, 993, 1430            |
 | POP3     | USER/PASS command scan     | 110, 995, 1100            |
 | Telnet   | Login/Password prompt scan | 23, 2323                  |
+| LDAP     | Simple-bind BindRequest    | 389, 3268                 |
+| Redis    | AUTH command scan          | 6379, 6380                |
 
 ## Configuration
 
@@ -45,6 +47,8 @@ smtp   = 25, 465, 587, 2525
 imap   = 143, 993, 1430
 pop3   = 110, 995, 1100
 telnet = 23, 2323
+ldap   = 389, 3268
+redis  = 6379, 6380
 ```
 
 After editing the config, restart both services:

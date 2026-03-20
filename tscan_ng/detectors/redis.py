@@ -1,0 +1,311 @@
+"""
+detectors/redis.py - Redis credential detector for tscan-ng.
+
+Stream-aware detector that operates on reassembled TCP streams. Detects
+Redis AUTH commands in the client buffer and correlates them with server
++OK / -ERR responses.
+
+Redis uses the RESP (REdis Serialization Protocol) wire format. AUTH can
+appear as:
+
+    RESP array, password only (Redis < 6.0):
+        *2\r\n$4\r\nAUTH\r\n$<len>\r\n<password>\r\n
+
+    RESP array, username + password (Redis 6.0+ ACL):
+        *3\r\n$4\r\nAUTH\r\n$<len>\r\n<username>\r\n$<len>\r\n<password>\r\n
+
+    Inline command (uncommon, sent by telnet-based clients):
+        AUTH <password>\r\n
+        AUTH <username> <password>\r\n
+
+Server responses:
+    +OK\r\n                      → success
+    -ERR invalid password\r\n    → failed (pre-6.0)
+    -WRONGPASS ...\r\n           → failed (6.0+)
+
+Port handling:
+    Gates on _REDIS_PORTS. Sessions on other ports are skipped immediately.
+    6379 — standard Redis
+    6380 — common alternate / Redis Cluster bus
+
+Finding type: "redis_creds"
+Finding extras:
+    "username" — ACL username if present (empty string for password-only AUTH).
+    "creds"    — "username:password" or ":password" for display consistency.
+"""
+
+import logging
+import re
+from tscan_ng.session import _make_filter
+
+# Well-known cleartext Redis ports.
+_REDIS_PORTS: frozenset = frozenset({
+    6379,  # Redis default (IANA assigned)
+    6380,  # Common alternate / Redis Cluster
+})
+
+# Maximum bytes of the client buffer to scan per call.
+# Redis AUTH commands are short; 4 KB is well above any realistic exchange.
+_MAX_SCAN = 4096
+
+# Regex for inline AUTH commands (fallback for non-RESP clients).
+# Captures optional username and mandatory password.
+_AUTH_INLINE_RE = re.compile(
+    rb"^AUTH\s+(\S+)(?:\s+(\S+))?\r\n",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Server +OK response line.
+_OK_RE = re.compile(rb"^\+OK\b", re.MULTILINE)
+
+# Server error response line (any leading '-' response to AUTH).
+_ERR_RE = re.compile(rb"^-\S+", re.MULTILINE)
+
+
+def _parse_resp_array(data: bytes, offset: int):
+    """
+    Parse one complete RESP array starting at *offset* in *data*.
+
+    Reads the element count from the '*N\\r\\n' header, then parses each
+    element as a bulk string '$N\\r\\n<data>\\r\\n'. The bulk string length
+    prefix is used to correctly handle element data that contains \\r\\n.
+
+    Args:
+        data:   Raw bytes buffer from the client stream.
+        offset: Byte position of the '*' character that starts the array.
+
+    Returns:
+        (elements, new_offset) where elements is a list of bytes objects and
+        new_offset points past the last byte of the parsed array.
+        Returns (None, None) if the array is incomplete or malformed.
+    """
+    if offset >= len(data) or data[offset:offset + 1] != b'*':
+        return None, None
+
+    # Read element count from '*N\r\n'.
+    eol = data.find(b'\r\n', offset)
+    if eol == -1:
+        return None, None
+    try:
+        count = int(data[offset + 1:eol])
+    except ValueError:
+        return None, None
+    if count < 0:
+        return None, None
+
+    pos = eol + 2
+    elements = []
+    for _ in range(count):
+        # Each element is a bulk string: '$N\r\n<data>\r\n'.
+        if pos >= len(data) or data[pos:pos + 1] != b'$':
+            return None, None
+        eol2 = data.find(b'\r\n', pos)
+        if eol2 == -1:
+            return None, None
+        try:
+            length = int(data[pos + 1:eol2])
+        except ValueError:
+            return None, None
+        pos = eol2 + 2
+        if pos + length + 2 > len(data):
+            # Bulk string data not yet fully received.
+            return None, None
+        elem = data[pos:pos + length]
+        pos += length + 2  # skip element data + trailing \r\n
+        elements.append(elem)
+
+    return elements, pos
+
+
+def _find_auth_command(data: bytes):
+    """
+    Scan *data* for the first Redis AUTH command in RESP or inline format.
+
+    Tries RESP array format first at each position; falls back to the inline
+    regex for clients that use raw text commands.
+
+    Args:
+        data: Raw bytes from the client stream buffer (bounded to _MAX_SCAN).
+
+    Returns:
+        (username, password, end_offset) where username is an empty string for
+        password-only AUTH and end_offset points past the last byte of the AUTH
+        command.  Returns (None, None, None) if no AUTH command is found.
+    """
+    i = 0
+    while i < len(data):
+        if data[i:i + 1] == b'*':
+            # Attempt to parse a RESP array at this position.
+            elems, end = _parse_resp_array(data, i)
+            if elems is not None:
+                if len(elems) >= 2 and elems[0].upper() == b'AUTH':
+                    if len(elems) == 2:
+                        # AUTH <password>
+                        username = ""
+                        password = elems[1].decode("utf-8", "replace")
+                        return username, password, end
+                    elif len(elems) == 3:
+                        # AUTH <username> <password>
+                        username = elems[1].decode("utf-8", "replace")
+                        password = elems[2].decode("utf-8", "replace")
+                        return username, password, end
+                # Valid RESP array but not AUTH — skip past it.
+                i = end
+                continue
+            # Not a valid RESP array at this offset — advance one byte.
+            i += 1
+            continue
+
+        # Try inline AUTH match at this position.
+        m = _AUTH_INLINE_RE.match(data, i)
+        if m:
+            if m.group(2) is not None:
+                # AUTH <username> <password>
+                username = m.group(1).decode("utf-8", "replace")
+                password = m.group(2).decode("utf-8", "replace")
+            else:
+                # AUTH <password>
+                username = ""
+                password = m.group(1).decode("utf-8", "replace")
+            return username, password, m.end()
+
+        i += 1
+
+    return None, None, None
+
+
+def _find_auth_response(data: bytes):
+    """
+    Scan *data* for the first Redis server response to an AUTH command.
+
+    Looks for '+OK' (success) or any '-<error>' line (failure).  The first
+    response found is returned, as it corresponds to the earliest unconsumed
+    AUTH command after detect_stream has consumed matched client data.
+
+    Args:
+        data: Raw bytes from the server stream buffer.
+
+    Returns:
+        (outcome, end_offset) where outcome is "success" or "failed", and
+        end_offset points past the end of the matched response line.
+        Returns (None, None) if no relevant response is present yet.
+    """
+    i = 0
+    while i < len(data):
+        eol = data.find(b'\r\n', i)
+        if eol == -1:
+            break
+        line = data[i:eol]
+        if line == b'+OK':
+            return "success", eol + 2
+        if line[:1] == b'-':
+            # Any error line in response to AUTH is a failure.
+            return "failed", eol + 2
+        i = eol + 2
+
+    return None, None
+
+
+def _outcome(status: str) -> str:
+    """
+    Return the outcome string from a Redis server response.
+
+    This is a thin passthrough — _find_auth_response already returns a
+    canonical outcome string.  The function exists for symmetry with other
+    detector modules and for use in run.py _try_resolve().
+
+    Args:
+        status: Outcome string from _find_auth_response ("success" or "failed").
+
+    Returns:
+        The same string, unchanged.
+    """
+    return status
+
+
+def detect(pkt: dict) -> list:
+    """
+    Per-packet interface — retained for API compatibility, always returns [].
+
+    Args:
+        pkt: Normalized packet dict from parsing.net.parse_basic.
+
+    Returns:
+        Empty list.
+    """
+    return []
+
+
+def detect_stream(session, ts: float) -> list:
+    """
+    Stream-aware Redis AUTH credential detector.
+
+    Scans session.client_buf for a Redis AUTH command (RESP or inline format)
+    and correlates it with the server response in session.server_buf.  Both
+    buffers are consumed up to the end of the matched exchange on resolution
+    to prevent re-detection on subsequent AUTH commands in the same connection.
+
+    The scan is bounded to _MAX_SCAN bytes per call to keep per-packet CPU
+    cost O(1) regardless of buffer depth.
+
+    Args:
+        session: Session object from session.SessionTable.
+        ts:      Unix timestamp of the current packet.
+
+    Returns:
+        List of resolved finding dicts. A pending finding is registered on
+        the session if the server response has not yet arrived.
+    """
+    # Gate: only inspect sessions on known Redis ports.
+    if session.dport not in _REDIS_PORTS and session.sport not in _REDIS_PORTS:
+        return []
+
+    # Bound the scan to avoid O(n) work on very deep buffers.
+    client_bytes = bytes(session.client_buf[:_MAX_SCAN])
+    username, password, cmd_end = _find_auth_command(client_bytes)
+
+    if username is None:
+        return []
+
+    if not password:
+        # AUTH with an empty password is unusual; skip to avoid noise.
+        logging.debug(
+            "redis: session %s: AUTH command with empty password — skipping",
+            session.session_id)
+        del session.client_buf[:cmd_end]
+        return []
+
+    creds_str = f"{username}:{password}" if username else f":{password}"
+
+    base = {
+        "type":       "redis_creds",
+        "session_id": session.session_id,
+        "src":        session.src,
+        "dst":        session.dst,
+        "sport":      session.sport,
+        "dport":      session.dport,
+        "username":   username,
+        "creds":      creds_str,
+        "filter":     _make_filter(session.src, session.dst,
+                                   session.sport, session.dport),
+    }
+
+    server_bytes = bytes(session.server_buf)
+    outcome, rsp_end = _find_auth_response(server_bytes)
+
+    if outcome is not None:
+        # Server response already in server_buf — resolve immediately.
+        del session.server_buf[:rsp_end]
+        del session.client_buf[:cmd_end]
+        return [{
+            **base,
+            "ts_start": ts,
+            "ts_end":   session.last_ts,
+            "status":   outcome,
+            "outcome":  outcome,
+        }]
+    else:
+        # Server has not responded yet — register as pending.
+        session.add_pending(base, ts_start=ts)
+        del session.client_buf[:cmd_end]
+        return []

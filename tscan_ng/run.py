@@ -43,6 +43,8 @@ from tscan_ng.detectors.smtp import (
 )
 from tscan_ng.detectors.pop3 import _POP3_RESPONSE_RE, _outcome as _pop3_outcome
 from tscan_ng.detectors.telnet import _outcome as _telnet_outcome
+from tscan_ng.detectors.ldap import _find_bind_response, _outcome as _ldap_outcome
+from tscan_ng.detectors.redis import _find_auth_response
 from tscan_ng.sinks.jsonl import JSONLSink
 from tscan_ng.session import SessionTable
 
@@ -187,6 +189,32 @@ def _try_resolve(p, session, ts: float) -> dict | None:
                 "ts_end":   ts,
                 "status":   result,
                 "outcome":  result,
+            }
+
+    elif finding_type == "ldap_creds":
+        result_code, rsp_end = _find_bind_response(bytes(session.server_buf))
+        if result_code is not None:
+            # Consume the BindResponse so it cannot be matched again.
+            del session.server_buf[:rsp_end]
+            return {
+                **clean_finding,
+                "ts_start": p.ts_start,
+                "ts_end":   ts,
+                "status":   str(result_code),
+                "outcome":  _ldap_outcome(result_code),
+            }
+
+    elif finding_type == "redis_creds":
+        outcome, rsp_end = _find_auth_response(bytes(session.server_buf))
+        if outcome is not None:
+            # Consume the AUTH response so it cannot be matched again.
+            del session.server_buf[:rsp_end]
+            return {
+                **clean_finding,
+                "ts_start": p.ts_start,
+                "ts_end":   ts,
+                "status":   outcome,
+                "outcome":  outcome,
             }
 
     return None

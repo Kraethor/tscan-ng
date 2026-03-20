@@ -26,7 +26,7 @@ Call configure_all(cfg) once in each worker process after loading Config to
 apply the port sets from the config file to every protocol detector.
 """
 
-from tscan_ng.detectors import http_basic, ftp, pop3, imap, smtp, telnet
+from tscan_ng.detectors import http_basic, ftp, pop3, imap, smtp, telnet, ldap, redis
 
 DETECTORS = []
 
@@ -37,6 +37,8 @@ STREAM_DETECTORS = [
     smtp.detect_stream,
     pop3.detect_stream,
     telnet.detect_stream,
+    ldap.detect_stream,
+    redis.detect_stream,
 ]
 
 
@@ -58,3 +60,5 @@ def configure_all(cfg) -> None:
     imap._IMAP_PORTS     = cfg.imap_ports
     pop3._POP3_PORTS     = cfg.pop3_ports
     telnet._TELNET_PORTS = cfg.telnet_ports
+    ldap._LDAP_PORTS     = cfg.ldap_ports
+    redis._REDIS_PORTS   = cfg.redis_ports

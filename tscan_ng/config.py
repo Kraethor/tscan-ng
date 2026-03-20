@@ -31,10 +31,13 @@ Config file format:
     [ports]
     # Comma-separated port numbers for each protocol detector.
     # Sessions whose src or dst port is not in this list are skipped.
-    ftp   = 21, 2121
-    smtp  = 25, 465, 587, 2525
-    imap  = 143, 993, 1430
-    pop3  = 110, 995, 1100
+    ftp    = 21, 2121
+    smtp   = 25, 465, 587, 2525
+    imap   = 143, 993, 1430
+    pop3   = 110, 995, 1100
+    telnet = 23, 2323
+    ldap   = 389, 3268
+    redis  = 6379, 6380
 """
 
 import configparser
@@ -237,6 +240,16 @@ class Config:
         """Frozenset of TCP ports to scan for Telnet credentials."""
         return self._getports("ports", "telnet", fallback=frozenset({23, 2323}))
 
+    @property
+    def ldap_ports(self) -> frozenset:
+        """Frozenset of TCP ports to scan for LDAP simple-bind credentials."""
+        return self._getports("ports", "ldap", fallback=frozenset({389, 3268}))
+
+    @property
+    def redis_ports(self) -> frozenset:
+        """Frozenset of TCP ports to scan for Redis AUTH credentials."""
+        return self._getports("ports", "redis", fallback=frozenset({6379, 6380}))
+
     def _validate(self):
         """
         Validate configuration values and raise ValueError for any that
@@ -336,6 +349,8 @@ class Config:
             ("imap",   self.imap_ports),
             ("pop3",   self.pop3_ports),
             ("telnet", self.telnet_ports),
+            ("ldap",   self.ldap_ports),
+            ("redis",  self.redis_ports),
         ]:
             bad = [p for p in ports if not (0 < p < 65536)]
             if bad:
@@ -360,5 +375,7 @@ class Config:
             f"smtp_ports={sorted(self.smtp_ports)}, "
             f"imap_ports={sorted(self.imap_ports)}, "
             f"pop3_ports={sorted(self.pop3_ports)}, "
-            f"telnet_ports={sorted(self.telnet_ports)})"
+            f"telnet_ports={sorted(self.telnet_ports)}, "
+            f"ldap_ports={sorted(self.ldap_ports)}, "
+            f"redis_ports={sorted(self.redis_ports)})"
         )

@@ -60,6 +60,8 @@ _PROTO = {
     "imap_creds":    (BOLD + BRIGHT_GREEN,   "IMAP"),
     "pop3_creds":    (BOLD + BRIGHT_MAGENTA, "POP3"),
     "telnet_creds":  (BOLD + BRIGHT_RED,     "Telnet"),
+    "ldap_creds":    (BOLD + BRIGHT_WHITE,   "LDAP"),
+    "redis_creds":   (BOLD + BRIGHT_CYAN,    "Redis"),
 }
 
 DEFAULT_RESULTS = "/var/log/tscan/results.jsonl"
