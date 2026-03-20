@@ -34,7 +34,7 @@ Phase status:
 import os, queue as _queue, struct, socket, time, logging, multiprocessing as mp
 from tscan_ng.config import Config
 from tscan_ng.parsing.net import parse_basic
-from tscan_ng.detectors import DETECTORS, STREAM_DETECTORS
+from tscan_ng.detectors import DETECTORS, STREAM_DETECTORS, configure_all
 from tscan_ng.detectors.http_basic import _parse_response, _outcome
 from tscan_ng.detectors.imap import _IMAP_RESPONSE_RE, _outcome as _imap_outcome
 from tscan_ng.detectors.ftp import _FTP_RESPONSE_RE, _outcome as _ftp_outcome
@@ -190,6 +190,8 @@ def worker_main(q: mp.Queue, cfg: Config):
         q:   Bounded multiprocessing Queue shared with the dispatcher.
         cfg: Loaded Config object.
     """
+    # Apply port lists from config to each protocol detector.
+    configure_all(cfg)
     sink = JSONLSink(cfg.out_path or None)
     sessions = SessionTable(
         max_buf=cfg.session_max_buf,

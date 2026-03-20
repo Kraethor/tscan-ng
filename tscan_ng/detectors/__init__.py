@@ -21,6 +21,9 @@ Each per-packet detector must implement:
 
 Each stream detector must implement:
     def detect_stream(session: Session, ts: float) -> list[dict]
+
+Call configure_all(cfg) once in each worker process after loading Config to
+apply the port sets from the config file to every protocol detector.
 """
 
 from tscan_ng.detectors import http_basic, ftp, pop3, imap, smtp
@@ -34,3 +37,22 @@ STREAM_DETECTORS = [
     smtp.detect_stream,
     pop3.detect_stream,
 ]
+
+
+def configure_all(cfg) -> None:
+    """
+    Apply per-protocol port sets from *cfg* to each detector module.
+
+    Each protocol detector gates on a module-level frozenset of ports. This
+    function replaces those frozensets with the values loaded from the config
+    file, allowing port lists to be changed without editing source code.
+
+    Must be called once per worker process before the packet processing loop.
+
+    Args:
+        cfg: Loaded Config object (tscan_ng.config.Config).
+    """
+    ftp._FTP_PORTS   = cfg.ftp_ports
+    smtp._SMTP_PORTS = cfg.smtp_ports
+    imap._IMAP_PORTS = cfg.imap_ports
+    pop3._POP3_PORTS = cfg.pop3_ports

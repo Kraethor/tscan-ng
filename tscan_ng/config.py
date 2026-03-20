@@ -27,6 +27,14 @@ Config file format:
     timeout_seconds     = 60
     max_buf_bytes       = 1048576
     expiry_interval_sec = 30
+
+    [ports]
+    # Comma-separated port numbers for each protocol detector.
+    # Sessions whose src or dst port is not in this list are skipped.
+    ftp   = 21, 2121
+    smtp  = 25, 465, 587, 2525
+    imap  = 143, 993, 1430
+    pop3  = 110, 995, 1100
 """
 
 import configparser
@@ -107,6 +115,32 @@ class Config:
         """
         return self._cfg.getboolean(section, key, fallback=fallback)
 
+    def _getports(self, section: str, key: str, fallback: frozenset) -> frozenset:
+        """
+        Retrieve a frozenset of port numbers from a comma-separated config value.
+
+        Each token is stripped of whitespace and parsed as an integer. Tokens
+        that are empty or non-numeric are silently skipped.  If the key is
+        absent the fallback frozenset is returned unchanged.
+
+        Args:
+            section:  INI section name.
+            key:      INI key name.
+            fallback: frozenset to return if the section/key is missing.
+
+        Returns:
+            frozenset[int] of port numbers parsed from the config value.
+        """
+        raw = self._cfg.get(section, key, fallback=None)
+        if raw is None:
+            return fallback
+        ports = set()
+        for token in raw.split(","):
+            token = token.strip()
+            if token.isdigit():
+                ports.add(int(token))
+        return frozenset(ports) if ports else fallback
+
     # -------------------------------------------------------------------------
     # [capture]
     # -------------------------------------------------------------------------
@@ -173,6 +207,30 @@ class Config:
         """How often (in seconds) each worker runs session expiry."""
         return float(self._getint("sessions", "expiry_interval_sec",
                                   fallback=30))
+
+    # -------------------------------------------------------------------------
+    # [ports]
+    # -------------------------------------------------------------------------
+
+    @property
+    def ftp_ports(self) -> frozenset:
+        """Frozenset of TCP ports to scan for FTP credentials."""
+        return self._getports("ports", "ftp", fallback=frozenset({21, 2121}))
+
+    @property
+    def smtp_ports(self) -> frozenset:
+        """Frozenset of TCP ports to scan for SMTP credentials."""
+        return self._getports("ports", "smtp", fallback=frozenset({25, 465, 587, 2525}))
+
+    @property
+    def imap_ports(self) -> frozenset:
+        """Frozenset of TCP ports to scan for IMAP credentials."""
+        return self._getports("ports", "imap", fallback=frozenset({143, 993, 1430}))
+
+    @property
+    def pop3_ports(self) -> frozenset:
+        """Frozenset of TCP ports to scan for POP3 credentials."""
+        return self._getports("ports", "pop3", fallback=frozenset({110, 995, 1100}))
 
     def _validate(self):
         """
@@ -265,6 +323,21 @@ class Config:
             errors.append(
                 f"sessions.expiry_interval_sec must be > 0 (got {self.expiry_interval})")
 
+        # --- ports -----------------------------------------------------------
+
+        for proto, ports in [
+            ("ftp",  self.ftp_ports),
+            ("smtp", self.smtp_ports),
+            ("imap", self.imap_ports),
+            ("pop3", self.pop3_ports),
+        ]:
+            bad = [p for p in ports if not (0 < p < 65536)]
+            if bad:
+                errors.append(
+                    f"ports.{proto} contains out-of-range port numbers: "
+                    + ", ".join(str(p) for p in sorted(bad))
+                )
+
         if errors:
             raise ValueError(
                 "Invalid configuration:\n" + "\n".join(f"  - {e}" for e in errors))
@@ -276,5 +349,9 @@ class Config:
             f"workers={self.workers}, "
             f"socket={self.socket_path!r}, "
             f"session_timeout={self.session_timeout}s, "
-            f"expiry_interval={self.expiry_interval}s)"
+            f"expiry_interval={self.expiry_interval}s, "
+            f"ftp_ports={sorted(self.ftp_ports)}, "
+            f"smtp_ports={sorted(self.smtp_ports)}, "
+            f"imap_ports={sorted(self.imap_ports)}, "
+            f"pop3_ports={sorted(self.pop3_ports)})"
         )
