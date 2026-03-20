@@ -158,6 +158,25 @@ iface = <your capture interface name>
 All other values have safe defaults. See the config file itself for
 documentation of every setting.
 
+### Protocol detector ports
+
+The `[ports]` section controls which TCP ports each protocol detector
+will scan. Sessions whose src and dst port are both absent from a
+protocol's list are skipped by that detector, saving CPU at high line
+speeds. The defaults match standard well-known ports:
+
+```ini
+[ports]
+ftp   = 21, 2121
+smtp  = 25, 465, 587, 2525
+imap  = 143, 993, 1430
+pop3  = 110, 995, 1100
+```
+
+Add non-standard ports by appending to the comma-separated list. No
+source code changes are required — just edit the config and restart
+both services.
+
 **Important:**  
 After editing `tscan_ng.conf`, both services must be restarted:
 ```bash
@@ -296,6 +315,11 @@ sudo tcpdump -ni <capture-interface> -c 10
 ```bash
 sudo systemctl restart tscan-dispatcher tscan-capture
 ```
+
+### Detector not firing for a known protocol
+- The session's port may not be in the `[ports]` list for that protocol
+- Add the port to the relevant entry in `tscan_ng.conf` and restart both services
+- Note: the HTTP detector is port-agnostic and always runs regardless of port
 
 ### Capture fails with `Operation not permitted`
 - The Python binary is missing `CAP_NET_RAW` capability
