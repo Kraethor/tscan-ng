@@ -35,7 +35,7 @@ import os, queue as _queue, struct, socket, time, logging, multiprocessing as mp
 from tscan_ng.config import Config
 from tscan_ng.parsing.net import parse_basic
 from tscan_ng.detectors import DETECTORS, STREAM_DETECTORS, configure_all
-from tscan_ng.detectors.http_basic import _parse_response, _outcome
+from tscan_ng.detectors.http_basic import _parse_response, _outcome, _RESPONSE_LINE_RE as _HTTP_RESPONSE_LINE_RE
 from tscan_ng.detectors.imap import _IMAP_RESPONSE_RE, _outcome as _imap_outcome
 from tscan_ng.detectors.ftp import _FTP_RESPONSE_RE, _outcome as _ftp_outcome
 from tscan_ng.detectors.smtp import (
@@ -99,6 +99,12 @@ def _try_resolve(p, session, ts: float) -> dict | None:
         response = _parse_response(session.server_buf)
         if response:
             status, status_text = response
+            # Consume the response line from server_buf so that subsequent
+            # requests on the same keep-alive connection are not incorrectly
+            # correlated with this (now-stale) response.
+            m = _HTTP_RESPONSE_LINE_RE.search(bytes(session.server_buf))
+            if m:
+                del session.server_buf[:m.end()]
             return {
                 **clean_finding,
                 "ts":          p.ts_start,
@@ -115,6 +121,9 @@ def _try_resolve(p, session, ts: float) -> dict | None:
         for resp_match in _IMAP_RESPONSE_RE.finditer(server_text):
             if resp_match.group(1).upper() == tag.upper():
                 status = resp_match.group(2).upper()
+                # Consume up to and including this tagged response so it
+                # cannot be matched again by a subsequent pending finding.
+                del session.server_buf[:resp_match.end()]
                 return {
                     **clean_finding,
                     "ts_start":    p.ts_start,
@@ -127,6 +136,9 @@ def _try_resolve(p, session, ts: float) -> dict | None:
         response = _FTP_RESPONSE_RE.search(bytes(session.server_buf))
         if response:
             code = response.group(1)
+            # Consume the matched response line to prevent re-correlation
+            # with a later credential exchange on the same session.
+            del session.server_buf[:response.end()]
             return {
                 **clean_finding,
                 "ts_start":    p.ts_start,
@@ -139,6 +151,9 @@ def _try_resolve(p, session, ts: float) -> dict | None:
         response = _SMTP_RESPONSE_RE.search(bytes(session.server_buf))
         if response:
             code = response.group(1)
+            # Consume the matched response line to prevent re-correlation
+            # with a later credential exchange on the same session.
+            del session.server_buf[:response.end()]
             return {
                 **clean_finding,
                 "ts_start":    p.ts_start,
@@ -151,6 +166,9 @@ def _try_resolve(p, session, ts: float) -> dict | None:
         responses = list(_POP3_RESPONSE_RE.finditer(bytes(session.server_buf)))
         if len(responses) >= 2:
             code = responses[1].group(1)
+            # Consume up to and including the PASS response (index 1) so
+            # subsequent logins on the same session are not double-matched.
+            del session.server_buf[:responses[1].end()]
             return {
                 **clean_finding,
                 "ts_start":    p.ts_start,
