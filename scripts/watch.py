@@ -59,6 +59,7 @@ _PROTO = {
     "smtp_creds":    (BOLD + BRIGHT_YELLOW,  "SMTP"),
     "imap_creds":    (BOLD + BRIGHT_GREEN,   "IMAP"),
     "pop3_creds":    (BOLD + BRIGHT_MAGENTA, "POP3"),
+    "telnet_creds":  (BOLD + BRIGHT_RED,     "Telnet"),
 }
 
 DEFAULT_RESULTS = "/var/log/tscan/results.jsonl"
@@ -175,10 +176,16 @@ def _format(finding: dict) -> str | None:
     if ftype == "http_basic":
         status_text = finding.get("status_text", "")
         status_str  = f"{status} {status_text}".strip()
-    lines.append(
-        f"  {DIM}Status:{RESET}       {BRIGHT_WHITE}{status_str}{RESET}"
-        f"  {BOLD}{BRIGHT_GREEN}{outcome}{RESET}"
-    )
+    # Only show status separately if it adds information beyond the outcome.
+    if status_str and status_str != outcome:
+        lines.append(
+            f"  {DIM}Status:{RESET}       {BRIGHT_WHITE}{status_str}{RESET}"
+            f"  {BOLD}{BRIGHT_GREEN}{outcome}{RESET}"
+        )
+    else:
+        lines.append(
+            f"  {DIM}Status:{RESET}       {BOLD}{BRIGHT_GREEN}{outcome}{RESET}"
+        )
 
     # ── Filter — bold yellow so it reads as "copy this" ────────────────────
     filt = finding.get("filter", "")

@@ -167,10 +167,11 @@ speeds. The defaults match standard well-known ports:
 
 ```ini
 [ports]
-ftp   = 21, 2121
-smtp  = 25, 465, 587, 2525
-imap  = 143, 993, 1430
-pop3  = 110, 995, 1100
+ftp    = 21, 2121
+smtp   = 25, 465, 587, 2525
+imap   = 143, 993, 1430
+pop3   = 110, 995, 1100
+telnet = 23, 2323
 ```
 
 Add non-standard ports by appending to the comma-separated list. No

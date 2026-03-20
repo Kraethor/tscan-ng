@@ -42,6 +42,7 @@ from tscan_ng.detectors.smtp import (
     _SMTP_RESPONSE_RE, _outcome as _smtp_outcome
 )
 from tscan_ng.detectors.pop3 import _POP3_RESPONSE_RE, _outcome as _pop3_outcome
+from tscan_ng.detectors.telnet import _outcome as _telnet_outcome
 from tscan_ng.sinks.jsonl import JSONLSink
 from tscan_ng.session import SessionTable
 
@@ -175,6 +176,17 @@ def _try_resolve(p, session, ts: float) -> dict | None:
                 "ts_end":      ts,
                 "status":      code.decode("utf-8", "ignore"),
                 "outcome":     _pop3_outcome(code),
+            }
+
+    elif finding_type == "telnet_creds":
+        result = _telnet_outcome(session.server_buf)
+        if result:
+            return {
+                **clean_finding,
+                "ts_start": p.ts_start,
+                "ts_end":   ts,
+                "status":   result,
+                "outcome":  result,
             }
 
     return None

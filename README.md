@@ -21,13 +21,14 @@ Two systemd services work together:
 
 ## Detectors
 
-| Protocol | Detection method       | Default ports             |
-|----------|------------------------|---------------------------|
-| HTTP     | Basic Auth header scan | All ports (port-agnostic) |
-| FTP      | USER/PASS command scan | 21, 2121                  |
-| SMTP     | AUTH credential scan   | 25, 465, 587, 2525        |
-| IMAP     | LOGIN command scan     | 143, 993, 1430            |
-| POP3     | USER/PASS command scan | 110, 995, 1100            |
+| Protocol | Detection method           | Default ports             |
+|----------|----------------------------|---------------------------|
+| HTTP     | Basic Auth header scan     | All ports (port-agnostic) |
+| FTP      | USER/PASS command scan     | 21, 2121                  |
+| SMTP     | AUTH credential scan       | 25, 465, 587, 2525        |
+| IMAP     | LOGIN command scan         | 143, 993, 1430            |
+| POP3     | USER/PASS command scan     | 110, 995, 1100            |
+| Telnet   | Login/Password prompt scan | 23, 2323                  |
 
 ## Configuration
 
@@ -39,10 +40,11 @@ can be extended without touching source code:
 
 ```ini
 [ports]
-ftp   = 21, 2121
-smtp  = 25, 465, 587, 2525
-imap  = 143, 993, 1430
-pop3  = 110, 995, 1100
+ftp    = 21, 2121
+smtp   = 25, 465, 587, 2525
+imap   = 143, 993, 1430
+pop3   = 110, 995, 1100
+telnet = 23, 2323
 ```
 
 After editing the config, restart both services:

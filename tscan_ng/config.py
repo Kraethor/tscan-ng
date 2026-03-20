@@ -232,6 +232,11 @@ class Config:
         """Frozenset of TCP ports to scan for POP3 credentials."""
         return self._getports("ports", "pop3", fallback=frozenset({110, 995, 1100}))
 
+    @property
+    def telnet_ports(self) -> frozenset:
+        """Frozenset of TCP ports to scan for Telnet credentials."""
+        return self._getports("ports", "telnet", fallback=frozenset({23, 2323}))
+
     def _validate(self):
         """
         Validate configuration values and raise ValueError for any that
@@ -326,10 +331,11 @@ class Config:
         # --- ports -----------------------------------------------------------
 
         for proto, ports in [
-            ("ftp",  self.ftp_ports),
-            ("smtp", self.smtp_ports),
-            ("imap", self.imap_ports),
-            ("pop3", self.pop3_ports),
+            ("ftp",    self.ftp_ports),
+            ("smtp",   self.smtp_ports),
+            ("imap",   self.imap_ports),
+            ("pop3",   self.pop3_ports),
+            ("telnet", self.telnet_ports),
         ]:
             bad = [p for p in ports if not (0 < p < 65536)]
             if bad:
@@ -353,5 +359,6 @@ class Config:
             f"ftp_ports={sorted(self.ftp_ports)}, "
             f"smtp_ports={sorted(self.smtp_ports)}, "
             f"imap_ports={sorted(self.imap_ports)}, "
-            f"pop3_ports={sorted(self.pop3_ports)})"
+            f"pop3_ports={sorted(self.pop3_ports)}, "
+            f"telnet_ports={sorted(self.telnet_ports)})"
         )
