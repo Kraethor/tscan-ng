@@ -5,7 +5,7 @@ Loads runtime configuration from a single INI-style config file at a
 well-known path. Provides typed accessors for all configuration values
 with safe defaults for every setting.
 
-Default config path: /opt/tscan/tscan.conf
+Default config path: /opt/tscan/tscan_ng/config/tscan_ng.conf
 
 All sections and keys are optional — missing values fall back to defaults
 so the service can start with a minimal or empty config file.
