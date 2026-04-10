@@ -111,7 +111,7 @@ sudo -u tscan -H bash -lc '
   python3 -m venv venv
   source venv/bin/activate
   pip install --upgrade pip
-  pip install dpkt orjson
+  pip install -r requirements.txt
   deactivate
 '
 ```
@@ -146,7 +146,7 @@ any system Python upgrade, reapply this command and restart the services.
 Set ownership and permissions on the config file:
 ```bash
 sudo chown tscan:tscan /opt/tscan/tscan_ng/config/tscan_ng.conf
-sudo chmod 640 /opt/tscan/tscan_ng/config/tscan-ng.conf
+sudo chmod 640 /opt/tscan/tscan_ng/config/tscan_ng.conf
 ```
 
 Edit `/opt/tscan/tscan_ng/config/tscan_ng.conf` and set at minimum:
