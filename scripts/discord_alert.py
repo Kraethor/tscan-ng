@@ -49,6 +49,10 @@ send_alert()
 import os
 import requests
 
+from tscan_ng.config import Config
+
+# Load the global tscan-ng configuration.
+config = Config()
 
 # Discord webhook URL loaded from environment or tscan_ng.conf.
 # If undefined, alerting is silently disabled.
