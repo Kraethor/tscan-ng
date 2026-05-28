@@ -50,10 +50,10 @@ import os
 import requests
 
 
-# Discord webhook URL loaded from environment.
+# Discord webhook URL loaded from environment or tscan_ng.conf.
 # If undefined, alerting is silently disabled.
-WEBHOOK_URL = os.getenv("TS_DISCORD_WEBHOOK")
-
+# WEBHOOK_URL = os.getenv("TS_DISCORD_WEBHOOK")
+WEBHOOK_URL = config.get("discord_webhook", "").strip()
 
 def send_alert() -> None:
     """
