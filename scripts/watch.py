@@ -31,6 +31,7 @@ import os
 import sys
 import time
 from datetime import datetime
+from discord_alert import send_alert
 
 # ── ANSI helpers ──────────────────────────────────────────────────────────────
 
@@ -281,6 +282,7 @@ def main():
         output = _format(finding)
         if output:
             print(output, flush=True)
+            send_alert()
 
 
 if __name__ == "__main__":
