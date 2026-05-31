@@ -56,6 +56,28 @@ After editing the config, restart both services:
 sudo systemctl restart tscan-dispatcher tscan-capture
 ```
 
+### Discord alerting
+
+Add a `[discord]` section to enable webhook alerts on confirmed findings:
+
+```ini
+[discord]
+discord_webhook = https://discord.com/api/webhooks/...
+```
+
+Leave blank or omit to disable. Only a generic "Credential found"
+notification is sent — no credential material leaves the host.
+
+## Live monitor
+
+`scripts/watch.py` tails the results file and displays colour-coded
+findings in real time. Fires Discord alerts on each confirmed capture.
+No root required:
+
+```bash
+python3 /opt/tscan/scripts/watch.py
+```
+
 ## Deployment
 See `docs/REBUILD.md` for full rebuild instructions.
 

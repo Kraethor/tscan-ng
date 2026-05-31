@@ -117,27 +117,10 @@ sudo -u tscan -H bash -lc '
 ```
 ## Grant Capture Capabilities
 
-Allow the Python binary to open raw sockets for pcap capture without
-running as root:
-```bash
-sudo setcap cap_net_raw+eip /usr/bin/python3.12
-```
-
-Verify:
-```bash
-getcap /usr/bin/python3.12
-```
-
-Expected output:
-```
-/usr/bin/python3.12 cap_net_raw=eip
-```
-
-**Important:**  
-This capability is set on the system Python binary directly. If Python
-is upgraded via `apt`, the new binary may not have this capability set
-and the capture service will fail with `Operation not permitted`. After
-any system Python upgrade, reapply this command and restart the services.
+The `tscan-capture.service` unit grants `CAP_NET_RAW` and `CAP_NET_ADMIN`
+directly to the capture process via systemd's `AmbientCapabilities`
+directive. No `setcap` on the Python binary is required — the unit file
+handles this automatically.
 
 ---
 
@@ -146,8 +129,12 @@ any system Python upgrade, reapply this command and restart the services.
 Set ownership and permissions on the config file:
 ```bash
 sudo chown tscan:tscan /opt/tscan/tscan_ng/config/tscan_ng.conf
-sudo chmod 640 /opt/tscan/tscan_ng/config/tscan_ng.conf
+sudo chmod 644 /opt/tscan/tscan_ng/config/tscan_ng.conf
 ```
+
+`644` (world-readable) is required so that `watch.py`, run as a regular
+user, can read the Discord webhook URL from the config. The file contains
+no credentials other than the optional webhook URL.
 
 Edit `/opt/tscan/tscan_ng/config/tscan_ng.conf` and set at minimum:
 ```ini
@@ -179,6 +166,21 @@ redis  = 6379, 6380
 Add non-standard ports by appending to the comma-separated list. No
 source code changes are required — just edit the config and restart
 both services.
+
+### Discord alerting
+
+To enable Discord alerts on confirmed credential findings, add a
+`[discord]` section to the config:
+
+```ini
+[discord]
+discord_webhook = https://discord.com/api/webhooks/...
+```
+
+Leave blank or omit the section to disable alerting. The webhook URL
+is the only value in this section. Alerts are fired by `watch.py` and
+send only a generic "Credential found" notification — no credential
+material is transmitted.
 
 **Important:**  
 After editing `tscan_ng.conf`, both services must be restarted:
@@ -274,18 +276,26 @@ sudo tcpdump -ni <capture-interface> -c 10
 sudo tail -f /var/log/tscan/results.jsonl
 ```
 
+### Live Monitor
+```bash
+python3 /opt/tscan/scripts/watch.py
+```
+
+Displays colour-coded findings in real time and fires Discord alerts on
+each confirmed credential capture. Run as any user — no root required.
+
 ---
 
 ## Permissions Model (Intentional)
 
-| Item                                       | Owner      | Rationale                  |
-|--------------------------------------------|------------|----------------------------|
-| `/opt/tscan`                               | `tscan`    | Service integrity          |
-| `/opt/tscan/tscan_ng/config/tscan_ng.conf` | `tscan`    | Config security            |
-| `/opt/tscan/scripts/update.sh`             | `tscan`    | Ops script ownership       |
-| Git operations                             | `thoward`  | Developer access           |
-| No group sharing                           | enforced   | Least privilege            |
-| No login for `tscan`                       | enforced   | Attack surface reduction   |
+| Item                                       | Owner      | Mode  | Rationale                           |
+|--------------------------------------------|------------|-------|-------------------------------------|
+| `/opt/tscan`                               | `tscan`    | `755` | Service integrity                   |
+| `/opt/tscan/tscan_ng/config/tscan_ng.conf` | `tscan`    | `644` | World-readable for watch.py         |
+| `/opt/tscan/scripts/update.sh`             | `tscan`    | —     | Ops script ownership                |
+| `/var/log/tscan`                           | `tscan`    | `750` | Log directory                       |
+| Git operations                             | `thoward`  | —     | Developer access                    |
+| No login for `tscan`                       | enforced   | —     | Attack surface reduction            |
 
 ---
 
@@ -325,10 +335,12 @@ sudo systemctl restart tscan-dispatcher tscan-capture
 - Note: the HTTP detector is port-agnostic and always runs regardless of port
 
 ### Capture fails with `Operation not permitted`
-- The Python binary is missing `CAP_NET_RAW` capability
-- Fix:
+- The service unit is missing `AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN`
+- This is already set in the repo's `systemd/tscan-capture.service`
+- Fix: reinstall the unit and restart:
 ```bash
-sudo setcap cap_net_raw+eip /usr/bin/python3.12
+sudo cp /opt/tscan/systemd/tscan-capture.service /etc/systemd/system/
+sudo systemctl daemon-reload
 sudo systemctl restart tscan-capture
 ```
 
@@ -350,3 +362,5 @@ sudo systemctl restart tscan-capture
 - [ ] Capture NIC mirrored correctly
 - [ ] Runtime verification complete (socket, NIC, output)
 - [ ] Update script tested: `sudo /opt/tscan/scripts/update.sh`
+- [ ] Discord webhook configured in `[discord]` section (optional)
+- [ ] Live monitor tested: `python3 /opt/tscan/scripts/watch.py`
