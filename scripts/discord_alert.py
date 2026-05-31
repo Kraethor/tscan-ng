@@ -30,14 +30,10 @@ The local JSONL results remain the authoritative evidence source.
 
 Configuration
 -------------
-Environment Variables:
+Set discord_webhook in the [discord] section of tscan_ng.conf:
 
-TS_DISCORD_WEBHOOK
-    Discord webhook URL used for alert delivery.
-
-Example:
-
-export TS_DISCORD_WEBHOOK="https://discord.com/api/webhooks/..."
+    [discord]
+    discord_webhook = https://discord.com/api/webhooks/...
 
 Usage
 -----
@@ -46,22 +42,34 @@ from discord_alert import send_alert
 send_alert()
 """
 
+import configparser
 import os
-import sys
-
-# Ensure tscan_ng package is importable when running from scripts/
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import requests
 
-from tscan_ng.config import Config
+_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "tscan_ng", "config", "tscan_ng.conf")
 
-# Load the global tscan-ng configuration.
-config = Config()
+
+def _read_webhook() -> str:
+    """
+    Read the Discord webhook URL directly from tscan_ng.conf.
+
+    Reads only the [discord] section via configparser, deliberately bypassing
+    the full Config class and its _validate() checks. watch.py runs as a
+    regular user who cannot write to /var/log/tscan, so full config validation
+    would always fail even though alerting needs no write access.
+
+    Returns:
+        Webhook URL string, or empty string if unset or unreadable.
+    """
+    cfg = configparser.ConfigParser()
+    cfg.read(os.path.abspath(_CONFIG_PATH))
+    return cfg.get("discord", "discord_webhook", fallback="").strip()
+
 
 # Discord webhook URL loaded from tscan_ng.conf [discord] section.
-# If undefined, alerting is silently disabled.
-WEBHOOK_URL = config.discord_webhook
+# If undefined or config is unreadable, alerting is silently disabled.
+WEBHOOK_URL = _read_webhook()
 
 def send_alert() -> None:
     """
