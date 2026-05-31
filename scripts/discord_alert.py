@@ -47,6 +47,11 @@ send_alert()
 """
 
 import os
+import sys
+
+# Ensure tscan_ng package is importable when running from scripts/
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import requests
 
 from tscan_ng.config import Config
@@ -54,10 +59,9 @@ from tscan_ng.config import Config
 # Load the global tscan-ng configuration.
 config = Config()
 
-# Discord webhook URL loaded from environment or tscan_ng.conf.
+# Discord webhook URL loaded from tscan_ng.conf [discord] section.
 # If undefined, alerting is silently disabled.
-# WEBHOOK_URL = os.getenv("TS_DISCORD_WEBHOOK")
-WEBHOOK_URL = config.get("discord_webhook", "").strip()
+WEBHOOK_URL = config.discord_webhook
 
 def send_alert() -> None:
     """

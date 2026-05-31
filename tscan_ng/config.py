@@ -250,6 +250,15 @@ class Config:
         """Frozenset of TCP ports to scan for Redis AUTH credentials."""
         return self._getports("ports", "redis", fallback=frozenset({6379, 6380}))
 
+    # -------------------------------------------------------------------------
+    # [discord]
+    # -------------------------------------------------------------------------
+
+    @property
+    def discord_webhook(self) -> str:
+        """Discord webhook URL for credential alerts. Empty string if unset."""
+        return self._get("discord", "discord_webhook", fallback="").strip()
+
     def _validate(self):
         """
         Validate configuration values and raise ValueError for any that
