@@ -14,6 +14,8 @@ ExecStart=/opt/tscan/venv/bin/python -m tscan_ng.capture
 Restart=on-failure
 RestartSec=5
 SyslogIdentifier=tscan-capture
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
 
 [Install]
 WantedBy=multi-user.target
