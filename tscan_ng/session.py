@@ -31,6 +31,7 @@ Phase status:
     Phase 5 - Session expiry and cleanup:   COMPLETE
 """
 
+import hashlib
 import time
 import logging
 from dataclasses import dataclass, field
@@ -53,6 +54,10 @@ _SERVER_PORTS: frozenset = frozenset({
     587,   # SMTP submission
     993,   # IMAPS
     995,   # POP3S
+    2121,  # FTP alternate
+    1430,  # IMAP alternate
+    1100,  # POP3 alternate
+    2323,  # Telnet alternate
     2525,  # SMTP alternate
 })
 
@@ -103,7 +108,8 @@ def _make_session_id(src: str, dst: str, sport: int, dport: int,
     Returns:
         8-character lowercase hex string.
     """
-    return format(hash((src, dst, sport, dport, created_at)) & 0xFFFFFFFF, "08x")
+    key = f"{src}|{sport}|{dst}|{dport}|{created_at}".encode()
+    return hashlib.sha1(key, usedforsecurity=False).hexdigest()[:8]
 
 
 def _make_filter(src: str, dst: str, sport: int, dport: int) -> str:

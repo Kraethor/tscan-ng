@@ -45,7 +45,10 @@ send_alert()
 import configparser
 import os
 
-import requests
+try:
+    import requests as _requests
+except ImportError:
+    _requests = None
 
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "tscan_ng", "config", "tscan_ng.conf")
 
@@ -67,10 +70,6 @@ def _read_webhook() -> str:
     return cfg.get("discord", "discord_webhook", fallback="").strip()
 
 
-# Discord webhook URL loaded from tscan_ng.conf [discord] section.
-# If undefined or config is unreadable, alerting is silently disabled.
-WEBHOOK_URL = _read_webhook()
-
 def send_alert() -> None:
     """
     Send a minimal Discord alert.
@@ -79,15 +78,20 @@ def send_alert() -> None:
     message to validate webhook functionality without exposing
     credential material.
 
+    The webhook URL is read from config on each call so that
+    config changes take effect without restarting watch.py.
+
     Failure Behavior
     ----------------
     All exceptions are intentionally suppressed to prevent
     Discord outages or network failures from impacting the
     tscan-ng monitoring pipeline.
     """
+    if _requests is None:
+        return
 
-    # If no webhook is configured, do nothing.
-    if not WEBHOOK_URL:
+    webhook_url = _read_webhook()
+    if not webhook_url:
         return
 
     payload = {
@@ -95,8 +99,8 @@ def send_alert() -> None:
     }
 
     try:
-        requests.post(
-            WEBHOOK_URL,
+        _requests.post(
+            webhook_url,
             json=payload,
             timeout=5
         )

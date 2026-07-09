@@ -74,21 +74,22 @@ def _outcome(status: int) -> str:
     return "unknown"
 
 
-def _parse_response(server_buf: bytearray) -> tuple[int, str] | None:
+def _parse_response(server_buf: bytearray) -> tuple[int, str, int] | None:
     """
-    Extract the HTTP status code and text from the server buffer.
+    Extract the HTTP status code, text, and byte end-offset from the server buffer.
 
     Args:
         server_buf: Reassembled server-direction byte stream.
 
     Returns:
-        Tuple of (status_code, status_text) if a response line is found,
-        otherwise None.
+        Tuple of (status_code, status_text, end_offset) if a response line is
+        found, otherwise None.  end_offset is the byte position immediately after
+        the matched response line, suitable for use with del server_buf[:end_offset].
     """
     m = _RESPONSE_LINE_RE.search(bytes(server_buf))
     if not m:
         return None
-    return int(m.group(1)), m.group(2).decode("utf-8", "ignore").strip()
+    return int(m.group(1)), m.group(2).decode("utf-8", "ignore").strip(), m.end()
 
 
 def detect(pkt: dict) -> list[dict]:
@@ -195,7 +196,7 @@ def detect_stream(session, ts: float) -> list[dict]:
         # Attempt to correlate with a server response already in server_buf
         response = _parse_response(session.server_buf)
         if response:
-            status, status_text = response
+            status, status_text, rsp_end = response
             findings.append({
                 **base,
                 "ts_start":    ts,
@@ -204,10 +205,7 @@ def detect_stream(session, ts: float) -> list[dict]:
                 "status_text": status_text,
                 "outcome":     _outcome(status),
             })
-            # Consume the matched response from server_buf
-            m = _RESPONSE_LINE_RE.search(bytes(session.server_buf))
-            if m:
-                del session.server_buf[:m.end()]
+            del session.server_buf[:rsp_end]
         else:
             # No server response yet — register as pending for later resolution
             session.add_pending(base, ts_start=ts)

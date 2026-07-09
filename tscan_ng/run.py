@@ -36,7 +36,8 @@ from tscan_ng.config import Config
 from tscan_ng.parsing.net import parse_basic
 from tscan_ng.detectors import DETECTORS, STREAM_DETECTORS, configure_all
 from tscan_ng.detectors.http_basic import _parse_response, _outcome, _RESPONSE_LINE_RE as _HTTP_RESPONSE_LINE_RE
-from tscan_ng.detectors.imap import _IMAP_RESPONSE_RE, _outcome as _imap_outcome
+from tscan_ng.detectors.imap import (_IMAP_RESPONSE_RE, _IMAP_RESPONSE_BYTES_RE,
+                                      _outcome as _imap_outcome)
 from tscan_ng.detectors.ftp import _FTP_RESPONSE_RE, _outcome as _ftp_outcome
 from tscan_ng.detectors.smtp import (
     _SMTP_RESPONSE_RE, _outcome as _smtp_outcome
@@ -101,13 +102,11 @@ def _try_resolve(p, session, ts: float) -> dict | None:
     if finding_type == "http_basic":
         response = _parse_response(session.server_buf)
         if response:
-            status, status_text = response
+            status, status_text, rsp_end = response
             # Consume the response line from server_buf so that subsequent
             # requests on the same keep-alive connection are not incorrectly
             # correlated with this (now-stale) response.
-            m = _HTTP_RESPONSE_LINE_RE.search(bytes(session.server_buf))
-            if m:
-                del session.server_buf[:m.end()]
+            del session.server_buf[:rsp_end]
             return {
                 **clean_finding,
                 "ts":          p.ts_start,
@@ -120,10 +119,14 @@ def _try_resolve(p, session, ts: float) -> dict | None:
 
     elif finding_type == "imap_creds":
         tag = p.finding.get("tag", "")
-        server_text = session.server_buf.decode("utf-8", "ignore")
-        for resp_match in _IMAP_RESPONSE_RE.finditer(server_text):
-            if resp_match.group(1).upper() == tag.upper():
-                status = resp_match.group(2).upper()
+        tag_bytes = tag.upper().encode("utf-8", "ignore")
+        # Search server_buf as bytes so resp_match.end() is a byte offset,
+        # not a character offset.  Decoding with errors="ignore" drops bytes
+        # and shifts character positions, causing incorrect buffer trimming.
+        server_bytes_imap = bytes(session.server_buf)
+        for resp_match in _IMAP_RESPONSE_BYTES_RE.finditer(server_bytes_imap):
+            if resp_match.group(1).upper() == tag_bytes:
+                status = resp_match.group(2).upper().decode("utf-8", "ignore")
                 # Consume up to and including this tagged response so it
                 # cannot be matched again by a subsequent pending finding.
                 del session.server_buf[:resp_match.end()]
@@ -167,11 +170,26 @@ def _try_resolve(p, session, ts: float) -> dict | None:
 
     elif finding_type == "pop3_creds":
         responses = list(_POP3_RESPONSE_RE.finditer(bytes(session.server_buf)))
-        if len(responses) >= 2:
-            code = responses[1].group(1)
-            # Consume up to and including the PASS response (index 1) so
-            # subsequent logins on the same session are not double-matched.
-            del session.server_buf[:responses[1].end()]
+        # Mirror pop3.detect_stream: -ERR is unambiguous at any position;
+        # success requires all three responses (banner, USER reply, PASS reply)
+        # because two +OK lines are ambiguous (banner + USER, PASS still pending).
+        err_response = next(
+            (r for r in responses if r.group(1).upper() == b"-ERR"), None
+        )
+        if err_response:
+            code = err_response.group(1)
+            del session.server_buf[:err_response.end()]
+            return {
+                **clean_finding,
+                "ts_start":    p.ts_start,
+                "ts_end":      ts,
+                "status":      code.decode("utf-8", "ignore"),
+                "outcome":     _pop3_outcome(code),
+            }
+        elif len(responses) >= 3:
+            # responses[0]=banner, responses[1]=USER reply, responses[2]=PASS reply
+            code = responses[2].group(1)
+            del session.server_buf[:responses[2].end()]
             return {
                 **clean_finding,
                 "ts_start":    p.ts_start,
@@ -372,7 +390,7 @@ def dispatcher(cfg: Config):
     worker_drops = 0  # packets dropped because a worker queue was full
     try:
         while True:
-            buf = s.recv(65536 + HDR.size)
+            buf = s.recv(cfg.snaplen + HDR.size)
             if len(buf) < HDR.size:
                 continue
             sec, usec, caplen, l2type, _ = HDR.unpack_from(buf, 0)

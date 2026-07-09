@@ -50,6 +50,7 @@ Finding outcomes:
 import logging
 import re
 import base64
+from tscan_ng.detectors.common import decode_b64 as _decode_b64
 from tscan_ng.session import _make_filter
 
 # Matches SMTP AUTH PLAIN with optional inline credentials
@@ -64,11 +65,20 @@ _SMTP_AUTH_LOGIN_RE = re.compile(
     re.IGNORECASE | re.MULTILINE
 )
 
-# Matches a bare base64 line (response to a 334 challenge)
+# Matches a bare base64 line (response to a 334 challenge).
+# SMTP verbs that are pure [A-Za-z0-9] strings (RSET, DATA, QUIT, NOOP, etc.)
+# would otherwise match; they are excluded by _SMTP_VERBS below.
 _BASE64_LINE_RE = re.compile(
     rb"^([A-Za-z0-9+/]+=*)\r?$",
     re.MULTILINE
 )
+
+# SMTP command words that are pure base64-alphabet strings and must not be
+# misread as AUTH LOGIN credential lines.
+_SMTP_VERBS: frozenset = frozenset({
+    b"RSET", b"DATA", b"QUIT", b"NOOP", b"HELP",
+    b"VRFY", b"EXPN", b"EHLO", b"HELO", b"STARTTLS",
+})
 
 # Matches SMTP server response codes we care about
 _SMTP_RESPONSE_RE = re.compile(
@@ -135,22 +145,6 @@ def _decode_plain(blob: bytes) -> tuple | None:
     return None
 
 
-def _decode_b64(blob: bytes) -> str:
-    """
-    Decode a base64 blob to a UTF-8 string.
-
-    Args:
-        blob: Raw base64 encoded bytes.
-
-    Returns:
-        Decoded string, or empty string on failure.
-    """
-    try:
-        return base64.b64decode(blob).decode("utf-8", "ignore")
-    except Exception:
-        return ""
-
-
 def detect(pkt: dict) -> list:
     """
     Per-packet interface — disabled in favour of stream detection.
@@ -209,7 +203,13 @@ def detect_stream(session, ts: float) -> list:
     # -----------------------------------------------------------------------
     login_match = _SMTP_AUTH_LOGIN_RE.search(client_bytes)
     if login_match:
-        b64_matches = list(_BASE64_LINE_RE.finditer(client_bytes, login_match.end()))
+        # Filter out bare SMTP verbs (RSET, DATA, QUIT, etc.) that consist
+        # entirely of base64-alphabet characters and would otherwise be
+        # misread as credential lines.
+        b64_matches = [
+            m for m in _BASE64_LINE_RE.finditer(client_bytes, login_match.end())
+            if m.group(1).upper() not in _SMTP_VERBS
+        ]
 
         if len(b64_matches) >= 2:
             user   = _decode_b64(b64_matches[0].group(1))
@@ -242,12 +242,13 @@ def detect_stream(session, ts: float) -> list:
             else:
                 session.add_pending(base, ts_start=ts)
 
-            # Consume AUTH LOGIN + both credential lines from client buffer
+            # Consume AUTH LOGIN + both credential lines from client buffer.
             del session.client_buf[:b64_matches[1].end()]
+            return findings
 
-        # If fewer than 2 base64 lines are present, do nothing: leave the
-        # buffer intact so AUTH LOGIN remains an anchor for the next packet.
-        return findings
+        # Fewer than 2 credential lines present — leave the buffer intact so
+        # AUTH LOGIN remains an anchor for the next packet.  Fall through to
+        # check AUTH PLAIN in case the client cancelled AUTH LOGIN and retried.
 
     # -----------------------------------------------------------------------
     # AUTH PLAIN

@@ -71,13 +71,22 @@ _IMAP_LOGIN_RE = re.compile(
     re.IGNORECASE | re.MULTILINE
 )
 
-# Matches a tagged server response (string regex — also used in run.py
-# _try_resolve for pending finding correlation):
+# Matches a tagged server response (string regex — used by detect_stream
+# when server_buf has already been decoded to str):
 #   a001 OK [CAPABILITY ...] Welcome
 #   a001 NO [AUTHENTICATIONFAILED] Invalid credentials
 #   a001 BAD Command unknown
 _IMAP_RESPONSE_RE = re.compile(
     r'^(\S+)\s+(OK|NO|BAD)\s+',
+    re.IGNORECASE | re.MULTILINE
+)
+
+# Bytes version of the same pattern — used by run.py _try_resolve to obtain
+# a byte-aligned end offset for slicing server_buf directly.  Searching the
+# decoded string and using the character offset would mis-align the slice if
+# server_buf contains multi-byte UTF-8 sequences or bytes dropped by "ignore".
+_IMAP_RESPONSE_BYTES_RE = re.compile(
+    rb'^(\S+)\s+(OK|NO|BAD)\s+',
     re.IGNORECASE | re.MULTILINE
 )
 
