@@ -281,6 +281,7 @@ def worker_main(q: mp.Queue, cfg: Config):
         max_buf=cfg.session_max_buf,
         timeout=cfg.session_timeout,
         pending_max_age=cfg.pending_max_age,
+        max_sessions=cfg.max_sessions,
     )
     last_expiry = time.monotonic()
     logging.basicConfig(level=logging.DEBUG,

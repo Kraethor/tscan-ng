@@ -28,6 +28,7 @@ Config file format:
     max_buf_bytes       = 4194304
     expiry_interval_sec = 30
     pending_max_age_sec = 45
+    max_sessions        = 2048
 
     [ports]
     # Comma-separated port numbers for each protocol detector.
@@ -228,6 +229,33 @@ class Config:
         return float(self._getint("sessions", "pending_max_age_sec",
                                   fallback=45))
 
+    @property
+    def max_sessions(self) -> int:
+        """
+        Maximum number of concurrent sessions tracked per worker.
+
+        Per-session buffers are already bounded by max_buf_bytes, but
+        nothing previously bounded the *number* of concurrent sessions —
+        a burst of many concurrent flows could still grow total memory
+        without limit even with per-session buffers capped. This caps it
+        the way libnids's n_tcp_streams does for dsniff: a hard ceiling,
+        evicting the oldest/least-valuable session to make room for a new
+        one once it's hit (see SessionTable._evict_one).
+
+        This is a second, independent layer of defense alongside
+        max_buf_bytes and the service's cgroup MemoryMax — it does not
+        mathematically guarantee staying under MemoryMax in the absolute
+        worst case (every session simultaneously pegged at max_buf_bytes
+        in both directions: 2048 * 2 * 4MiB would be ~16GB), since real
+        traffic essentially never pegs every concurrent session at once.
+        Its job is bounding the more common failure mode — a connection-
+        count explosion — that MemoryMax alone can't distinguish from
+        legitimate load until memory is already gone. Tune down if
+        MemoryHigh pressure shows up in practice, or up if legitimate
+        traffic gets evicted too aggressively.
+        """
+        return self._getint("sessions", "max_sessions", fallback=2048)
+
     # -------------------------------------------------------------------------
     # [ports]
     # -------------------------------------------------------------------------
@@ -369,6 +397,9 @@ class Config:
         if self.pending_max_age <= 0:
             errors.append(
                 f"sessions.pending_max_age_sec must be > 0 (got {self.pending_max_age})")
+        if self.max_sessions < 1:
+            errors.append(
+                f"sessions.max_sessions must be >= 1 (got {self.max_sessions})")
 
         # --- ports -----------------------------------------------------------
 

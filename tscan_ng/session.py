@@ -112,6 +112,34 @@ def _make_session_id(src: str, dst: str, sport: int, dport: int,
     return hashlib.sha1(key, usedforsecurity=False).hexdigest()[:8]
 
 
+def _close_finding(p: "PendingFinding", last_ts: float) -> dict:
+    """
+    Build a no_response finding dict for a pending finding being force-closed.
+
+    Shared by every path that removes a session or a pending finding
+    without a resolved response (idle expiry, age-based expiry, eviction)
+    so each closes out its in-flight findings the same way instead of
+    silently dropping them.
+
+    Args:
+        p:       The PendingFinding being closed.
+        last_ts: Unix timestamp to record as ts_end (typically the owning
+                 session's last_ts).
+
+    Returns:
+        A completed finding dict with outcome="no_response".
+    """
+    clean = {k: v for k, v in p.finding.items() if not k.startswith("_")}
+    return {
+        **clean,
+        "ts_start":    p.ts_start,
+        "ts_end":      last_ts,
+        "outcome":     "no_response",
+        "status":      None,
+        "status_text": None,
+    }
+
+
 def _make_filter(src: str, dst: str, sport: int, dport: int) -> str:
     """
     Build a Wireshark/tcpdump display filter string for this flow.
@@ -297,16 +325,7 @@ class Session:
         still_pending = []
         for p in self.pending:
             if (now - p.ts_start) > max_age:
-                clean = {k: v for k, v in p.finding.items()
-                         if not k.startswith("_")}
-                expired_findings.append({
-                    **clean,
-                    "ts_start":    p.ts_start,
-                    "ts_end":      self.last_ts,
-                    "outcome":     "no_response",
-                    "status":      None,
-                    "status_text": None,
-                })
+                expired_findings.append(_close_finding(p, self.last_ts))
             else:
                 still_pending.append(p)
         self.pending = still_pending
@@ -347,10 +366,15 @@ class SessionTable:
         _pending_max_age:  Maximum age in seconds for an unresolved pending
                            finding before it is force-closed (see
                            Session.expire_pending).
+        _max_sessions:     Maximum number of concurrent sessions tracked at
+                           once. Bounds total memory against a burst of many
+                           concurrent flows, independent of per-session
+                           buffer limits (see _evict_one).
     """
 
     def __init__(self, max_buf: int = 4 * 1024 * 1024,
-                 timeout: float = 60.0, pending_max_age: float = 45.0):
+                 timeout: float = 60.0, pending_max_age: float = 45.0,
+                 max_sessions: int = 2048):
         """
         Initialize an empty session table.
 
@@ -361,11 +385,14 @@ class SessionTable:
             pending_max_age: Maximum age in seconds before an unresolved
                              pending finding is force-closed, releasing the
                              server_buf trim floor it was holding open.
+            max_sessions:    Maximum number of concurrent sessions tracked
+                             at once, independent of max_buf/timeout.
         """
         self._sessions: dict = {}
         self._max_buf = max_buf
         self._timeout = timeout
         self._pending_max_age = pending_max_age
+        self._max_sessions = max_sessions
 
     def _make_key(self, src: str, dst: str, sport: int, dport: int) -> tuple:
         """
@@ -385,7 +412,7 @@ class SessionTable:
             a, b = b, a
         return (a, b)
 
-    def get_or_create(self, pkt: dict) -> Session:
+    def get_or_create(self, pkt: dict) -> tuple:
         """
         Return the existing session for a packet's flow, or create a new one.
 
@@ -394,15 +421,24 @@ class SessionTable:
         always accumulates client bytes and server_buf accumulates server
         bytes regardless of which endpoint sent the first packet.
 
+        If creating a new session would exceed max_sessions, evicts one
+        existing session first (see _evict_one) so the table never grows
+        past its cap.
+
         Args:
             pkt: Normalized packet dict from parsing.net.parse_basic.
 
         Returns:
-            The Session object for this flow.
+            Tuple of (session, evicted_findings) — the Session object for
+            this flow, and a list of no_response finding dicts for any
+            session evicted to make room for it (empty if none).
         """
         key = self._make_key(pkt["src"], pkt["dst"],
                              pkt["sport"], pkt["dport"])
+        evicted = []
         if key not in self._sessions:
+            if len(self._sessions) >= self._max_sessions:
+                evicted = self._evict_one()
             norm = _normalize_direction(pkt)
             self._sessions[key] = Session(
                 src=norm["src"],
@@ -410,7 +446,29 @@ class SessionTable:
                 sport=norm["sport"],
                 dport=norm["dport"],
             )
-        return self._sessions[key]
+        return self._sessions[key], evicted
+
+    def _evict_one(self) -> list:
+        """
+        Evict one session to make room when the table is at max_sessions.
+
+        Prefers evicting a session with no pending findings — nothing
+        credential-related in flight — over one with pending findings.
+        Within whichever pool is available, evicts the least-recently-active
+        session first. If every session currently has a pending finding,
+        falls back to least-recently-active regardless, since an incoming
+        new connection must always get a session even if that means giving
+        up on one in-flight correlation.
+
+        Returns:
+            List of no_response finding dicts for any pending findings the
+            evicted session was holding (empty if it had none).
+        """
+        idle = [(k, s) for k, s in self._sessions.items() if not s.pending]
+        pool = idle if idle else list(self._sessions.items())
+        key, victim = min(pool, key=lambda kv: kv[1].last_seen)
+        del self._sessions[key]
+        return [_close_finding(p, victim.last_ts) for p in victim.pending]
 
     def add_packet(self, pkt: dict, ts: float) -> tuple:
         """
@@ -444,13 +502,15 @@ class SessionTable:
             ts:  Unix timestamp of this packet.
 
         Returns:
-            Tuple of (session, expired_findings) — the updated Session object
+            Tuple of (session, closed_findings) — the updated Session object
             for this flow, and a list of no_response finding dicts for any
-            pending findings force-closed by age.
+            pending findings force-closed by age or by evicting another
+            session to make room for this one.
         """
-        session = self.get_or_create(pkt)
+        session, evicted = self.get_or_create(pkt)
         session.add_packet(pkt, ts)
         expired = session.expire_pending(ts, self._pending_max_age)
+        closed = evicted + expired
 
         if len(session.client_buf) > self._max_buf:
             if not session._client_trim_warned:
@@ -476,7 +536,7 @@ class SessionTable:
                 del session.server_buf[:cut]
                 session.shift_pending_floors(cut)
 
-        return session, expired
+        return session, closed
 
     def expire(self) -> list:
         """
@@ -494,17 +554,8 @@ class SessionTable:
                         if s.is_expired(self._timeout)]
         for k in expired_keys:
             session = self._sessions[k]
-            for p in session.pending:
-                clean = {kk: v for kk, v in p.finding.items()
-                         if not kk.startswith("_")}
-                expired_findings.append({
-                    **clean,
-                    "ts_start":    p.ts_start,
-                    "ts_end":      session.last_ts,
-                    "outcome":     "no_response",
-                    "status":      None,
-                    "status_text": None,
-                })
+            expired_findings.extend(
+                _close_finding(p, session.last_ts) for p in session.pending)
             del self._sessions[k]
         return expired_findings
 
@@ -523,17 +574,8 @@ class SessionTable:
         """
         flushed = []
         for session in self._sessions.values():
-            for p in session.pending:
-                clean = {k: v for k, v in p.finding.items()
-                         if not k.startswith("_")}
-                flushed.append({
-                    **clean,
-                    "ts_start":    p.ts_start,
-                    "ts_end":      session.last_ts,
-                    "outcome":     "no_response",
-                    "status":      None,
-                    "status_text": None,
-                })
+            flushed.extend(
+                _close_finding(p, session.last_ts) for p in session.pending)
         self._sessions.clear()
         return flushed
 
