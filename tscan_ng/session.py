@@ -138,12 +138,20 @@ class PendingFinding:
     A credential finding detected but not yet correlated with a server response.
 
     Attributes:
-        finding:  Partial finding dict. Will be completed with status,
-                  status_text, outcome, and ts_end on resolution.
-        ts_start: Unix timestamp when the credentials were observed.
+        finding:            Partial finding dict. Will be completed with status,
+                            status_text, outcome, and ts_end on resolution.
+        ts_start:           Unix timestamp when the credentials were observed.
+        server_buf_floor:   len(session.server_buf) at the moment this finding
+                            was registered. The eventual response can only
+                            appear at or after this position — bytes before it
+                            predate the credential submission and are safe to
+                            trim. Shifted down whenever server_buf is trimmed
+                            or consumed (see Session.shift_pending_floors()) so
+                            it stays valid as an index into the current buffer.
     """
-    finding:  dict
-    ts_start: float
+    finding:          dict
+    ts_start:         float
+    server_buf_floor: int = 0
 
 
 @dataclass
@@ -236,11 +244,34 @@ class Session:
         """
         Register a credential finding as pending server response correlation.
 
+        Records the current server_buf length as this finding's floor (see
+        PendingFinding.server_buf_floor) so a later buffer trim knows not to
+        discard bytes this finding's response may still need.
+
         Args:
             finding:  Partial finding dict from a stream detector.
             ts_start: Unix timestamp when the credentials were observed.
         """
-        self.pending.append(PendingFinding(finding=finding, ts_start=ts_start))
+        self.pending.append(PendingFinding(
+            finding=finding, ts_start=ts_start,
+            server_buf_floor=len(self.server_buf)))
+
+    def shift_pending_floors(self, consumed: int):
+        """
+        Shift all pending findings' server_buf_floor down after bytes are
+        removed from the front of server_buf.
+
+        Call this immediately after any `del session.server_buf[:N]` —
+        whether from trimming or from a resolved finding consuming its
+        matched response — so remaining pending findings' floors stay valid
+        indexes into the now-shorter buffer. Clamped to 0 rather than going
+        negative.
+
+        Args:
+            consumed: Number of bytes removed from the front of server_buf.
+        """
+        for p in self.pending:
+            p.server_buf_floor = max(0, p.server_buf_floor - consumed)
 
     def is_expired(self, timeout: float) -> bool:
         """
@@ -345,6 +376,15 @@ class SessionTable:
         prevent credential correlation for that exchange.  If trims are frequent,
         increase session_max_buf in tscan_ng.conf.
 
+        server_buf's trim point additionally respects any pending findings'
+        server_buf_floor (see PendingFinding) — it will never cut past the
+        earliest floor still outstanding, even if that means temporarily
+        exceeding max_buf. Without this, a burst of unrelated server traffic
+        could trim away a tagged response a pending finding is still waiting
+        to match, silently turning a real outcome into a false "no_response".
+        This bends the size cap only as far as outstanding pending findings
+        require; once they resolve or expire, normal trimming resumes.
+
         Args:
             pkt: Normalized packet dict from parsing.net.parse_basic.
             ts:  Unix timestamp of this packet.
@@ -363,14 +403,21 @@ class SessionTable:
                     session.session_id, len(session.client_buf))
                 session._client_trim_warned = True
             del session.client_buf[:-self._max_buf]
-        if len(session.server_buf) > self._max_buf:
-            if not session._server_trim_warned:
-                logging.warning(
-                    "session %s: server_buf trimmed (%d bytes) — "
-                    "increase session_max_buf to reduce credential data loss",
-                    session.session_id, len(session.server_buf))
-                session._server_trim_warned = True
-            del session.server_buf[:-self._max_buf]
+
+        naive_cut = len(session.server_buf) - self._max_buf
+        if naive_cut > 0:
+            floor = min((p.server_buf_floor for p in session.pending),
+                        default=naive_cut)
+            cut = min(naive_cut, floor)
+            if cut > 0:
+                if not session._server_trim_warned:
+                    logging.warning(
+                        "session %s: server_buf trimmed (%d bytes) — "
+                        "increase session_max_buf to reduce credential data loss",
+                        session.session_id, len(session.server_buf))
+                    session._server_trim_warned = True
+                del session.server_buf[:cut]
+                session.shift_pending_floors(cut)
 
         return session
 

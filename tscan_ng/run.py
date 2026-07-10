@@ -107,6 +107,7 @@ def _try_resolve(p, session, ts: float) -> dict | None:
             # requests on the same keep-alive connection are not incorrectly
             # correlated with this (now-stale) response.
             del session.server_buf[:rsp_end]
+            session.shift_pending_floors(rsp_end)
             return {
                 **clean_finding,
                 "ts":          p.ts_start,
@@ -130,6 +131,7 @@ def _try_resolve(p, session, ts: float) -> dict | None:
                 # Consume up to and including this tagged response so it
                 # cannot be matched again by a subsequent pending finding.
                 del session.server_buf[:resp_match.end()]
+                session.shift_pending_floors(resp_match.end())
                 return {
                     **clean_finding,
                     "ts_start":    p.ts_start,
@@ -145,6 +147,7 @@ def _try_resolve(p, session, ts: float) -> dict | None:
             # Consume the matched response line to prevent re-correlation
             # with a later credential exchange on the same session.
             del session.server_buf[:response.end()]
+            session.shift_pending_floors(response.end())
             return {
                 **clean_finding,
                 "ts_start":    p.ts_start,
@@ -160,6 +163,7 @@ def _try_resolve(p, session, ts: float) -> dict | None:
             # Consume the matched response line to prevent re-correlation
             # with a later credential exchange on the same session.
             del session.server_buf[:response.end()]
+            session.shift_pending_floors(response.end())
             return {
                 **clean_finding,
                 "ts_start":    p.ts_start,
@@ -179,6 +183,7 @@ def _try_resolve(p, session, ts: float) -> dict | None:
         if err_response:
             code = err_response.group(1)
             del session.server_buf[:err_response.end()]
+            session.shift_pending_floors(err_response.end())
             return {
                 **clean_finding,
                 "ts_start":    p.ts_start,
@@ -190,6 +195,7 @@ def _try_resolve(p, session, ts: float) -> dict | None:
             # responses[0]=banner, responses[1]=USER reply, responses[2]=PASS reply
             code = responses[2].group(1)
             del session.server_buf[:responses[2].end()]
+            session.shift_pending_floors(responses[2].end())
             return {
                 **clean_finding,
                 "ts_start":    p.ts_start,
@@ -214,6 +220,7 @@ def _try_resolve(p, session, ts: float) -> dict | None:
         if result_code is not None:
             # Consume the BindResponse so it cannot be matched again.
             del session.server_buf[:rsp_end]
+            session.shift_pending_floors(rsp_end)
             return {
                 **clean_finding,
                 "ts_start": p.ts_start,
@@ -227,6 +234,7 @@ def _try_resolve(p, session, ts: float) -> dict | None:
         if outcome is not None:
             # Consume the AUTH response so it cannot be matched again.
             del session.server_buf[:rsp_end]
+            session.shift_pending_floors(rsp_end)
             return {
                 **clean_finding,
                 "ts_start": p.ts_start,
