@@ -95,6 +95,14 @@ pcap_next_ex.restype = ctypes.c_int
 pcap_close = pcap.pcap_close
 pcap_close.argtypes = [pcap_t]
 
+# Returns a pcap_t that exists only to compile filters against a given
+# datalink type -- no interface, no capture, no CAP_NET_RAW required.
+# Used by pipeline.py to compile a BPF filter for a raw AF_PACKET socket
+# without needing an activated (and therefore privileged) capture handle.
+pcap_open_dead = pcap.pcap_open_dead
+pcap_open_dead.argtypes = [ctypes.c_int, ctypes.c_int]
+pcap_open_dead.restype = pcap_t
+
 pcap_compile = pcap.pcap_compile
 pcap_compile.argtypes = [pcap_t, ctypes.POINTER(bpf_program), ctypes.c_char_p,
                          ctypes.c_int, ctypes.c_uint32]

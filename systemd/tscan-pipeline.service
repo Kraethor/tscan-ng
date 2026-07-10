@@ -1,0 +1,34 @@
+[Unit]
+Description=tscan-ng fan-out capture+detect pipeline
+After=network.target
+Documentation=file:/opt/tscan/docs/REBUILD.md
+
+[Service]
+Type=simple
+User=tscan
+Group=tscan
+WorkingDirectory=/opt/tscan
+ExecStart=/opt/tscan/venv/bin/python -m tscan_ng.pipeline
+Restart=on-failure
+RestartSec=5
+SyslogIdentifier=tscan-pipeline
+
+# Replaces tscan-capture.service + tscan-dispatcher.service: each pipeline
+# process now does its own raw AF_PACKET capture directly (joined to a
+# shared PACKET_FANOUT_HASH group), so it needs the capture capabilities
+# tscan-capture.service used to hold. multiprocessing's fork() preserves
+# ambient capabilities across fork, so every pipeline_worker child inherits
+# these from this parent process without re-exec.
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+
+# Combined memory budget for capture+session-tracking+detection across all
+# pipeline processes. Previously split across tscan-capture.service's 256M
+# and tscan-dispatcher.service's 4G separately; this single service now
+# does both jobs, so it adopts the larger of the two as its ceiling.
+MemoryHigh=3G
+MemoryMax=4G
+MemorySwapMax=512M
+
+[Install]
+WantedBy=multi-user.target
