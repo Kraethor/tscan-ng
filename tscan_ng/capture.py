@@ -36,6 +36,24 @@ class pcap_pkthdr(ctypes.Structure):
                 ("len", ctypes.c_uint32)]
 
 
+class bpf_program(ctypes.Structure):
+    """
+    Maps to C struct bpf_program (bf_len, bf_insns).
+
+    bf_insns is populated by pcap_compile() with a pointer to a
+    libpcap-allocated instruction array. Never dereferenced from Python —
+    it is only ever passed by reference to pcap_setfilter()/pcap_freecode(),
+    so c_void_p is sufficient here.
+    """
+    _fields_ = [("bf_len", ctypes.c_uint), ("bf_insns", ctypes.c_void_p)]
+
+
+# Passed to pcap_compile() when the capture device's network mask is
+# unknown/unavailable, which is always true for us (no netmask-relative
+# filter terms like "net"/"broadcast" are used).
+PCAP_NETMASK_UNKNOWN = 0xffffffff
+
+
 # libpcap function bindings
 pcap_create = pcap.pcap_create
 pcap_create.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
@@ -76,6 +94,18 @@ pcap_next_ex.restype = ctypes.c_int
 
 pcap_close = pcap.pcap_close
 pcap_close.argtypes = [pcap_t]
+
+pcap_compile = pcap.pcap_compile
+pcap_compile.argtypes = [pcap_t, ctypes.POINTER(bpf_program), ctypes.c_char_p,
+                         ctypes.c_int, ctypes.c_uint32]
+pcap_compile.restype = ctypes.c_int
+
+pcap_setfilter = pcap.pcap_setfilter
+pcap_setfilter.argtypes = [pcap_t, ctypes.POINTER(bpf_program)]
+pcap_setfilter.restype = ctypes.c_int
+
+pcap_freecode = pcap.pcap_freecode
+pcap_freecode.argtypes = [ctypes.POINTER(bpf_program)]
 
 try:
     pcap_set_immediate_mode = pcap.pcap_set_immediate_mode
@@ -133,10 +163,37 @@ def _connect_with_retry(sock_path: str,
             time.sleep(delay)
 
 
+def _build_port_filter(cfg: Config) -> str:
+    """
+    Build a BPF filter expression restricting capture to the TCP ports any
+    protocol detector actually looks at.
+
+    Without this, capture forwards 100% of traffic on the interface to the
+    dispatcher for full parsing, even on a SPAN/mirror port carrying mostly
+    irrelevant traffic (bulk HTTPS, video, etc.) that no detector will ever
+    match. Filtering at the pcap/kernel layer means that traffic never
+    reaches userspace at all, rather than being parsed and then discarded.
+
+    Args:
+        cfg: Loaded Config object.
+
+    Returns:
+        A BPF filter expression string, e.g. "tcp and (port 21 or port 25)".
+    """
+    ports = set()
+    for port_set in (cfg.http_ports, cfg.ftp_ports, cfg.smtp_ports,
+                     cfg.imap_ports, cfg.pop3_ports, cfg.telnet_ports,
+                     cfg.ldap_ports, cfg.redis_ports):
+        ports.update(port_set)
+    terms = " or ".join(f"port {p}" for p in sorted(ports))
+    return f"tcp and ({terms})"
+
+
 def capture_into_unix_dgram(iface: str, sock_path: str,
                              buf_bytes: int = 32 * 1024 * 1024,
                              snaplen: int = 65535,
-                             immediate: bool = True):
+                             immediate: bool = True,
+                             bpf_filter: str = None):
     """
     Capture packets from a network interface and forward them to the dispatcher.
 
@@ -166,6 +223,13 @@ def capture_into_unix_dgram(iface: str, sock_path: str,
         snaplen:    Maximum bytes to capture per packet (default: 65535).
         immediate:  If True, enable immediate mode for low-latency capture.
                     Falls back to 1ms timeout if immediate mode is unavailable.
+        bpf_filter: BPF filter expression (tcpdump/pcap-filter syntax) applied
+                    in-kernel so non-matching packets never reach userspace.
+                    None skips filtering entirely (capture everything); an
+                    empty string "" also matches everything but goes through
+                    the same compile/setfilter path. See
+                    config.bpf_filter / capture._build_port_filter for how
+                    the caller normally derives this from configured ports.
     """
     import struct
     HDR = struct.Struct("!IIIHH")  # sec, usec, caplen, l2type, pad
@@ -200,6 +264,27 @@ def capture_into_unix_dgram(iface: str, sock_path: str,
         s.close()
         print(f"pcap_activate: {msg}", file=sys.stderr)
         os._exit(3)
+
+    if bpf_filter is not None:
+        prog = bpf_program()
+        if pcap_compile(pc, ctypes.byref(prog), bpf_filter.encode(),
+                        1, PCAP_NETMASK_UNKNOWN) != 0:
+            msg = _err(pc)
+            pcap_close(pc)
+            s.close()
+            print(f"pcap_compile({bpf_filter!r}): {msg}", file=sys.stderr)
+            os._exit(4)
+        if pcap_setfilter(pc, ctypes.byref(prog)) != 0:
+            msg = _err(pc)
+            pcap_freecode(ctypes.byref(prog))
+            pcap_close(pc)
+            s.close()
+            print(f"pcap_setfilter({bpf_filter!r}): {msg}", file=sys.stderr)
+            os._exit(4)
+        # Safe to free immediately after pcap_setfilter() succeeds -- it
+        # copies the compiled program in, it doesn't hold onto bf_insns.
+        pcap_freecode(ctypes.byref(prog))
+        logging.info("capture: BPF filter active: %s", bpf_filter)
 
     dlt = pcap_datalink(pc)
     hdr_ptr = ctypes.POINTER(pcap_pkthdr)()
@@ -263,10 +348,17 @@ if __name__ == "__main__":
     except ValueError as exc:
         logging.critical("tscan-capture: configuration error — %s", exc)
         raise SystemExit(1)
+    # cfg.bpf_filter unset (None) -> auto-build from configured protocol
+    # ports. Explicitly set (including "") -> use verbatim, letting an
+    # empty string disable filtering (capture everything) for troubleshooting.
+    bpf_filter = cfg.bpf_filter
+    if bpf_filter is None:
+        bpf_filter = _build_port_filter(cfg)
     capture_into_unix_dgram(
         iface=cfg.iface,
         sock_path=cfg.socket_path,
         buf_bytes=cfg.buffer_bytes,
         snaplen=cfg.snaplen,
         immediate=not cfg.no_immediate,
+        bpf_filter=bpf_filter,
     )

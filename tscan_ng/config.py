@@ -17,6 +17,7 @@ Config file format:
     snaplen             = 65535
     buffer_bytes        = 33554432
     no_immediate        = false
+    bpf_filter          = tcp and (port 21 or port 25)
 
     [dispatcher]
     workers             = 4
@@ -170,6 +171,21 @@ class Config:
     def no_immediate(self) -> bool:
         """If True, disable immediate mode and use 1ms timeout instead."""
         return self._getbool("capture", "no_immediate", fallback=False)
+
+    @property
+    def bpf_filter(self) -> str | None:
+        """
+        Explicit BPF filter override for pcap capture, or None if unset.
+
+        None (key absent) means: auto-build a filter from every protocol
+        detector's configured ports (see capture._build_port_filter), which
+        is the right default -- it keeps traffic no detector will ever look
+        at from reaching userspace at all. Set explicitly to override:
+        an empty string disables filtering entirely (capture everything,
+        e.g. for troubleshooting); any other value is used verbatim as a
+        tcpdump/pcap-filter expression.
+        """
+        return self._get("capture", "bpf_filter", fallback=None)
 
     # -------------------------------------------------------------------------
     # [dispatcher]
