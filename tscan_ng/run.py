@@ -280,6 +280,7 @@ def worker_main(q: mp.Queue, cfg: Config):
     sessions = SessionTable(
         max_buf=cfg.session_max_buf,
         timeout=cfg.session_timeout,
+        pending_max_age=cfg.pending_max_age,
     )
     last_expiry = time.monotonic()
     logging.basicConfig(level=logging.DEBUG,
@@ -308,7 +309,9 @@ def worker_main(q: mp.Queue, cfg: Config):
 
         try:
             ts, pkt = msg
-            session = sessions.add_packet(pkt, ts)
+            session, expired_pending = sessions.add_packet(pkt, ts)
+            for f in expired_pending:
+                sink.write({"ts": f["ts_start"], **f})
             for det in DETECTORS:
                 for f in det(pkt):
                     sink.write({"ts": ts, **f})

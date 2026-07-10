@@ -25,8 +25,9 @@ Config file format:
 
     [sessions]
     timeout_seconds     = 60
-    max_buf_bytes       = 1048576
+    max_buf_bytes       = 4194304
     expiry_interval_sec = 30
+    pending_max_age_sec = 45
 
     [ports]
     # Comma-separated port numbers for each protocol detector.
@@ -203,13 +204,29 @@ class Config:
     def session_max_buf(self) -> int:
         """Maximum bytes buffered per directional stream per session."""
         return self._getint("sessions", "max_buf_bytes",
-                            fallback=1 * 1024 * 1024)
+                            fallback=4 * 1024 * 1024)
 
     @property
     def expiry_interval(self) -> float:
         """How often (in seconds) each worker runs session expiry."""
         return float(self._getint("sessions", "expiry_interval_sec",
                                   fallback=30))
+
+    @property
+    def pending_max_age(self) -> float:
+        """
+        Maximum age (seconds) of an unresolved pending finding before it is
+        force-closed as no_response.
+
+        A pending finding's server_buf_floor blocks server_buf trimming from
+        cutting past it (see Session.add_pending), so a finding that never
+        correlates with a response holds that floor in place indefinitely.
+        On a busy, continuously-active session this alone lets server_buf
+        grow past max_buf_bytes without bound. Aging out stale pending
+        findings clears the floor so normal trimming can resume.
+        """
+        return float(self._getint("sessions", "pending_max_age_sec",
+                                  fallback=45))
 
     # -------------------------------------------------------------------------
     # [ports]
@@ -349,6 +366,9 @@ class Config:
         if self.expiry_interval <= 0:
             errors.append(
                 f"sessions.expiry_interval_sec must be > 0 (got {self.expiry_interval})")
+        if self.pending_max_age <= 0:
+            errors.append(
+                f"sessions.pending_max_age_sec must be > 0 (got {self.pending_max_age})")
 
         # --- ports -----------------------------------------------------------
 

@@ -273,6 +273,45 @@ class Session:
         for p in self.pending:
             p.server_buf_floor = max(0, p.server_buf_floor - consumed)
 
+    def expire_pending(self, now: float, max_age: float) -> list:
+        """
+        Force-close pending findings older than max_age as no_response.
+
+        A pending finding's server_buf_floor (see add_pending) blocks
+        server_buf trimming from cutting past it, so a finding that never
+        correlates with a response holds that floor — and therefore
+        server_buf's growth — in place indefinitely. On a busy session
+        that never goes idle long enough to hit is_expired(), this is the
+        only thing that bounds server_buf, so it must run independently of
+        session-level idle expiry.
+
+        Args:
+            now:     Current wall-clock (Unix) timestamp.
+            max_age: Maximum age in seconds before a pending finding is
+                     force-closed.
+
+        Returns:
+            List of no_response finding dicts for any findings force-closed.
+        """
+        expired_findings = []
+        still_pending = []
+        for p in self.pending:
+            if (now - p.ts_start) > max_age:
+                clean = {k: v for k, v in p.finding.items()
+                         if not k.startswith("_")}
+                expired_findings.append({
+                    **clean,
+                    "ts_start":    p.ts_start,
+                    "ts_end":      self.last_ts,
+                    "outcome":     "no_response",
+                    "status":      None,
+                    "status_text": None,
+                })
+            else:
+                still_pending.append(p)
+        self.pending = still_pending
+        return expired_findings
+
     def is_expired(self, timeout: float) -> bool:
         """
         Check whether this session has been idle longer than the timeout.
@@ -301,24 +340,32 @@ class SessionTable:
     respectively.
 
     Attributes:
-        _sessions:  Dict mapping flow keys to Session objects.
-        _max_buf:   Maximum bytes buffered per directional stream
-                    before the buffer is trimmed from the front.
-        _timeout:   Idle timeout in seconds for session expiry.
+        _sessions:         Dict mapping flow keys to Session objects.
+        _max_buf:          Maximum bytes buffered per directional stream
+                           before the buffer is trimmed from the front.
+        _timeout:          Idle timeout in seconds for session expiry.
+        _pending_max_age:  Maximum age in seconds for an unresolved pending
+                           finding before it is force-closed (see
+                           Session.expire_pending).
     """
 
-    def __init__(self, max_buf: int = 1 * 1024 * 1024,
-                 timeout: float = 60.0):
+    def __init__(self, max_buf: int = 4 * 1024 * 1024,
+                 timeout: float = 60.0, pending_max_age: float = 45.0):
         """
         Initialize an empty session table.
 
         Args:
-            max_buf: Maximum bytes to buffer per directional stream.
-            timeout: Idle timeout in seconds before a session is expired.
+            max_buf:         Maximum bytes to buffer per directional stream.
+            timeout:         Idle timeout in seconds before a session is
+                             expired.
+            pending_max_age: Maximum age in seconds before an unresolved
+                             pending finding is force-closed, releasing the
+                             server_buf trim floor it was holding open.
         """
         self._sessions: dict = {}
         self._max_buf = max_buf
         self._timeout = timeout
+        self._pending_max_age = pending_max_age
 
     def _make_key(self, src: str, dst: str, sport: int, dport: int) -> tuple:
         """
@@ -365,7 +412,7 @@ class SessionTable:
             )
         return self._sessions[key]
 
-    def add_packet(self, pkt: dict, ts: float) -> Session:
+    def add_packet(self, pkt: dict, ts: float) -> tuple:
         """
         Add a packet to its corresponding session, creating one if needed.
 
@@ -385,15 +432,25 @@ class SessionTable:
         This bends the size cap only as far as outstanding pending findings
         require; once they resolve or expire, normal trimming resumes.
 
+        Because that floor can be held open indefinitely by a finding that
+        never correlates with a response, pending findings older than
+        _pending_max_age are force-closed as no_response *before* the floor
+        is computed below. Without this, a single stuck pending finding on a
+        continuously-active session (one that never goes idle long enough to
+        hit session-level expiry) lets server_buf grow without bound.
+
         Args:
             pkt: Normalized packet dict from parsing.net.parse_basic.
             ts:  Unix timestamp of this packet.
 
         Returns:
-            The updated Session object for this flow.
+            Tuple of (session, expired_findings) — the updated Session object
+            for this flow, and a list of no_response finding dicts for any
+            pending findings force-closed by age.
         """
         session = self.get_or_create(pkt)
         session.add_packet(pkt, ts)
+        expired = session.expire_pending(ts, self._pending_max_age)
 
         if len(session.client_buf) > self._max_buf:
             if not session._client_trim_warned:
@@ -419,7 +476,7 @@ class SessionTable:
                 del session.server_buf[:cut]
                 session.shift_pending_floors(cut)
 
-        return session
+        return session, expired
 
     def expire(self) -> list:
         """

@@ -15,5 +15,18 @@ RuntimeDirectory=tscan
 RuntimeDirectoryMode=0750
 SyslogIdentifier=tscan-dispatcher
 
+# Bound worst-case memory so a session-buffer blowup gets contained to this
+# cgroup (OOM-killed and restarted via Restart=on-failure) instead of
+# exhausting system RAM/swap and hanging the whole box.
+# MemoryHigh throttles/reclaims under pressure before the hard cap hits.
+MemoryHigh=3G
+MemoryMax=4G
+# Cap this cgroup's swap use too -- without it, memory.max only bounds
+# resident pages; swapped-out pages are tracked separately, so this
+# service could still swap unbounded amounts and drag the whole system
+# into the same thrashing that caused last night's hang before it ever
+# hits MemoryMax and gets OOM-killed.
+MemorySwapMax=512M
+
 [Install]
 WantedBy=multi-user.target
