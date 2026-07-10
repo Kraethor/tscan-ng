@@ -55,10 +55,11 @@ def configure_all(cfg) -> None:
     Args:
         cfg: Loaded Config object (tscan_ng.config.Config).
     """
-    ftp._FTP_PORTS       = cfg.ftp_ports
-    smtp._SMTP_PORTS     = cfg.smtp_ports
-    imap._IMAP_PORTS     = cfg.imap_ports
-    pop3._POP3_PORTS     = cfg.pop3_ports
-    telnet._TELNET_PORTS = cfg.telnet_ports
-    ldap._LDAP_PORTS     = cfg.ldap_ports
-    redis._REDIS_PORTS   = cfg.redis_ports
+    http_basic._HTTP_PORTS = cfg.http_ports
+    ftp._FTP_PORTS         = cfg.ftp_ports
+    smtp._SMTP_PORTS       = cfg.smtp_ports
+    imap._IMAP_PORTS       = cfg.imap_ports
+    pop3._POP3_PORTS       = cfg.pop3_ports
+    telnet._TELNET_PORTS   = cfg.telnet_ports
+    ldap._LDAP_PORTS       = cfg.ldap_ports
+    redis._REDIS_PORTS     = cfg.redis_ports

@@ -33,6 +33,7 @@ Config file format:
     [ports]
     # Comma-separated port numbers for each protocol detector.
     # Sessions whose src or dst port is not in this list are skipped.
+    http   = 80, 8080, 8000, 8008, 8081, 8888, 3128
     ftp    = 21, 2121
     smtp   = 25, 465, 587, 2525
     imap   = 143, 993, 1430
@@ -261,6 +262,12 @@ class Config:
     # -------------------------------------------------------------------------
 
     @property
+    def http_ports(self) -> frozenset:
+        """Frozenset of TCP ports to scan for HTTP Basic Auth credentials."""
+        return self._getports("ports", "http",
+                              fallback=frozenset({80, 8080, 8000, 8008, 8081, 8888, 3128}))
+
+    @property
     def ftp_ports(self) -> frozenset:
         """Frozenset of TCP ports to scan for FTP credentials."""
         return self._getports("ports", "ftp", fallback=frozenset({21, 2121}))
@@ -404,6 +411,7 @@ class Config:
         # --- ports -----------------------------------------------------------
 
         for proto, ports in [
+            ("http",   self.http_ports),
             ("ftp",    self.ftp_ports),
             ("smtp",   self.smtp_ports),
             ("imap",   self.imap_ports),

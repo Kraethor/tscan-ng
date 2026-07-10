@@ -9,6 +9,21 @@ Detects credentials submitted via HTTP Basic Authentication and emits
 findings with full request context (method, URI, host) and response
 correlation (status code, outcome).
 
+Port handling:
+    The detector gates on _HTTP_PORTS (a frozenset of common HTTP/proxy
+    ports). Sessions where neither endpoint port is in the set are skipped
+    immediately, keeping per-packet overhead negligible for non-matching
+    traffic — the same pattern every other detector in this package uses.
+
+    This is a deliberate coverage/cost tradeoff: Basic Auth on a port
+    outside this list will not be detected. Previously this detector had no
+    port gate at all and scanned every session on the wire regardless of
+    port, which was the single largest per-packet CPU cost in the pipeline
+    on a full SPAN/mirror feed (every non-HTTP session — bulk HTTPS, video,
+    everything — still paid for a 16 KB buffer scan on every packet). Add
+    site-specific alternate ports to ports.http in tscan_ng.conf rather than
+    reverting to unconditional scanning.
+
 Buffer handling:
     The scan for HTTP header boundaries is capped at _MAX_HEADER_SCAN bytes
     per call. This keeps per-packet work O(1) regardless of buffer size, and
@@ -42,6 +57,19 @@ import logging
 import re
 from tscan_ng.detectors.common import decode_b64
 from tscan_ng.session import _make_filter
+
+# Well-known and commonly-used HTTP/proxy ports.
+# Sessions whose dport or sport is in this set are scanned for Basic Auth.
+# Add site-specific alternate ports here if needed.
+_HTTP_PORTS: frozenset = frozenset({
+    80,    # HTTP
+    8080,  # Common HTTP alternate / proxy
+    8000,  # Common HTTP alternate
+    8008,  # Common HTTP alternate
+    8081,  # Common HTTP alternate
+    8888,  # Common HTTP alternate
+    3128,  # Squid proxy default
+})
 
 # Maximum bytes to scan for an HTTP header boundary (\r\n\r\n) per call.
 # 16 KB is well above any realistic HTTP request header. Capping the scan
@@ -149,6 +177,11 @@ def detect_stream(session, ts: float) -> list[dict]:
         List of resolved finding dicts. Pending findings are registered on
         the session and not returned until resolved.
     """
+    # Skip sessions that are not on a known HTTP/proxy port.
+    # Neither dport nor sport in _HTTP_PORTS means this is definitely not HTTP.
+    if session.dport not in _HTTP_PORTS and session.sport not in _HTTP_PORTS:
+        return []
+
     findings = []
 
     while True:
