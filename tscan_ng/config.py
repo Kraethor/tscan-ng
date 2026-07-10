@@ -15,7 +15,7 @@ Config file format:
     [capture]
     iface               = eth1
     snaplen             = 65535
-    buffer_bytes        = 33554432
+    buffer_bytes        = 268435456
     no_immediate        = false
     bpf_filter          = tcp and (port 21 or port 25)
 
@@ -164,8 +164,25 @@ class Config:
 
     @property
     def buffer_bytes(self) -> int:
-        """Kernel capture ring buffer size in bytes."""
-        return self._getint("capture", "buffer_bytes", fallback=32 * 1024 * 1024)
+        """
+        Kernel socket receive buffer size in bytes, per pipeline process.
+
+        Set via SO_RCVBUFFORCE on each pipeline's AF_PACKET socket (see
+        pipeline._open_fanout_socket) -- a ceiling, not a pre-allocation, so
+        oversizing this costs nothing while idle. It only matters during a
+        burst, and the ultimate backstop regardless of how large a burst
+        gets is this service's cgroup MemoryMax, the same protection
+        session buffers already rely on. 256MB (raised from an original
+        32MB used by the old libpcap-based capture.py) was sized against a
+        live replay-load test: the worst single 30-second window saw
+        ~63,000 kernel-level drops on one pipeline before this increase,
+        and 256MB leaves headroom for roughly double that while keeping
+        worst-case total memory (all 4 sockets + typical session buffer
+        load) comfortably under MemoryHigh -- pushing right up against
+        MemoryHigh risks throttling/reclaim pressure that could itself slow
+        packet processing and cause more drops, not fewer.
+        """
+        return self._getint("capture", "buffer_bytes", fallback=256 * 1024 * 1024)
 
     @property
     def no_immediate(self) -> bool:
