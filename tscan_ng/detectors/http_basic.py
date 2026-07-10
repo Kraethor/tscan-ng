@@ -193,6 +193,18 @@ def detect_stream(session, ts: float) -> list[dict]:
         # Decode Base64 credentials
         creds = decode_b64(auth_match.group(1))
 
+        # Guard against empty captures — some clients (e.g. Zscaler Client
+        # Connector's zcc_conn_test probe) send "Authorization: Basic Og=="
+        # (base64 for ":") purely as a connectivity check, with no real
+        # username or password. Emit nothing rather than a finding with
+        # blank credentials, which would be noise in the output.
+        _user, _, _passwd = creds.partition(":")
+        if not _user and not _passwd:
+            logging.debug(
+                "http_basic: session %s: Authorization header present but decoded to empty credentials",
+                session.session_id)
+            continue
+
         base = {
             "type":       "http_basic",
             "session_id": session.session_id,

@@ -19,13 +19,14 @@ Design Goals
 
 Security Notes
 --------------
-The alert includes the captured username and session_id for triage, e.g.:
+The alert includes the finding type, captured username, and session_id
+for triage, e.g.:
 
-    Credential found — user: `phil`  session: `a1b2c3d4e5f6...`
+    Credential found — type: `http_basic`  user: `phil`  session: `a1b2c3d4e5f6...`
 
 Passwords, tokens, packet payloads, and other stream metadata are never
-transmitted to Discord — only the username portion of `creds` (the text
-before the first ":") and the session_id.
+transmitted to Discord — only `type`, the username portion of `creds`
+(the text before the first ":"), and `session_id`.
 
 Because the username comes directly from captured network traffic, it is
 attacker-controlled input. The payload sets `allowed_mentions: {"parse": []}`
@@ -80,10 +81,10 @@ def send_alert(finding: dict) -> None:
     """
     Send a Discord alert for one successful credential finding.
 
-    Includes the username (from `creds`, split on the first ":") and
-    `session_id` so the alert can be correlated back to the matching
-    line in results.jsonl. Passwords and all other finding fields are
-    never sent.
+    Includes the finding `type` (e.g. "http_basic"), username (from `creds`,
+    split on the first ":"), and `session_id` so the alert can be
+    correlated back to the matching line in results.jsonl. Passwords and
+    all other finding fields are never sent.
 
     Args:
         finding: The parsed JSONL finding dict for one capture.
@@ -104,11 +105,12 @@ def send_alert(finding: dict) -> None:
     if not webhook_url:
         return
 
+    ftype = finding.get("type", "unknown")
     username = finding.get("creds", "").split(":", 1)[0] or "unknown"
     session_id = finding.get("session_id", "unknown")
 
     payload = {
-        "content": f"Credential found — user: `{username}`  session: `{session_id}`",
+        "content": f"Credential found — type: `{ftype}`  user: `{username}`  session: `{session_id}`",
         "allowed_mentions": {"parse": []},
     }
 
