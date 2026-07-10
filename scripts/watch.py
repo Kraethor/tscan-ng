@@ -282,7 +282,7 @@ def main():
         output = _format(finding)
         if output:
             print(output, flush=True)
-            send_alert()
+            send_alert(finding)
 
 
 if __name__ == "__main__":

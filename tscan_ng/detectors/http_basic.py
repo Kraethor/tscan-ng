@@ -21,13 +21,21 @@ Buffer handling:
     on every subsequent packet.
 
 Finding outcomes:
-    success      - Server responded with 2xx
+    success      - Server responded with 2xx, or 304 (see note below)
     failed       - Server responded with 401
-    redirect     - Server responded with 3xx
+    redirect     - Server responded with 3xx (excluding 304)
     server_error - Server responded with 5xx
     pending      - Credentials seen, no server response yet in this packet
     no_response  - Session expired before a server response was seen
                    (emitted by SessionTable.expire())
+
+Note on 304:
+    Per RFC 7232, a server may only return 304 Not Modified for a conditional
+    request if that request would otherwise have succeeded — including its
+    Authorization header. A server rejects bad credentials with 401, never
+    304. So 304 is as strong evidence of valid credentials as 2xx, and is
+    classified as "success" rather than lumped in with ordinary 3xx redirects
+    (301/302/303/307/308), which carry no such guarantee about auth validity.
 """
 
 import logging
@@ -57,6 +65,11 @@ def _outcome(status: int) -> str:
     """
     Map an HTTP status code to a human-readable outcome string.
 
+    304 is classified as "success" rather than "redirect": per RFC 7232, a
+    server can only return 304 for a conditional request that would otherwise
+    have succeeded (including Authorization), so it's equally strong evidence
+    of valid credentials as a 2xx. See the module docstring's "Note on 304".
+
     Args:
         status: HTTP status code integer.
 
@@ -64,6 +77,8 @@ def _outcome(status: int) -> str:
         One of: success, failed, redirect, server_error, unknown.
     """
     if 200 <= status < 300:
+        return "success"
+    elif status == 304:
         return "success"
     elif status == 401:
         return "failed"

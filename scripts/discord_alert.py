@@ -19,12 +19,18 @@ Design Goals
 
 Security Notes
 --------------
-This module intentionally sends ONLY a generic notification message:
+The alert includes the captured username and session_id for triage, e.g.:
 
-    "Credential found"
+    Credential found — user: `phil`  session: `a1b2c3d4e5f6...`
 
-No usernames, passwords, tokens, packet payloads, or stream metadata
-are transmitted to Discord.
+Passwords, tokens, packet payloads, and other stream metadata are never
+transmitted to Discord — only the username portion of `creds` (the text
+before the first ":") and the session_id.
+
+Because the username comes directly from captured network traffic, it is
+attacker-controlled input. The payload sets `allowed_mentions: {"parse": []}`
+so a crafted username (e.g. containing "@everyone") cannot trigger a mention
+in the target channel.
 
 The local JSONL results remain the authoritative evidence source.
 
@@ -39,7 +45,7 @@ Usage
 -----
 from discord_alert import send_alert
 
-send_alert()
+send_alert(finding)  # finding is the parsed JSONL dict for one capture
 """
 
 import configparser
@@ -70,13 +76,17 @@ def _read_webhook() -> str:
     return cfg.get("discord", "discord_webhook", fallback="").strip()
 
 
-def send_alert() -> None:
+def send_alert(finding: dict) -> None:
     """
-    Send a minimal Discord alert.
+    Send a Discord alert for one successful credential finding.
 
-    This function intentionally sends only a generic notification
-    message to validate webhook functionality without exposing
-    credential material.
+    Includes the username (from `creds`, split on the first ":") and
+    `session_id` so the alert can be correlated back to the matching
+    line in results.jsonl. Passwords and all other finding fields are
+    never sent.
+
+    Args:
+        finding: The parsed JSONL finding dict for one capture.
 
     The webhook URL is read from config on each call so that
     config changes take effect without restarting watch.py.
@@ -94,8 +104,12 @@ def send_alert() -> None:
     if not webhook_url:
         return
 
+    username = finding.get("creds", "").split(":", 1)[0] or "unknown"
+    session_id = finding.get("session_id", "unknown")
+
     payload = {
-        "content": "Credential found"
+        "content": f"Credential found — user: `{username}`  session: `{session_id}`",
+        "allowed_mentions": {"parse": []},
     }
 
     try:
