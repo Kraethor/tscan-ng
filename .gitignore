@@ -22,3 +22,7 @@ pcaps/
 
 # Conf file
 tscan_ng.conf
+
+# Deploy key / Claude Code session state (not part of the repo, lives alongside it in /opt/tscan)
+/.ssh/
+/.claude/
