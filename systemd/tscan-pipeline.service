@@ -26,8 +26,13 @@ CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
 # pipeline processes. Previously split across tscan-capture.service's 256M
 # and tscan-dispatcher.service's 4G separately; this single service now
 # does both jobs, so it adopts the larger of the two as its ceiling.
-MemoryHigh=3G
-MemoryMax=4G
+#
+# Raised 2026-07-13 on ser8: workers=12 (vs U01's smaller worker count) x
+# capture.buffer_bytes=256M alone is ~3G of AF_PACKET recv-buffer allocation,
+# leaving no headroom under the original 3G/4G limits sized for fewer
+# workers. ser8 has 57G RAM, so bumped proportionally.
+MemoryHigh=6G
+MemoryMax=8G
 MemorySwapMax=512M
 
 [Install]
