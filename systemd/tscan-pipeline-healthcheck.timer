@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic trigger for tscan-pipeline-healthcheck.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+Unit=tscan-pipeline-healthcheck.service
+
+[Install]
+WantedBy=timers.target

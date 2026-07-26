@@ -22,8 +22,11 @@ coordinate with any other pipeline process.
 
 Each pipeline process is a complete, independent capture-to-finding path:
 raw socket recv() -> parse_basic() -> SessionTable -> detectors ->
-JSONLSink. JSONLSink already flock()s file writes (see sinks/jsonl.py), so
-N processes safely share one output file with no further coordination.
+JSONLSink + DiscordSink. JSONLSink already flock()s file writes (see
+sinks/jsonl.py), so N processes safely share one output file with no
+further coordination. DiscordSink (see sinks/discord.py) fires a webhook
+alert for every successful finding on a background thread, so alerting is
+always on -- it does not depend on anything reading the JSONL log.
 
 The BPF filter is compiled via libpcap's pcap_open_dead() + pcap_compile()
 (see capture.py) rather than reimplementing a BPF compiler, then attached
@@ -32,11 +35,12 @@ is identical whether it ends up driving a pcap handle or a Linux socket
 filter, so no translation is needed.
 """
 
-import ctypes, logging, multiprocessing as mp, socket, struct, time
+import ctypes, logging, multiprocessing as mp, os, socket, struct, sys, time
 from tscan_ng.config import Config
 from tscan_ng.parsing.net import parse_basic, DLT_EN10MB
 from tscan_ng.detectors import DETECTORS, STREAM_DETECTORS, configure_all
 from tscan_ng.sinks.jsonl import JSONLSink
+from tscan_ng.sinks.discord import DiscordSink
 from tscan_ng.session import SessionTable
 from tscan_ng.run import _try_resolve
 from tscan_ng.capture import (
@@ -188,8 +192,26 @@ def _open_fanout_socket(iface: str, group_id: int, bpf_filter: str,
     return sock
 
 
+def _emit(sink: JSONLSink, discord: DiscordSink, finding: dict) -> None:
+    """
+    Write *finding* to the JSONL sink and forward it to Discord alerting.
+
+    Both sinks share the same write(finding) interface, so every finding
+    site in this module calls through here once instead of duplicating the
+    two calls. DiscordSink.write() is itself a no-op unless the finding is
+    a successful credential capture and alerting is configured.
+
+    Args:
+        sink:    The pipeline's JSONLSink.
+        discord: The pipeline's DiscordSink.
+        finding: Finding dict to write/alert on.
+    """
+    sink.write(finding)
+    discord.write(finding)
+
+
 def _maybe_run_periodic(sock: socket.socket, sessions: SessionTable, sink: JSONLSink,
-                        pipeline_id: int, last_expiry: float,
+                        discord: DiscordSink, pipeline_id: int, last_expiry: float,
                         expiry_interval: float) -> float:
     """
     Run session expiry and log kernel-level packet drops, if expiry_interval
@@ -212,6 +234,7 @@ def _maybe_run_periodic(sock: socket.socket, sessions: SessionTable, sink: JSONL
         sock:            The pipeline's fanout socket.
         sessions:        The pipeline's SessionTable.
         sink:            The pipeline's JSONLSink.
+        discord:         The pipeline's DiscordSink.
         pipeline_id:     0-based index, used only for logging.
         last_expiry:     Monotonic timestamp of the last periodic run.
         expiry_interval: Minimum seconds between periodic runs.
@@ -224,7 +247,7 @@ def _maybe_run_periodic(sock: socket.socket, sessions: SessionTable, sink: JSONL
     if now - last_expiry < expiry_interval:
         return last_expiry
     for f in sessions.expire():
-        sink.write({"ts": f["ts_start"], **f})
+        _emit(sink, discord, {"ts": f["ts_start"], **f})
     _, drops = struct.unpack(
         "=II", sock.getsockopt(SOL_PACKET, PACKET_STATISTICS, 8))
     if drops:
@@ -280,6 +303,7 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
     sock.settimeout(1.0)
 
     sink = JSONLSink(cfg.out_path or None)
+    discord = DiscordSink(cfg.discord_webhook, cooldown_sec=cfg.discord_notify_cooldown)
     sessions = SessionTable(
         max_buf=cfg.session_max_buf,
         timeout=cfg.session_timeout,
@@ -291,16 +315,27 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
 
     # Consecutive failure counter — reset to 0 on every successful packet.
     fail_count = 0
+    # Set to a reason string on abnormal exit, checked after the loop to
+    # decide this process's exit code. A worker dying is only ever supposed
+    # to happen via KeyboardInterrupt/terminate() from main() during
+    # shutdown; recv() failing or fail_count maxing out means something is
+    # actually wrong (e.g. the capture interface went down), and previously
+    # this function just returned normally in both cases -- indistinguishable
+    # from a clean shutdown to both systemd (exit code 0 never triggers
+    # Restart=on-failure) and to anyone watching (nothing said why). Both
+    # get an exit code and a Discord alert now.
+    abnormal_exit = None
     while True:
         try:
             frame = sock.recv(cfg.snaplen)
         except socket.timeout:
             # No packets for 1 second. Run session expiry and loop.
             last_expiry = _maybe_run_periodic(
-                sock, sessions, sink, pipeline_id, last_expiry, cfg.expiry_interval)
+                sock, sessions, sink, discord, pipeline_id, last_expiry, cfg.expiry_interval)
             continue
-        except OSError:
+        except OSError as exc:
             logging.exception("pipeline[%d]: recv error, exiting", pipeline_id)
+            abnormal_exit = f"pipeline[{pipeline_id}] pid={os.getpid()} exiting: recv() error ({exc}) -- capture interface may be down"
             break
 
         ts = time.time()
@@ -315,24 +350,24 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
         try:
             session, closed = sessions.add_packet(pkt, ts)
             for f in closed:
-                sink.write({"ts": f["ts_start"], **f})
+                _emit(sink, discord, {"ts": f["ts_start"], **f})
             for det in DETECTORS:
                 for f in det(pkt):
-                    sink.write({"ts": ts, **f})
+                    _emit(sink, discord, {"ts": ts, **f})
             for det in STREAM_DETECTORS:
                 for f in det(session, ts):
-                    sink.write({"ts": ts, **f})
+                    _emit(sink, discord, {"ts": ts, **f})
             if session.pending:
                 still_pending = []
                 for p in session.pending:
                     resolved = _try_resolve(p, session, ts)
                     if resolved:
-                        sink.write(resolved)
+                        _emit(sink, discord, resolved)
                     else:
                         still_pending.append(p)
                 session.pending = still_pending
             last_expiry = _maybe_run_periodic(
-                sock, sessions, sink, pipeline_id, last_expiry, cfg.expiry_interval)
+                sock, sessions, sink, discord, pipeline_id, last_expiry, cfg.expiry_interval)
             fail_count = 0  # Reset on success
         except Exception:
             logging.exception(
@@ -341,11 +376,25 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
             if fail_count >= 100:
                 logging.error("pipeline[%d]: %d consecutive failures, exiting",
                               pipeline_id, fail_count)
+                abnormal_exit = f"pipeline[{pipeline_id}] pid={os.getpid()} exiting: {fail_count} consecutive processing failures"
                 break
 
     for f in sessions.flush_all():
-        sink.write({"ts": f["ts_start"], **f})
+        _emit(sink, discord, {"ts": f["ts_start"], **f})
     sock.close()
+
+    if abnormal_exit:
+        # notify() posts on a background daemon thread; join it (briefly --
+        # matches the HTTP call's own 5s timeout) before exiting, since a
+        # daemon thread doesn't get to finish once the process exits and
+        # this is the last thing this process does.
+        alert_thread = discord.notify(abnormal_exit)
+        if alert_thread:
+            alert_thread.join(timeout=5)
+        # Exit non-zero so the parent's main() (and, transitively,
+        # systemd's Restart=on-failure) sees this as a real failure instead
+        # of a clean shutdown.
+        sys.exit(1)
 
 
 def main(cfg: Config):
@@ -354,7 +403,11 @@ def main(cfg: Config):
 
     Unlike the old dispatcher/worker split, there is no coordinating
     process needed once the pipelines are running -- each is fully
-    independent. This process's only job is to start them and wait.
+    independent. This process's job is to start them, notice if any of
+    them ever exits, and tear the rest down + propagate a real failure if
+    so -- every pipeline_worker() is meant to run forever, so any exit
+    (short of this process itself being interrupted for shutdown) means
+    something is wrong.
 
     Shutdown handling mirrors run.py's old dispatcher(): best-effort on
     KeyboardInterrupt (SIGINT), which is the same level of graceful
@@ -365,6 +418,17 @@ def main(cfg: Config):
 
     Args:
         cfg: Loaded Config object.
+
+    Raises:
+        SystemExit(1): if any worker exited on its own (as opposed to this
+            process being interrupted for a requested shutdown), so
+            systemd's Restart=on-failure actually restarts the service
+            instead of treating it as a clean stop. The previous version of
+            this function returned normally in that case -- looking
+            identical to a deliberate shutdown to both systemd and anyone
+            watching -- which is how the pipeline ended up silently dead
+            for 10 days after the capture interface dropped (see
+            pipeline_worker's docstring for the worker side of this fix).
     """
     procs = [mp.Process(target=pipeline_worker, args=(i, cfg, _FANOUT_GROUP_ID),
                         daemon=False)
@@ -372,18 +436,37 @@ def main(cfg: Config):
     for p in procs:
         p.start()
 
+    failed = False
     try:
-        for p in procs:
-            p.join()
+        # Wait for the first worker to exit, for any reason, rather than
+        # joining them in list order. A plain `for p in procs: p.join()`
+        # only notices a worker dying once every *earlier* worker in the
+        # list has also already exited -- one bad worker among many
+        # healthy ones would hang unnoticed forever, leaving the pipeline
+        # silently running at reduced capacity with one fanout member
+        # permanently gone. mp.connection.wait() on every process's
+        # sentinel wakes up on whichever process exits first, with no
+        # polling.
+        mp.connection.wait(p.sentinel for p in procs)
     except KeyboardInterrupt:
-        for p in procs:
+        pass  # Requested shutdown -- not a failure.
+    else:
+        dead = {p.pid: p.exitcode for p in procs if not p.is_alive()}
+        logging.error("pipeline: worker(s) exited unexpectedly, tearing down: %s", dead)
+        failed = True
+
+    for p in procs:
+        if p.is_alive():
             p.terminate()
-        for p in procs:
-            p.join(timeout=5)
-            if p.is_alive():
-                logging.warning("pipeline: pid=%d did not exit cleanly, killing", p.pid)
-                p.kill()
-                p.join(timeout=1)
+    for p in procs:
+        p.join(timeout=5)
+        if p.is_alive():
+            logging.warning("pipeline: pid=%d did not exit cleanly, killing", p.pid)
+            p.kill()
+            p.join(timeout=1)
+
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

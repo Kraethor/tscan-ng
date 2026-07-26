@@ -1,0 +1,203 @@
+"""
+sinks/discord.py - Discord webhook alerting for tscan-ng.
+
+Two kinds of alert, both posted to the same webhook:
+  - write(finding):  a credential-finding alert, fired for every finding
+    with outcome == "success". Exposes the same write(finding) interface
+    as JSONLSink so pipeline.py can treat both sinks identically at each
+    finding call site.
+  - notify(message): a free-text operational alert -- pipeline_worker exit,
+    kernel packet drops, etc. -- for the "is the pipeline itself healthy"
+    channel of alerting, distinct from "did we catch a credential".
+
+This replaces the old scripts/discord_alert.py, which only alerted while a
+human had watch.py open on a terminal. Living inside tscan-pipeline.service
+itself means alerting no longer depends on anyone watching -- it is always
+on, the same as the JSONL log.
+
+Design goals (carried over from scripts/discord_alert.py):
+  - Never block packet processing: pipeline_worker's hot loop can't afford
+    to stall on a Discord outage or slow network the way a detached
+    terminal viewer could, so the actual HTTP POST runs on a throwaway
+    daemon thread.
+  - Never expose credentials to Discord: only `type`, the username portion
+    of `creds`, and `session_id` are sent for findings.
+  - Never raise back into the caller: exceptions from the network call are
+    swallowed inside the background thread.
+"""
+
+import fcntl
+import os
+import threading
+import time
+
+import requests
+
+# Default marker file for notify()'s cooldown. Every pipeline_worker process
+# constructs its own DiscordSink independently (there is no shared memory
+# between them), so the cooldown has to live on disk to actually coordinate
+# across processes -- otherwise a single event that takes down every worker
+# at once (e.g. the capture interface dropping) fires one alert per worker
+# instead of one alert total. /run/tscan is created by tscan-pipeline.service
+# via RuntimeDirectory=tscan, so it exists whenever a pipeline_worker could
+# plausibly call notify().
+_DEFAULT_COOLDOWN_PATH = "/run/tscan/discord_notify_last"
+
+
+class DiscordSink:
+    """
+    Sends Discord webhook alerts for tscan-ng: credential findings and
+    operational events.
+
+    Args:
+        webhook_url:   Discord webhook URL, or "" to disable alerting
+            entirely (write()/notify() become no-ops).
+        cooldown_path: Marker file used to rate-limit notify() across
+            processes. See _try_claim_alert_slot().
+        cooldown_sec:  Minimum seconds between notify() alerts sharing
+            cooldown_path. 0 disables the cooldown (every notify() call
+            sends), which is correct for a caller that already does its own
+            edge-triggered dedup (e.g. the external healthcheck, which only
+            calls notify() on an up/down state transition).
+    """
+
+    def __init__(self, webhook_url: str,
+                 cooldown_path: str = _DEFAULT_COOLDOWN_PATH,
+                 cooldown_sec: float = 300):
+        self._webhook_url = webhook_url
+        self._cooldown_path = cooldown_path
+        self._cooldown_sec = cooldown_sec
+
+    def write(self, finding: dict) -> None:
+        """
+        Fire a background alert for *finding* if alerting is enabled and
+        the finding is a successful credential capture. No-op otherwise.
+
+        Args:
+            finding: Finding dict, same shape as written to the JSONL sink.
+        """
+        if not self._webhook_url or finding.get("outcome") != "success":
+            return
+        threading.Thread(
+            target=_send_finding, args=(self._webhook_url, finding), daemon=True
+        ).start()
+
+    def notify(self, message: str) -> "threading.Thread | None":
+        """
+        Fire a background operational alert with free-text *message*, e.g.
+        "pipeline[2] pid=1234 exiting: recv() error (iface down?)". No-op if
+        alerting is disabled, or if another alert already claimed this
+        cooldown window (see _try_claim_alert_slot).
+
+        Returns the (already-started) daemon thread doing the POST, or None
+        if no alert was sent (disabled, or suppressed by the cooldown).
+        Fire-and-forget callers can ignore the return value; a caller about
+        to exit the process right after calling notify() should join() it
+        (with a timeout) first -- otherwise the process can exit before the
+        background thread gets a chance to actually send the alert, since
+        daemon threads are not waited on at interpreter shutdown.
+
+        Args:
+            message: Plain-text message to post to the webhook.
+        """
+        if not self._webhook_url:
+            return None
+        if not _try_claim_alert_slot(self._cooldown_path, self._cooldown_sec):
+            return None
+        t = threading.Thread(
+            target=_post,
+            args=(self._webhook_url, {"content": message, "allowed_mentions": {"parse": []}}),
+            daemon=True,
+        )
+        t.start()
+        return t
+
+
+def _send_finding(webhook_url: str, finding: dict) -> None:
+    """
+    Build and POST the Discord payload for one successful credential
+    finding. Runs on a background thread.
+
+    Because the username comes directly from captured network traffic, it
+    is attacker-controlled input. `allowed_mentions: {"parse": []}` stops a
+    crafted username (e.g. containing "@everyone") from triggering a
+    mention in the target channel.
+
+    Args:
+        webhook_url: Discord webhook URL.
+        finding: Finding dict for one successful credential capture.
+    """
+    ftype = finding.get("type", "unknown")
+    username = finding.get("creds", "").split(":", 1)[0] or "unknown"
+    session_id = finding.get("session_id", "unknown")
+
+    payload = {
+        "content": f"Credential found — type: `{ftype}`  user: `{username}`  session: `{session_id}`",
+        "allowed_mentions": {"parse": []},
+    }
+    _post(webhook_url, payload)
+
+
+def _try_claim_alert_slot(marker_path: str, cooldown_sec: float) -> bool:
+    """
+    Return True if the caller may send a notify() alert right now, False if
+    one was already sent within the last cooldown_sec (by this process or
+    any other process sharing marker_path).
+
+    Uses flock() around a read-modify-write of the marker file's mtime for
+    atomicity, the same pattern sinks/jsonl.py uses for write safety across
+    multiple pipeline_worker processes -- local filesystem only, per that
+    module's documented NFS caveat. A file's mtime (rather than its
+    contents) is the timestamp of record: any write bumps it, so claiming
+    the slot is just "write one byte while holding the lock". An empty file
+    (O_CREAT just created it, nothing written yet) means "never claimed" and
+    always succeeds regardless of its just-created mtime -- without this, a
+    brand new marker's mtime is "now", which is indistinguishable from "an
+    alert was just sent" and would wrongly deny the very first claim.
+
+    Fails open (returns True) if the marker file can't be opened at all,
+    since a missing/unwritable state directory should never be the reason a
+    real operational alert silently never gets sent.
+
+    Args:
+        marker_path:  Path to the shared marker file.
+        cooldown_sec: Minimum seconds between claims. 0 always claims.
+
+    Returns:
+        True if this call claimed the slot and should send; False if still
+        within another call's cooldown window.
+    """
+    try:
+        fd = os.open(marker_path, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            st = os.fstat(fd)
+            if st.st_size > 0 and time.time() - st.st_mtime < cooldown_sec:
+                return False
+            os.ftruncate(fd, 0)
+            os.write(fd, str(int(time.time())).encode())
+            return True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _post(webhook_url: str, payload: dict) -> None:
+    """
+    POST *payload* to the Discord webhook. All exceptions are intentionally
+    suppressed so a Discord outage or network failure can never affect the
+    capture pipeline (this always runs on a background thread; there is no
+    caller left to usefully report an exception to).
+
+    Args:
+        webhook_url: Discord webhook URL.
+        payload: JSON-serializable Discord webhook payload.
+    """
+    try:
+        requests.post(webhook_url, json=payload, timeout=5)
+    except Exception:
+        pass

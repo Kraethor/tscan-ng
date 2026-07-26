@@ -7,6 +7,11 @@ for each finding whose outcome is "success".  All other outcomes are silently
 skipped.  Log rotation is handled transparently — the file is reopened
 automatically when it is truncated or replaced by a new inode.
 
+This is a read-only viewer. Logging and Discord alerting both happen inside
+tscan-pipeline.service itself (see tscan_ng/sinks/jsonl.py and
+tscan_ng/sinks/discord.py) regardless of whether this script is running, so
+closing this terminal never turns alerting off.
+
 Usage:
     sudo python3 /opt/tscan/scripts/watch.py [results_file]
 
@@ -31,7 +36,6 @@ import os
 import sys
 import time
 from datetime import datetime
-from discord_alert import send_alert
 
 # ── ANSI helpers ──────────────────────────────────────────────────────────────
 
@@ -282,7 +286,6 @@ def main():
         output = _format(finding)
         if output:
             print(output, flush=True)
-            send_alert(finding)
 
 
 if __name__ == "__main__":

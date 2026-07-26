@@ -2,6 +2,15 @@
 Description=tscan-ng fan-out capture+detect pipeline
 After=network.target
 Documentation=file:/opt/tscan/docs/REBUILD.md
+# Unlimited restart attempts. The default (5 starts per 10s) exists to stop
+# a genuinely broken unit from spinning forever, but the main failure mode
+# here -- the capture interface (enx00242788e34c, a USB NIC) going down --
+# is exactly the case where retrying forever is correct: every RestartSec
+# tick is another chance to notice the NIC came back, and pipeline.py now
+# exits non-zero specifically so these retries happen instead of the
+# service just going quiet. Losing that safety valve is an acceptable
+# trade given RestartSec=5 already keeps the retry rate low.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -12,6 +21,13 @@ ExecStart=/opt/tscan/venv/bin/python -m tscan_ng.pipeline
 Restart=on-failure
 RestartSec=5
 SyslogIdentifier=tscan-pipeline
+
+# /run/tscan, owned by tscan:tscan, created before ExecStart and removed on
+# stop (but preserved across Restart= cycles within one activation). Used by
+# tscan_ng/sinks/discord.py to coordinate the operational-alert cooldown
+# across all pipeline_worker processes, which otherwise have no shared
+# memory to dedupe through.
+RuntimeDirectory=tscan
 
 # Replaces tscan-capture.service + tscan-dispatcher.service: each pipeline
 # process now does its own raw AF_PACKET capture directly (joined to a

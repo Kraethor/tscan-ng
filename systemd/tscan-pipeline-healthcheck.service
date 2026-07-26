@@ -1,0 +1,12 @@
+[Unit]
+Description=External health check for tscan-pipeline.service (Discord alert on down/recovered)
+Documentation=file:/opt/tscan/docs/REBUILD.md
+
+[Service]
+Type=oneshot
+User=tscan
+Group=tscan
+WorkingDirectory=/opt/tscan
+StateDirectory=tscan-healthcheck
+ExecStart=/opt/tscan/venv/bin/python /opt/tscan/scripts/pipeline_healthcheck.py
+SyslogIdentifier=tscan-pipeline-healthcheck

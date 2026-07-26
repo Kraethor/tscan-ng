@@ -344,6 +344,22 @@ class Config:
         """Discord webhook URL for credential alerts. Empty string if unset."""
         return self._get("discord", "discord_webhook", fallback="").strip()
 
+    @property
+    def discord_notify_cooldown(self) -> float:
+        """
+        Minimum seconds between operational (non-finding) Discord alerts,
+        e.g. a pipeline_worker exiting abnormally.
+
+        Distinct from credential-finding alerts (DiscordSink.write()), which
+        have no cooldown -- every successful capture is meaningful on its
+        own. Operational alerts need one because a sustained failure (e.g.
+        the capture interface staying down) makes every pipeline_worker
+        process re-raise and re-alert on every RestartSec cycle; without a
+        cooldown that's one Discord message every few seconds for as long
+        as the outage lasts.
+        """
+        return float(self._getint("discord", "notify_cooldown_sec", fallback=300))
+
     def _validate(self):
         """
         Validate configuration values and raise ValueError for any that
