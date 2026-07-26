@@ -9,18 +9,16 @@ fi
 
 SERVICE_USER="tscan"
 APP_DIR="/opt/tscan"
-DISPATCHER_SERVICE="tscan-dispatcher"
-CAPTURE_SERVICE="tscan-capture"
+PIPELINE_SERVICE="tscan-pipeline"
+HEALTHCHECK_TIMER="tscan-pipeline-healthcheck.timer"
+UNITS=("tscan-pipeline.service" "tscan-pipeline-healthcheck.service" "tscan-pipeline-healthcheck.timer")
 
 # ---------------------------------------------------------------------------
-# Stop services (capture first, then dispatcher)
+# Stop the pipeline
 # ---------------------------------------------------------------------------
-echo "[+] Stopping services (capture then dispatcher)..."
-if systemctl is-active --quiet "${CAPTURE_SERVICE}"; then
-  systemctl stop "${CAPTURE_SERVICE}"
-fi
-if systemctl is-active --quiet "${DISPATCHER_SERVICE}"; then
-  systemctl stop "${DISPATCHER_SERVICE}"
+echo "[+] Stopping ${PIPELINE_SERVICE}..."
+if systemctl is-active --quiet "${PIPELINE_SERVICE}"; then
+  systemctl stop "${PIPELINE_SERVICE}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -52,11 +50,11 @@ fi
 # Reinstall systemd units if they changed
 # ---------------------------------------------------------------------------
 UNITS_CHANGED=0
-for SVC in "${DISPATCHER_SERVICE}" "${CAPTURE_SERVICE}"; do
-  REPO_UNIT="${APP_DIR}/systemd/${SVC}.service"
-  SYSTEM_UNIT="/etc/systemd/system/${SVC}.service"
+for UNIT in "${UNITS[@]}"; do
+  REPO_UNIT="${APP_DIR}/systemd/${UNIT}"
+  SYSTEM_UNIT="/etc/systemd/system/${UNIT}"
   if [ ! -f "${SYSTEM_UNIT}" ] || ! diff -q "${REPO_UNIT}" "${SYSTEM_UNIT}" &>/dev/null; then
-    echo "[+] ${SVC}.service changed or missing, reinstalling..."
+    echo "[+] ${UNIT} changed or missing, reinstalling..."
     cp "${REPO_UNIT}" "${SYSTEM_UNIT}"
     UNITS_CHANGED=1
   fi
@@ -70,23 +68,25 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Start services (dispatcher first, then capture)
+# Start the pipeline and make sure the healthcheck timer is enabled
 # ---------------------------------------------------------------------------
-echo "[+] Starting services (dispatcher then capture)..."
-systemctl start "${DISPATCHER_SERVICE}"
-sleep 2
-systemctl start "${CAPTURE_SERVICE}"
+echo "[+] Starting ${PIPELINE_SERVICE}..."
+systemctl start "${PIPELINE_SERVICE}"
+systemctl enable --now "${HEALTHCHECK_TIMER}" >/dev/null
 
 # ---------------------------------------------------------------------------
 # Report status
 # ---------------------------------------------------------------------------
-echo "[+] Current service status:"
-for SVC in "${DISPATCHER_SERVICE}" "${CAPTURE_SERVICE}"; do
-  if systemctl --no-pager --quiet is-active "${SVC}"; then
-    echo "  - ${SVC}: active"
-  else
-    echo "  - ${SVC}: NOT active"
-  fi
-done
+echo "[+] Current status:"
+if systemctl --no-pager --quiet is-active "${PIPELINE_SERVICE}"; then
+  echo "  - ${PIPELINE_SERVICE}: active"
+else
+  echo "  - ${PIPELINE_SERVICE}: NOT active"
+fi
+if systemctl --no-pager --quiet is-active "${HEALTHCHECK_TIMER}"; then
+  echo "  - ${HEALTHCHECK_TIMER}: active"
+else
+  echo "  - ${HEALTHCHECK_TIMER}: NOT active"
+fi
 
 echo "[+] Done."

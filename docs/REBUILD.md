@@ -1,10 +1,10 @@
 # REBUILD.md
 **tscan-ng – Rebuild & Deployment Guide**
-**Host: U01**
+**Applies to any tscan-ng deployment (e.g. U01, ser8)**
 
 ## Purpose
 
-This document describes how to rebuild a `tscan-ng` capture node from scratch  
+This document describes how to rebuild a `tscan-ng` capture node from scratch
 (e.g., hardware loss, OS reinstall, disaster recovery).
 
 The goal is that **this repo alone** is sufficient to rebuild a working system.
@@ -15,8 +15,11 @@ The goal is that **this repo alone** is sufficient to rebuild a working system.
 
 - **Host role:** Passive network traffic capture + analysis
 - **Traffic source:** Switch SPAN / mirror port
-- **Execution model:** systemd services
-- **Language:** Python (libpcap via ctypes)
+- **Execution model:** One systemd service (`tscan-pipeline`) plus a
+  timer/oneshot pair for external health monitoring
+  (`tscan-pipeline-healthcheck`)
+- **Language:** Python (raw `AF_PACKET` sockets; libpcap via ctypes for BPF
+  filter compilation only)
 - **Security model:**
   - Non-login service account
   - No group sharing
@@ -29,29 +32,31 @@ The goal is that **this repo alone** is sufficient to rebuild a working system.
 ### Interfaces
 
 | Interface      | Purpose              | Notes                        |
-|----------------|----------------------|------------------------------|
+|-----------------|-----------------------|--------------------------------|
 | Management NIC | SSH, Git, admin      | Has default route + DNS      |
 | Capture NIC    | SPAN destination     | RX-only, no gateway          |
 
-**Important:**  
+**Important:**
 Traffic generated *on this host* will **not** be seen by the capture NIC.
 
 ---
 
 ## Filesystem Layout
 
-| Path                                      | Purpose                        |
-|-------------------------------------------|--------------------------------|
-| `/opt/tscan`                              | Application root               |
-| `/opt/tscan/tscan_ng`                     | Python source                  |
-| `/opt/tscan/tscan_ng/config/tscan_ng.conf`| Runtime configuration          |
-| `/opt/tscan/scripts`                      | Operational scripts            |
-| `/opt/tscan/systemd`                      | systemd unit files             |
-| `/opt/tscan/logrotate`                    | logrotate config               |
-| `/opt/tscan/docs`                         | Documentation                  |
-| `/opt/tscan/venv`                         | Python virtualenv              |
-| `/var/log/tscan`                          | Runtime logs                   |
-| `/run/tscan`                              | Runtime socket (tmpfs)         |
+| Path                                       | Purpose                                              |
+|----------------------------------------------|---------------------------------------------------------|
+| `/opt/tscan`                               | Application root                                     |
+| `/opt/tscan/tscan_ng`                      | Python source                                        |
+| `/opt/tscan/tscan_ng/config/tscan_ng.conf` | Runtime configuration (gitignored, host-specific)    |
+| `/opt/tscan/scripts`                       | Operational scripts                                  |
+| `/opt/tscan/systemd`                       | systemd unit files                                   |
+| `/opt/tscan/logrotate`                     | logrotate config                                     |
+| `/opt/tscan/docs`                          | Documentation                                        |
+| `/opt/tscan/venv`                          | Python virtualenv                                    |
+| `/opt/tscan/.ssh`                          | GitHub deploy key (mode 700, `tscan`-owned)          |
+| `/var/log/tscan`                           | Runtime logs                                         |
+| `/run/tscan`                               | tmpfs, created by `RuntimeDirectory=tscan` on the pipeline unit. Holds the cross-process Discord operational-alert cooldown marker — not a socket (the old dispatcher's Unix socket no longer exists in the fan-out architecture). |
+| `/var/lib/tscan-healthcheck`               | Persistent state for the healthcheck timer (up/down transition marker), created via `StateDirectory=` on that unit |
 
 ---
 
@@ -84,22 +89,50 @@ Verify:
 ```bash
 getent passwd tscan
 ```
-**Note:**  
+**Note:**
 This is a non-login service account with no home directory. It has no
-interactive access and exists solely to own and run the tscan-ng services.
+interactive access and exists solely to own and run the tscan-ng service.
 
 ---
 
 ## Deploy Code
+
 ```bash
 sudo mkdir -p /opt/tscan
 sudo chown -R tscan:tscan /opt/tscan
 sudo chmod 755 /opt/tscan
 ```
 
-Clone the repo **as the service user**:
+The repo is private and cloned over SSH using a deploy key scoped to this
+repo, not a GitHub PAT. Provision the key **before** cloning, since the
+clone step needs it:
+
 ```bash
-sudo -u tscan -H git clone https://github.com/Kraethor/tscan-ng.git /opt/tscan
+sudo -u tscan -H mkdir -p -m 700 /opt/tscan/.ssh
+# Copy in the existing deploy key pair (id_ed25519_tscan_ng /
+# id_ed25519_tscan_ng.pub) from wherever it's backed up, or generate a new
+# one and register its public half as a GitHub deploy key on
+# Kraethor/tscan-ng (read access is enough; write access is only needed if
+# this host will also push):
+sudo -u tscan -H ssh-keygen -t ed25519 -f /opt/tscan/.ssh/id_ed25519_tscan_ng -N ""
+sudo -u tscan -H chmod 600 /opt/tscan/.ssh/id_ed25519_tscan_ng
+```
+
+Clone the repo **as the service user**, over SSH, pinned to this key:
+```bash
+sudo -u tscan -H env GIT_SSH_COMMAND="ssh -i /opt/tscan/.ssh/id_ed25519_tscan_ng -o IdentitiesOnly=yes -o UserKnownHostsFile=/opt/tscan/.ssh/known_hosts -o StrictHostKeyChecking=accept-new" \
+  git clone git@github.com:Kraethor/tscan-ng.git /opt/tscan
+```
+
+Once cloned, pin the same SSH command in the repo's own config so future
+`git` operations (including the `sudo -u tscan git ...` pattern used
+elsewhere in this doc and by `scripts/update.sh`) use it automatically
+without needing `GIT_SSH_COMMAND` set every time:
+```bash
+sudo -u tscan -H git -C /opt/tscan config core.sshCommand \
+  "ssh -i /opt/tscan/.ssh/id_ed25519_tscan_ng -o IdentitiesOnly=yes -o UserKnownHostsFile=/opt/tscan/.ssh/known_hosts -o StrictHostKeyChecking=accept-new"
+sudo -u tscan -H git -C /opt/tscan config user.name "<git identity>"
+sudo -u tscan -H git -C /opt/tscan config user.email "<git identity email>"
 ```
 
 ---
@@ -115,12 +148,15 @@ sudo -u tscan -H bash -lc '
   deactivate
 '
 ```
+
 ## Grant Capture Capabilities
 
-The `tscan-capture.service` unit grants `CAP_NET_RAW` and `CAP_NET_ADMIN`
-directly to the capture process via systemd's `AmbientCapabilities`
+The `tscan-pipeline.service` unit grants `CAP_NET_RAW` and `CAP_NET_ADMIN`
+directly to the pipeline process via systemd's `AmbientCapabilities`
 directive. No `setcap` on the Python binary is required — the unit file
-handles this automatically.
+handles this automatically, and Python's `multiprocessing.Process` (used to
+fork off each worker) preserves ambient capabilities across `fork()`, so
+every worker inherits them without a re-exec step.
 
 ---
 
@@ -129,12 +165,16 @@ handles this automatically.
 Set ownership and permissions on the config file:
 ```bash
 sudo chown tscan:tscan /opt/tscan/tscan_ng/config/tscan_ng.conf
-sudo chmod 644 /opt/tscan/tscan_ng/config/tscan_ng.conf
+sudo chmod 640 /opt/tscan/tscan_ng/config/tscan_ng.conf
 ```
 
-`644` (world-readable) is required so that `watch.py`, run as a regular
-user, can read the Discord webhook URL from the config. The file contains
-no credentials other than the optional webhook URL.
+`640` (owner + group readable, not world-readable) is sufficient: every
+process that reads this file — `tscan-pipeline.service` and
+`tscan-pipeline-healthcheck.service` — runs as `tscan`. Unlike the old
+architecture, `scripts/watch.py` no longer reads this file at all (it just
+tails the results JSONL by path), so there is no longer a reason to make
+it world-readable. The file may still contain a Discord webhook URL, which
+should be treated as a secret.
 
 Edit `/opt/tscan/tscan_ng/config/tscan_ng.conf` and set at minimum:
 ```ini
@@ -142,18 +182,22 @@ Edit `/opt/tscan/tscan_ng/config/tscan_ng.conf` and set at minimum:
 iface = <your capture interface name>
 ```
 
-All other values have safe defaults. See the config file itself for
-documentation of every setting.
+All other values have safe defaults. See the config file itself and
+`tscan_ng/config.py` for documentation of every setting.
 
 ### Protocol detector ports
 
 The `[ports]` section controls which TCP ports each protocol detector
-will scan. Sessions whose src and dst port are both absent from a
-protocol's list are skipped by that detector, saving CPU at high line
-speeds. The defaults match standard well-known ports:
+will scan — this now includes HTTP, which used to run port-agnostic on
+every port and no longer does. A session whose src and dst port are both
+absent from a protocol's list is skipped by that detector, and a BPF
+filter compiled from the union of every configured port is attached
+directly to each worker's capture socket, so non-matching traffic never
+reaches userspace in the first place. Defaults:
 
 ```ini
 [ports]
+http   = 80, 8080, 8000, 8008, 8081, 8888, 3128
 ftp    = 21, 2121
 smtp   = 25, 465, 587, 2525
 imap   = 143, 993, 1430
@@ -164,28 +208,37 @@ redis  = 6379, 6380
 ```
 
 Add non-standard ports by appending to the comma-separated list. No
-source code changes are required — just edit the config and restart
-both services.
+source code changes are required — just edit the config and restart the
+service.
 
 ### Discord alerting
 
-To enable Discord alerts on confirmed credential findings, add a
-`[discord]` section to the config:
+To enable Discord alerts, add a `[discord]` section to the config:
 
 ```ini
 [discord]
 discord_webhook = https://discord.com/api/webhooks/...
+notify_cooldown_sec = 300
 ```
 
-Leave blank or omit the section to disable alerting. The webhook URL
-is the only value in this section. Alerts are fired by `watch.py` and
-send only a generic "Credential found" notification — no credential
-material is transmitted.
+Leave `discord_webhook` blank or omit the section to disable alerting.
+Alerting is built into `tscan-pipeline.service` itself — it does not
+depend on `watch.py` or any other viewer running. Three kinds of alert
+share the one webhook:
 
-**Important:**  
-After editing `tscan_ng.conf`, both services must be restarted:
+- **Credential finding**, fired for every successful capture. Only
+  `type`, the username portion of `creds`, and `session_id` are sent — no
+  credential material or packet payloads leave the host.
+- **Pipeline failure** (in-process), fired when a worker exits abnormally
+  (e.g. the capture interface dropping). `notify_cooldown_sec` rate-limits
+  this so a sustained outage doesn't send one alert per restart cycle.
+- **Service down / recovered** (external), fired by
+  `tscan-pipeline-healthcheck.timer` — see its own section below.
+
+**Important:**
+After editing `tscan_ng.conf`, the service must be restarted:
 ```bash
-sudo systemctl restart tscan-dispatcher tscan-capture
+sudo systemctl restart tscan-pipeline
 ```
 
 ---
@@ -201,21 +254,30 @@ sudo chmod 750 /var/log/tscan
 
 ## Install systemd Units
 ```bash
-sudo cp /opt/tscan/systemd/tscan-dispatcher.service /etc/systemd/system/
-sudo cp /opt/tscan/systemd/tscan-capture.service /etc/systemd/system/
+sudo cp /opt/tscan/systemd/tscan-pipeline.service /etc/systemd/system/
+sudo cp /opt/tscan/systemd/tscan-pipeline-healthcheck.service /etc/systemd/system/
+sudo cp /opt/tscan/systemd/tscan-pipeline-healthcheck.timer /etc/systemd/system/
 ```
 
 Reload and enable:
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable tscan-dispatcher tscan-capture
-sudo systemctl start tscan-dispatcher tscan-capture
+sudo systemctl enable --now tscan-pipeline
+sudo systemctl enable --now tscan-pipeline-healthcheck.timer
 ```
 
 Verify:
 ```bash
-sudo systemctl status tscan-dispatcher tscan-capture --no-pager
+sudo systemctl status tscan-pipeline --no-pager
+sudo systemctl list-timers tscan-pipeline-healthcheck.timer --no-pager
 ```
+
+`tscan-pipeline.service` sets `StartLimitIntervalSec=0`, so it will keep
+retrying forever on failure (e.g. while the capture interface is down)
+rather than exhausting systemd's default start-limit and landing
+permanently in `failed`. `tscan-pipeline-healthcheck.timer` runs every 2
+minutes and is the independent, out-of-process check that this doesn't
+silently stop working.
 
 ---
 
@@ -229,7 +291,7 @@ Test:
 sudo logrotate -v /etc/logrotate.d/tscan
 ```
 
-**Important:**  
+**Important:**
 The logrotate config must include:
 ```
 su tscan tscan
@@ -245,26 +307,29 @@ sudo /opt/tscan/scripts/update.sh
 ```
 
 The script will:
-- Stop both services in the correct order
-- Pull the latest code from the repository
+- Stop `tscan-pipeline`
+- Pull the latest code from the repository (as `tscan`, over the deploy key)
 - Update Python dependencies if `requirements.txt` changed
-- Reinstall systemd units if they changed
+- Reinstall systemd units if they changed (`tscan-pipeline.service` and
+  the healthcheck `.service`/`.timer` pair)
 - Reload systemd if needed
-- Start both services in the correct order
-- Report final service status
+- Start `tscan-pipeline` and ensure the healthcheck timer is enabled
+- Report final status
 
-**Important:**  
-The update script must be run as root. It handles the correct service
-stop/start ordering automatically.
+**Important:**
+The update script must be run as root. It handles stop/start ordering
+automatically.
 
 ---
 
 ## Runtime Verification
 
-### Socket
+### Pipeline process
 ```bash
-ls -l /run/tscan/tscan.sock
+sudo systemctl status tscan-pipeline --no-pager
 ```
+Should show `active (running)` with `workers`-many `pipeline_worker`
+child processes under the main PID.
 
 ### Capture NIC
 ```bash
@@ -281,72 +346,98 @@ sudo tail -f /var/log/tscan/results.jsonl
 python3 /opt/tscan/scripts/watch.py
 ```
 
-Displays colour-coded findings in real time and fires Discord alerts on
-each confirmed credential capture. Run as any user — no root required.
+Displays colour-coded findings in real time. Read-only — logging and
+Discord alerting already happen inside `tscan-pipeline.service`
+regardless of whether this is running. Run as any user — no root
+required.
+
+### Health check timer
+```bash
+sudo systemctl list-timers tscan-pipeline-healthcheck.timer --no-pager
+sudo systemctl status tscan-pipeline-healthcheck.service --no-pager
+```
+The service's last run should be `code=exited, status=0/SUCCESS` — a
+non-zero exit here means the healthcheck script itself broke, not
+necessarily that the pipeline is down.
 
 ---
 
 ## Permissions Model (Intentional)
 
-| Item                                       | Owner      | Mode  | Rationale                           |
-|--------------------------------------------|------------|-------|-------------------------------------|
-| `/opt/tscan`                               | `tscan`    | `755` | Service integrity                   |
-| `/opt/tscan/tscan_ng/config/tscan_ng.conf` | `tscan`    | `644` | World-readable for watch.py         |
-| `/opt/tscan/scripts/update.sh`             | `tscan`    | —     | Ops script ownership                |
-| `/var/log/tscan`                           | `tscan`    | `750` | Log directory                       |
-| Git operations                             | `thoward`  | —     | Developer access                    |
-| No login for `tscan`                       | enforced   | —     | Attack surface reduction            |
+| Item                                       | Owner      | Mode  | Rationale                                         |
+|-----------------------------------------------|--------------|---------|------------------------------------------------------|
+| `/opt/tscan`                               | `tscan`    | `755` | Service integrity                                 |
+| `/opt/tscan/tscan_ng/config/tscan_ng.conf` | `tscan`    | `640` | May hold a Discord webhook secret; only `tscan`-run processes need to read it |
+| `/opt/tscan/.ssh`                          | `tscan`    | `700` | Deploy key must not be readable by other users    |
+| `/opt/tscan/scripts/update.sh`             | `tscan`    | —     | Ops script ownership                              |
+| `/var/log/tscan`                           | `tscan`    | `750` | Log directory                                     |
+| `/run/tscan`                               | `tscan`    | `755` | Created by `RuntimeDirectory=tscan`; ephemeral, torn down on service stop |
+| `/var/lib/tscan-healthcheck`               | `tscan`    | `755` | Created by `StateDirectory=`; persists across reboots |
+| Git operations                             | via `sudo -u tscan` | — | Deploy key and git identity live in the repo's own `.git/config`, not any user's home |
+| No login for `tscan`                       | enforced   | —     | Attack surface reduction                          |
 
 ---
 
 ## Common Failure Modes
 
-### Capture service fails with `CHDIR`
-- `/opt/tscan` not accessible by service user
+### Pipeline fails with `CHDIR`
+- `/opt/tscan` not accessible by the service user
 - Fix: `chmod 755 /opt/tscan`
 
-### Capture fails to connect to socket
-- Dispatcher not running
-- Restart dispatcher first, then capture:
-```bash
-sudo systemctl restart tscan-dispatcher tscan-capture
-```
-
-### Logs stop updating after rotation
-- logrotate missing `su tscan tscan`
-- Fix ownership and rerun logrotate
-
-### Service starts but no output appears
-- Check `iface` is set correctly in `tscan_ng.conf`
+### Pipeline exits immediately, no findings ever appear
+- Check `capture.iface` is set correctly in `tscan_ng.conf` and exists:
+  `ip -br link show`
 - Verify the capture NIC is receiving traffic:
 ```bash
 sudo tcpdump -ni <capture-interface> -c 10
 ```
 
+### Pipeline restarts continuously (crash-loop)
+- This is now the *expected*, self-healing behavior when the capture
+  interface is down — `tscan-pipeline.service` has
+  `StartLimitIntervalSec=0` and `Restart=on-failure`, so it retries
+  forever rather than giving up. Bring the interface back up
+  (`sudo ip link set <iface> up`) and the next restart attempt will
+  succeed on its own; no manual service restart needed.
+- You should have received a Discord "pipeline[N] ... exiting" alert
+  (rate-limited to one per `notify_cooldown_sec`) and, within 2 minutes, a
+  "tscan-pipeline.service is DOWN" alert from the healthcheck timer. If
+  you didn't and the interface really was down, check `discord_webhook`
+  is set in `tscan_ng.conf` and check `journalctl -u tscan-pipeline` /
+  `journalctl -u tscan-pipeline-healthcheck` for delivery errors.
+
+### Logs stop updating after rotation
+- logrotate missing `su tscan tscan`
+- Fix ownership and rerun logrotate
+
 ### Config changes have no effect
-- Both services must be restarted after editing `tscan_ng.conf`:
+- The service must be restarted after editing `tscan_ng.conf`:
 ```bash
-sudo systemctl restart tscan-dispatcher tscan-capture
+sudo systemctl restart tscan-pipeline
 ```
 
 ### Detector not firing for a known protocol
 - The session's port may not be in the `[ports]` list for that protocol
-- Add the port to the relevant entry in `tscan_ng.conf` and restart both services
-- Note: the HTTP detector is port-agnostic and always runs regardless of port
+  — this now applies to HTTP too (it is no longer port-agnostic)
+- Add the port to the relevant entry in `tscan_ng.conf` and restart the
+  service
 
-### Capture fails with `Operation not permitted`
+### Pipeline fails with `Operation not permitted`
 - The service unit is missing `AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN`
-- This is already set in the repo's `systemd/tscan-capture.service`
+- This is already set in the repo's `systemd/tscan-pipeline.service`
 - Fix: reinstall the unit and restart:
 ```bash
-sudo cp /opt/tscan/systemd/tscan-capture.service /etc/systemd/system/
+sudo cp /opt/tscan/systemd/tscan-pipeline.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl restart tscan-capture
+sudo systemctl restart tscan-pipeline
 ```
 
 ### Update script fails on git pull
-- GitHub credentials may have expired
-- Re-enter credentials when prompted, or configure SSH key auth for the `tscan` user
+- The deploy key at `/opt/tscan/.ssh/id_ed25519_tscan_ng` may be missing,
+  wrong, or its public half may have been removed as a GitHub deploy key
+  on `Kraethor/tscan-ng`
+- Verify: `sudo -u tscan -H git -C /opt/tscan fetch` and read the error
+- This repo does not use a PAT-in-URL for cloning/pulling
 
 ---
 
@@ -354,13 +445,19 @@ sudo systemctl restart tscan-capture
 
 - [ ] OS installed
 - [ ] Service account created
-- [ ] Repo cloned
+- [ ] Deploy key provisioned at `/opt/tscan/.ssh/id_ed25519_tscan_ng` and
+      registered on GitHub
+- [ ] Repo cloned over SSH, `core.sshCommand`/`user.name`/`user.email` set
 - [ ] Virtualenv created
 - [ ] `tscan_ng.conf` permissions set and `iface` configured
-- [ ] systemd units installed and enabled
+- [ ] systemd units installed and enabled: `tscan-pipeline`,
+      `tscan-pipeline-healthcheck.service`/`.timer`
 - [ ] logrotate installed
 - [ ] Capture NIC mirrored correctly
-- [ ] Runtime verification complete (socket, NIC, output)
+- [ ] Runtime verification complete (pipeline status, NIC, output)
 - [ ] Update script tested: `sudo /opt/tscan/scripts/update.sh`
-- [ ] Discord webhook configured in `[discord]` section (optional)
+- [ ] Discord webhook configured in `[discord]` section (optional) and a
+      test finding/failure confirmed to arrive
 - [ ] Live monitor tested: `python3 /opt/tscan/scripts/watch.py`
+- [ ] Healthcheck timer confirmed running:
+      `systemctl list-timers tscan-pipeline-healthcheck.timer`
