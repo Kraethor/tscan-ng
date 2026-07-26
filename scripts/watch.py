@@ -68,6 +68,9 @@ _PROTO = {
     "ldap_creds":    (BOLD + BRIGHT_WHITE,   "LDAP"),
     "redis_creds":   (BOLD + BRIGHT_CYAN,    "Redis"),
     "smb_creds":     (BOLD + WHITE,          "SMB"),
+    "snmp_creds":    (BOLD + BRIGHT_YELLOW,  "SNMP"),
+    "irc_creds":     (BOLD + BRIGHT_GREEN,   "IRC"),
+    "postgres_creds": (BOLD + BRIGHT_BLUE,   "PostgreSQL"),
 }
 
 DEFAULT_RESULTS = "/var/log/tscan/results.jsonl"
@@ -177,6 +180,15 @@ def _format(finding: dict) -> str | None:
             flow += f"  {DIM}domain: {domain}{RESET}"
         if workstation:
             flow += f"  {DIM}from: {workstation}{RESET}"
+    elif ftype == "snmp_creds":
+        version  = finding.get("version",  "")
+        pdu_type = finding.get("pdu_type", "")
+        if version or pdu_type:
+            flow += f"  {DIM}{version} {pdu_type}{RESET}"
+    elif ftype == "postgres_creds":
+        user = finding.get("user", "")
+        if user:
+            flow += f"  {DIM}user: {user}{RESET}"
 
     lines.append(flow)
 

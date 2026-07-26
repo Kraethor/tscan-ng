@@ -173,7 +173,7 @@ def _connect_with_retry(sock_path: str,
 
 def _build_port_filter(cfg: Config) -> str:
     """
-    Build a BPF filter expression restricting capture to the TCP ports any
+    Build a BPF filter expression restricting capture to the ports any
     protocol detector actually looks at.
 
     Without this, capture forwards 100% of traffic on the interface to the
@@ -182,19 +182,35 @@ def _build_port_filter(cfg: Config) -> str:
     match. Filtering at the pcap/kernel layer means that traffic never
     reaches userspace at all, rather than being parsed and then discarded.
 
+    Every detector here is TCP-based except snmp.py, which is UDP (SNMP is
+    virtually always deployed over UDP in practice) -- so cfg.snmp_ports
+    feeds a separate "udp and (...)" clause rather than joining the TCP
+    port union. If snmp_ports is somehow empty, the udp clause is omitted
+    entirely rather than emitting an invalid empty "udp and ()".
+
     Args:
         cfg: Loaded Config object.
 
     Returns:
-        A BPF filter expression string, e.g. "tcp and (port 21 or port 25)".
+        A BPF filter expression string, e.g.
+        "(tcp and (port 21 or port 25)) or (udp and (port 161))", or just
+        "tcp and (port 21 or port 25)" if no UDP ports are configured.
     """
-    ports = set()
+    tcp_ports = set()
     for port_set in (cfg.http_ports, cfg.ftp_ports, cfg.smtp_ports,
                      cfg.imap_ports, cfg.pop3_ports, cfg.telnet_ports,
-                     cfg.ldap_ports, cfg.redis_ports, cfg.smb_ports):
-        ports.update(port_set)
-    terms = " or ".join(f"port {p}" for p in sorted(ports))
-    return f"tcp and ({terms})"
+                     cfg.ldap_ports, cfg.redis_ports, cfg.smb_ports,
+                     cfg.irc_ports, cfg.postgres_ports):
+        tcp_ports.update(port_set)
+    tcp_terms = " or ".join(f"port {p}" for p in sorted(tcp_ports))
+    tcp_clause = f"tcp and ({tcp_terms})"
+
+    udp_ports = set(cfg.snmp_ports)
+    if not udp_ports:
+        return tcp_clause
+    udp_terms = " or ".join(f"port {p}" for p in sorted(udp_ports))
+    udp_clause = f"udp and ({udp_terms})"
+    return f"({tcp_clause}) or ({udp_clause})"
 
 
 def capture_into_unix_dgram(iface: str, sock_path: str,

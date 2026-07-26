@@ -42,9 +42,12 @@ failure). See "Alerting & health monitoring" below.
 | IMAP     | LOGIN command scan          | 143, 993, 1430                          |
 | POP3     | USER/PASS command scan      | 110, 995, 1100                          |
 | Telnet   | Login/Password prompt scan  | 23, 2323                                |
-| LDAP     | Simple-bind BindRequest     | 389, 3268                               |
-| Redis    | AUTH command scan           | 6379, 6380                              |
-| SMB      | NTLMv2 challenge/response   | 445, 139                                |
+| LDAP       | Simple-bind BindRequest     | 389, 3268                               |
+| Redis      | AUTH command scan          | 6379, 6380                              |
+| SMB        | NTLMv2 challenge/response   | 445, 139                                |
+| SNMP       | v1/v2c community string    | 161 (UDP)                               |
+| IRC        | NickServ IDENTIFY scan     | 6667, 6666, 6668, 6669                  |
+| PostgreSQL | Cleartext PasswordMessage  | 5432                                    |
 
 Every detector, including HTTP, is gated on its configured port list — a
 session whose ports don't appear in the relevant `[ports]` entry is
@@ -61,6 +64,13 @@ protocol-correlation details and the resulting alerting tradeoff (a
 captured hash is equally crackable whether or not that specific logon
 attempt succeeded, but Discord alerting is still gated on the SMB session
 actually succeeding, for consistency with every other detector).
+
+SNMP is the other exception, in the other direction: it's the first and
+only UDP-carried detector (every other protocol here is TCP), and its
+"outcome" is a much weaker signal than elsewhere — SNMPv1/v2c has no
+"authentication failed" response; a rejected community string typically
+just gets silently dropped by the agent rather than answered. See
+`tscan_ng/detectors/snmp.py` for the full reasoning.
 
 ## Configuration
 
@@ -86,6 +96,9 @@ telnet = 23, 2323
 ldap   = 389, 3268
 redis  = 6379, 6380
 smb    = 445, 139
+snmp   = 161
+irc    = 6667, 6666, 6668, 6669
+postgres = 5432
 ```
 
 After editing the config, restart the pipeline:

@@ -43,6 +43,9 @@ Config file format:
     ldap   = 389, 3268
     redis  = 6379, 6380
     smb    = 445, 139
+    snmp   = 161
+    irc    = 6667, 6666, 6668, 6669
+    postgres = 5432
 """
 
 import configparser
@@ -341,6 +344,28 @@ class Config:
         """Frozenset of TCP ports to scan for SMB2/3 NTLMv2 credentials."""
         return self._getports("ports", "smb", fallback=frozenset({445, 139}))
 
+    @property
+    def snmp_ports(self) -> frozenset:
+        """
+        Frozenset of UDP ports to scan for SNMPv1/v2c community strings.
+
+        Unlike every other port set here, these are UDP ports, not TCP —
+        see capture._build_port_filter, which treats this one property
+        specially to add a "udp and (...)" BPF clause alongside the
+        "tcp and (...)" clause every other detector's ports feed into.
+        """
+        return self._getports("ports", "snmp", fallback=frozenset({161}))
+
+    @property
+    def irc_ports(self) -> frozenset:
+        """Frozenset of TCP ports to scan for IRC NickServ IDENTIFY credentials."""
+        return self._getports("ports", "irc", fallback=frozenset({6667, 6666, 6668, 6669}))
+
+    @property
+    def postgres_ports(self) -> frozenset:
+        """Frozenset of TCP ports to scan for PostgreSQL cleartext passwords."""
+        return self._getports("ports", "postgres", fallback=frozenset({5432}))
+
     # -------------------------------------------------------------------------
     # [discord]
     # -------------------------------------------------------------------------
@@ -475,6 +500,9 @@ class Config:
             ("ldap",   self.ldap_ports),
             ("redis",  self.redis_ports),
             ("smb",    self.smb_ports),
+            ("snmp",   self.snmp_ports),
+            ("irc",    self.irc_ports),
+            ("postgres", self.postgres_ports),
         ]:
             bad = [p for p in ports if not (0 < p < 65536)]
             if bad:
@@ -502,5 +530,8 @@ class Config:
             f"telnet_ports={sorted(self.telnet_ports)}, "
             f"ldap_ports={sorted(self.ldap_ports)}, "
             f"redis_ports={sorted(self.redis_ports)}, "
-            f"smb_ports={sorted(self.smb_ports)})"
+            f"smb_ports={sorted(self.smb_ports)}, "
+            f"snmp_ports={sorted(self.snmp_ports)}, "
+            f"irc_ports={sorted(self.irc_ports)}, "
+            f"postgres_ports={sorted(self.postgres_ports)})"
         )

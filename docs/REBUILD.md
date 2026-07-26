@@ -187,25 +187,30 @@ All other values have safe defaults. See the config file itself and
 
 ### Protocol detector ports
 
-The `[ports]` section controls which TCP ports each protocol detector
-will scan — this now includes HTTP, which used to run port-agnostic on
-every port and no longer does. A session whose src and dst port are both
-absent from a protocol's list is skipped by that detector, and a BPF
-filter compiled from the union of every configured port is attached
-directly to each worker's capture socket, so non-matching traffic never
-reaches userspace in the first place. Defaults:
+The `[ports]` section controls which ports each protocol detector will
+scan — this now includes HTTP, which used to run port-agnostic on every
+port and no longer does. A session whose src and dst port are both absent
+from a protocol's list is skipped by that detector, and a BPF filter
+compiled from every configured port is attached directly to each worker's
+capture socket, so non-matching traffic never reaches userspace in the
+first place. All of these are TCP ports except `snmp`, which is UDP —
+capture.py's `_build_port_filter` gives it its own `udp and (...)` BPF
+clause rather than folding it into the TCP port union. Defaults:
 
 ```ini
 [ports]
-http   = 80, 8080, 8000, 8008, 8081, 8888, 3128
-ftp    = 21, 2121
-smtp   = 25, 465, 587, 2525
-imap   = 143, 993, 1430
-pop3   = 110, 995, 1100
-telnet = 23, 2323
-ldap   = 389, 3268
-redis  = 6379, 6380
-smb    = 445, 139
+http     = 80, 8080, 8000, 8008, 8081, 8888, 3128
+ftp      = 21, 2121
+smtp     = 25, 465, 587, 2525
+imap     = 143, 993, 1430
+pop3     = 110, 995, 1100
+telnet   = 23, 2323
+ldap     = 389, 3268
+redis    = 6379, 6380
+smb      = 445, 139
+snmp     = 161
+irc      = 6667, 6666, 6668, 6669
+postgres = 5432
 ```
 
 Add non-standard ports by appending to the comma-separated list. No

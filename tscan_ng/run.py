@@ -47,6 +47,9 @@ from tscan_ng.detectors.telnet import _outcome as _telnet_outcome
 from tscan_ng.detectors.ldap import _find_bind_response, _outcome as _ldap_outcome
 from tscan_ng.detectors.redis import _find_auth_response
 from tscan_ng.detectors.smb import _find_final_status, _outcome as _smb_outcome
+from tscan_ng.detectors.snmp import _find_snmp_response, _outcome as _snmp_outcome
+from tscan_ng.detectors.irc import _find_identify_response, _outcome as _irc_outcome
+from tscan_ng.detectors.postgres import _find_auth_outcome
 from tscan_ng.sinks.jsonl import JSONLSink
 from tscan_ng.session import SessionTable
 
@@ -256,6 +259,53 @@ def _try_resolve(p, session, ts: float) -> dict | None:
                 "ts_end":   ts,
                 "status":   str(status),
                 "outcome":  _smb_outcome(status),
+            }
+
+    elif finding_type == "snmp_creds":
+        # _request_id is only on the uncleaned p.finding (see
+        # detectors/snmp.py's add_pending call) -- clean_finding has it
+        # stripped since it's not meant to appear in the emitted finding.
+        request_id = p.finding.get("_request_id")
+        error_status, rsp_end = _find_snmp_response(bytes(session.server_buf), request_id)
+        if error_status is not None:
+            # Consume the Response-PDU so it cannot be matched again.
+            del session.server_buf[:rsp_end]
+            session.shift_pending_floors(rsp_end)
+            return {
+                **clean_finding,
+                "ts_start": p.ts_start,
+                "ts_end":   ts,
+                "status":   str(error_status),
+                "outcome":  _snmp_outcome(error_status),
+            }
+
+    elif finding_type == "irc_creds":
+        outcome, rsp_end = _find_identify_response(bytes(session.server_buf))
+        if outcome is not None:
+            # Consume the NickServ NOTICE so it cannot be matched again.
+            del session.server_buf[:rsp_end]
+            session.shift_pending_floors(rsp_end)
+            return {
+                **clean_finding,
+                "ts_start": p.ts_start,
+                "ts_end":   ts,
+                "status":   outcome,
+                "outcome":  _irc_outcome(outcome),
+            }
+
+    elif finding_type == "postgres_creds":
+        outcome, status, rsp_end = _find_auth_outcome(bytes(session.server_buf))
+        if outcome is not None:
+            # Consume the AuthenticationOk/ErrorResponse so it cannot be
+            # matched again.
+            del session.server_buf[:rsp_end]
+            session.shift_pending_floors(rsp_end)
+            return {
+                **clean_finding,
+                "ts_start": p.ts_start,
+                "ts_end":   ts,
+                "status":   status,
+                "outcome":  outcome,
             }
 
     return None
