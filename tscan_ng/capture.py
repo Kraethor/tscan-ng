@@ -191,7 +191,7 @@ def _build_port_filter(cfg: Config) -> str:
     ports = set()
     for port_set in (cfg.http_ports, cfg.ftp_ports, cfg.smtp_ports,
                      cfg.imap_ports, cfg.pop3_ports, cfg.telnet_ports,
-                     cfg.ldap_ports, cfg.redis_ports):
+                     cfg.ldap_ports, cfg.redis_ports, cfg.smb_ports):
         ports.update(port_set)
     terms = " or ".join(f"port {p}" for p in sorted(ports))
     return f"tcp and ({terms})"

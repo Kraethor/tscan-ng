@@ -205,6 +205,7 @@ pop3   = 110, 995, 1100
 telnet = 23, 2323
 ldap   = 389, 3268
 redis  = 6379, 6380
+smb    = 445, 139
 ```
 
 Add non-standard ports by appending to the comma-separated list. No

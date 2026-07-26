@@ -44,12 +44,23 @@ failure). See "Alerting & health monitoring" below.
 | Telnet   | Login/Password prompt scan  | 23, 2323                                |
 | LDAP     | Simple-bind BindRequest     | 389, 3268                               |
 | Redis    | AUTH command scan           | 6379, 6380                              |
+| SMB      | NTLMv2 challenge/response   | 445, 139                                |
 
 Every detector, including HTTP, is gated on its configured port list — a
 session whose ports don't appear in the relevant `[ports]` entry is
 skipped by that detector, and a BPF filter compiled from the union of all
 configured ports is attached at the capture socket so non-matching traffic
 never reaches userspace at all.
+
+SMB is a deliberate exception to "credential" meaning "plaintext
+password" — NTLM authentication is a challenge/response handshake, so what
+gets captured is the NTLMv2 hash itself, formatted ready for `hashcat -m
+5600` / `john --format=netntlmv2` (the same technique tools like Responder
+use), not a password. See `tscan_ng/detectors/smb.py` for the full
+protocol-correlation details and the resulting alerting tradeoff (a
+captured hash is equally crackable whether or not that specific logon
+attempt succeeded, but Discord alerting is still gated on the SMB session
+actually succeeding, for consistency with every other detector).
 
 ## Configuration
 
@@ -74,6 +85,7 @@ pop3   = 110, 995, 1100
 telnet = 23, 2323
 ldap   = 389, 3268
 redis  = 6379, 6380
+smb    = 445, 139
 ```
 
 After editing the config, restart the pipeline:

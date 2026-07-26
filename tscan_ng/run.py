@@ -46,6 +46,7 @@ from tscan_ng.detectors.pop3 import _POP3_RESPONSE_RE, _outcome as _pop3_outcome
 from tscan_ng.detectors.telnet import _outcome as _telnet_outcome
 from tscan_ng.detectors.ldap import _find_bind_response, _outcome as _ldap_outcome
 from tscan_ng.detectors.redis import _find_auth_response
+from tscan_ng.detectors.smb import _find_final_status, _outcome as _smb_outcome
 from tscan_ng.sinks.jsonl import JSONLSink
 from tscan_ng.session import SessionTable
 
@@ -241,6 +242,20 @@ def _try_resolve(p, session, ts: float) -> dict | None:
                 "ts_end":   ts,
                 "status":   outcome,
                 "outcome":  outcome,
+            }
+
+    elif finding_type == "smb_creds":
+        status, rsp_end = _find_final_status(bytes(session.server_buf))
+        if status is not None:
+            # Consume the SESSION_SETUP response so it cannot be matched again.
+            del session.server_buf[:rsp_end]
+            session.shift_pending_floors(rsp_end)
+            return {
+                **clean_finding,
+                "ts_start": p.ts_start,
+                "ts_end":   ts,
+                "status":   str(status),
+                "outcome":  _smb_outcome(status),
             }
 
     return None

@@ -42,6 +42,7 @@ Config file format:
     telnet = 23, 2323
     ldap   = 389, 3268
     redis  = 6379, 6380
+    smb    = 445, 139
 """
 
 import configparser
@@ -335,6 +336,11 @@ class Config:
         """Frozenset of TCP ports to scan for Redis AUTH credentials."""
         return self._getports("ports", "redis", fallback=frozenset({6379, 6380}))
 
+    @property
+    def smb_ports(self) -> frozenset:
+        """Frozenset of TCP ports to scan for SMB2/3 NTLMv2 credentials."""
+        return self._getports("ports", "smb", fallback=frozenset({445, 139}))
+
     # -------------------------------------------------------------------------
     # [discord]
     # -------------------------------------------------------------------------
@@ -468,6 +474,7 @@ class Config:
             ("telnet", self.telnet_ports),
             ("ldap",   self.ldap_ports),
             ("redis",  self.redis_ports),
+            ("smb",    self.smb_ports),
         ]:
             bad = [p for p in ports if not (0 < p < 65536)]
             if bad:
@@ -494,5 +501,6 @@ class Config:
             f"pop3_ports={sorted(self.pop3_ports)}, "
             f"telnet_ports={sorted(self.telnet_ports)}, "
             f"ldap_ports={sorted(self.ldap_ports)}, "
-            f"redis_ports={sorted(self.redis_ports)})"
+            f"redis_ports={sorted(self.redis_ports)}, "
+            f"smb_ports={sorted(self.smb_ports)})"
         )

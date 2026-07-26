@@ -67,6 +67,7 @@ _PROTO = {
     "telnet_creds":  (BOLD + BRIGHT_RED,     "Telnet"),
     "ldap_creds":    (BOLD + BRIGHT_WHITE,   "LDAP"),
     "redis_creds":   (BOLD + BRIGHT_CYAN,    "Redis"),
+    "smb_creds":     (BOLD + WHITE,          "SMB"),
 }
 
 DEFAULT_RESULTS = "/var/log/tscan/results.jsonl"
@@ -169,6 +170,13 @@ def _format(finding: dict) -> str | None:
         mech = finding.get("mechanism", "")
         if mech:
             flow += f"  {DIM}AUTH {mech}{RESET}"
+    elif ftype == "smb_creds":
+        domain = finding.get("domain", "")
+        workstation = finding.get("workstation", "")
+        if domain:
+            flow += f"  {DIM}domain: {domain}{RESET}"
+        if workstation:
+            flow += f"  {DIM}from: {workstation}{RESET}"
 
     lines.append(flow)
 
