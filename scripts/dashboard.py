@@ -54,6 +54,18 @@ def systemctl_show(unit: str, props: list[str]) -> dict:
     return {p: result.get(p, "") for p in props}
 
 
+def parse_mem_value(v: str):
+    """Parse a systemd memory property (e.g. MemoryCurrent/MemoryMax) to bytes.
+
+    Returns None for values systemd reports as unset/unlimited: '[not set]',
+    'infinity', or the raw uint64 sentinel (18446744073709551615)."""
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if n >= 18446744073709551615 else n
+
+
 def human_bytes(n: float) -> str:
     """Format a byte count as a short human-readable string, e.g. '318.4M'."""
     for unit in ("B", "K", "M", "G", "T"):
@@ -330,8 +342,10 @@ def run(stdscr):
         state_attr = GREEN | BOLD if active else RED | BOLD
         entered = parse_systemd_timestamp(svc["ActiveEnterTimestamp"])
         uptime = fmt_duration(now_utc - entered) if entered else "?"
-        mem_cur = human_bytes(float(svc["MemoryCurrent"] or 0))
-        mem_max = human_bytes(float(svc["MemoryMax"] or 0))
+        mem_cur_val = parse_mem_value(svc["MemoryCurrent"])
+        mem_max_val = parse_mem_value(svc["MemoryMax"])
+        mem_cur = human_bytes(mem_cur_val) if mem_cur_val is not None else "n/a"
+        mem_max = human_bytes(mem_max_val) if mem_max_val is not None else "n/a"
         line(" SERVICE", BOLD)
         mline([
             (f"   {PIPELINE_UNIT:<34}", 0),

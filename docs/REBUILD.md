@@ -39,6 +39,27 @@ The goal is that **this repo alone** is sufficient to rebuild a working system.
 **Important:**
 Traffic generated *on this host* will **not** be seen by the capture NIC.
 
+**Bringing the capture NIC up automatically:**
+Nothing does this by default. Netplan on a typical install only manages
+the admin NIC (matched by its own MAC address), NetworkManager is usually
+not installed, and a udev rule reacting to the capture NIC appearing
+(e.g. for ethtool ring-buffer tuning) does not itself set the link
+state. Left unconfigured, the capture NIC stays admin-down after every
+boot or USB re-enumeration, and `tscan-pipeline.service` crash-loops
+waiting for it (see "Pipeline restarts continuously" below).
+
+Fix by adding a systemd-networkd match for the capture NIC's MAC address.
+A template is at `systemd/tscan-monitor.network.example`:
+```bash
+sudo cp /opt/tscan/systemd/tscan-monitor.network.example \
+  /etc/systemd/network/70-tscan-monitor.network
+sudo sed -i 's/00:11:22:33:44:55/<capture-nic-mac-address>/' \
+  /etc/systemd/network/70-tscan-monitor.network
+sudo systemctl restart systemd-networkd
+```
+No DHCP/addressing — it's a passive SPAN/mirror interface and never
+needs an IP.
+
 ---
 
 ## Filesystem Layout
@@ -426,6 +447,12 @@ sudo tcpdump -ni <capture-interface> -c 10
   forever rather than giving up. Bring the interface back up
   (`sudo ip link set <iface> up`) and the next restart attempt will
   succeed on its own; no manual service restart needed.
+- If this keeps recurring after every reboot or USB re-enumeration, the
+  capture NIC likely has no systemd-networkd config keeping it up — check
+  `ls /etc/systemd/network/` for a match on its MAC address and see
+  "Bringing the capture NIC up automatically" under Network Design above.
+  Without it, `ip link set <iface> up` is a one-time fix that won't
+  survive the next boot.
 - You should have received a Discord "pipeline[N] ... exiting" alert
   (rate-limited to one per `notify_cooldown_sec`) and, within 2 minutes, a
   "tscan-pipeline.service is DOWN" alert from the healthcheck timer. If
@@ -481,6 +508,10 @@ sudo systemctl restart tscan-pipeline
       `tscan-pipeline-healthcheck.service`/`.timer`
 - [ ] logrotate installed
 - [ ] Capture NIC mirrored correctly
+- [ ] Capture NIC has a systemd-networkd config
+      (`/etc/systemd/network/70-tscan-monitor.network`, from
+      `systemd/tscan-monitor.network.example`) so it comes up
+      automatically after reboot/USB re-enumeration
 - [ ] Runtime verification complete (pipeline status, NIC, output)
 - [ ] Update script tested: `sudo /opt/tscan/scripts/update.sh`
 - [ ] Discord webhook configured in `[discord]` section (optional) and a

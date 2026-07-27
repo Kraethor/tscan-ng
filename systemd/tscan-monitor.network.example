@@ -1,0 +1,28 @@
+# Template systemd-networkd config for the capture NIC.
+#
+# Nothing else on a fresh box brings this interface up automatically:
+# netplan typically only manages the admin NIC (matched by its own MAC),
+# NetworkManager is usually not installed, and a udev rule that reacts to
+# the capture NIC appearing (e.g. for ethtool ring-buffer tuning) does not
+# by itself set the link state. Without a .network match like this one,
+# the capture NIC stays admin-down after every boot or USB
+# re-enumeration, and tscan-pipeline.service crash-loops waiting for it
+# (see "Pipeline restarts continuously" in docs/REBUILD.md).
+#
+# Copy to /etc/systemd/network/70-tscan-monitor.network, replace the MAC
+# address below with the capture NIC's actual address (`ip link show`),
+# then `sudo systemctl restart systemd-networkd`.
+#
+# No DHCP/addressing on purpose: this is a passive SPAN/mirror capture
+# interface, it never needs an IP. RequiredForOnline=no so boot never
+# waits on it.
+
+[Match]
+MACAddress=00:11:22:33:44:55
+
+[Network]
+DHCP=no
+LinkLocalAddressing=no
+
+[Link]
+RequiredForOnline=no
