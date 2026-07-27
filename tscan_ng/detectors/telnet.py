@@ -207,19 +207,6 @@ def _outcome(server_buf: bytearray) -> str | None:
 
 # ── Stream detector ───────────────────────────────────────────────────────────
 
-def detect(pkt: dict) -> list:
-    """
-    Per-packet interface — unused; stream detection handles all logic.
-
-    Args:
-        pkt: Normalized packet dict.
-
-    Returns:
-        Empty list.
-    """
-    return []
-
-
 def detect_stream(session, ts: float) -> list:
     """
     Stream-aware Telnet credential detector.

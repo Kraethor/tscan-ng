@@ -46,6 +46,10 @@ Config file format:
     snmp   = 161
     irc    = 6667, 6666, 6668, 6669
     postgres = 5432
+
+    [discord]
+    discord_webhook     = https://discord.com/api/webhooks/...
+    notify_cooldown_sec = 300
 """
 
 import configparser

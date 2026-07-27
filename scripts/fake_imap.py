@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-# fake_imap.py — plaintext AUTH PLAIN/LOGIN server, no TLS
-# Valid creds: testuser / hunter2  — everything else fails
+"""
+scripts/fake_imap.py - Plaintext IMAP4rev1 test server for
+tscan_ng.detectors.imap.
+
+Implements just enough of RFC 3501 (CAPABILITY, LOGIN, AUTHENTICATE
+PLAIN/LOGIN, SELECT, LIST, NOOP, LOGOUT) to generate real cleartext
+credential traffic for the IMAP detector to capture. No TLS. Valid creds:
+testuser / hunter2 -- everything else gets a tagged NO response. See
+docs/test_reference.md for how this fits into the manual test workflow.
+"""
 
 import socket, base64, threading, datetime
 
@@ -11,10 +19,12 @@ VALID_USER = "testuser"
 VALID_PASS = "hunter2"
 
 def log(addr, msg):
+    """Print a timestamped, per-client log line to stdout."""
     ts = datetime.datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {addr[0]}:{addr[1]} | {msg}")
 
 def check(user, pw, addr):
+    """Return True and log success if (user, pw) match VALID_USER/VALID_PASS."""
     if user == VALID_USER and pw == VALID_PASS:
         log(addr, f"*** AUTH SUCCESS user={user!r}")
         return True
@@ -22,13 +32,17 @@ def check(user, pw, addr):
     return False
 
 def handle(conn, addr):
+    """Drive one client connection through the IMAP command loop."""
     tag = "*"
 
     def send(line):
+        """Log and write one CRLF-terminated response line to the client."""
         log(addr, f">>> {line}")
         conn.sendall((line + "\r\n").encode())
 
     def recv():
+        """Block until a newline-terminated line arrives, log it, and
+        return it stripped of line endings."""
         data = b""
         while not data.endswith(b"\n"):
             chunk = conn.recv(4096)

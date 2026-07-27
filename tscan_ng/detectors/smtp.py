@@ -145,22 +145,6 @@ def _decode_plain(blob: bytes) -> tuple | None:
     return None
 
 
-def detect(pkt: dict) -> list:
-    """
-    Per-packet interface — disabled in favour of stream detection.
-
-    Retained so the detector remains a valid entry in DETECTORS for
-    per-packet fallback if needed. Always returns empty in this phase.
-
-    Args:
-        pkt: Normalized packet dict from parsing.net.parse_basic.
-
-    Returns:
-        Empty list.
-    """
-    return []
-
-
 def detect_stream(session, ts: float) -> list:
     """
     Stream-aware SMTP AUTH credential detector.

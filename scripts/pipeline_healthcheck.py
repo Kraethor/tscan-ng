@@ -64,6 +64,9 @@ def _active_duration() -> float:
 
 
 def main() -> None:
+    """Check tscan-pipeline.service's current state against the persisted
+    down-marker and alert exactly once on each up<->down transition (see
+    module docstring for the debounce and cooldown rationale)."""
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
     except OSError:

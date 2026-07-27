@@ -167,19 +167,6 @@ def _outcome(status: str) -> str:
     return status
 
 
-def detect(pkt: dict) -> list:
-    """
-    Per-packet interface — retained for API compatibility, always returns [].
-
-    Args:
-        pkt: Normalized packet dict from parsing.net.parse_basic.
-
-    Returns:
-        Empty list.
-    """
-    return []
-
-
 def detect_stream(session, ts: float) -> list:
     """
     Stream-aware IRC NickServ IDENTIFY credential detector.

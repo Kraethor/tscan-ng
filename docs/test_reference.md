@@ -229,6 +229,99 @@ Connect with: `nc <host> 6379`
 
 ---
 
+## SMB — Port 445 / 139
+
+SMB2/3 NTLM authentication never puts a plaintext password on the wire — it's
+a challenge/response handshake. tscan-ng captures the NTLMv2 CHALLENGE +
+AUTHENTICATE exchange in the exact format `hashcat -m 5600` /
+`john --format=netntlmv2` expect for offline cracking, not a password. See
+`tscan_ng/detectors/smb.py` for the full protocol correlation. Requires a
+real SMB server (or a local Samba instance) that completes SMB2 NTLM auth —
+a Kerberos-only environment won't produce this exchange.
+
+### smbclient commands
+
+| Test | Command | Expected result |
+|------|---------|-----------------|
+| Auth attempt (any outcome) | `smbclient //<host>/<share> -U testuser%hunter2` | NTLMv2 challenge/response visible in capture regardless of whether login succeeds |
+| Bad credentials | `smbclient //<host>/<share> -U baduser%wrongpass` | `NT_STATUS_LOGON_FAILURE`; the NTLMv2 hash is still captured — a captured hash is equally crackable whether or not the logon succeeded |
+
+> **Note:** Discord alerting for SMB is gated on the SESSION_SETUP
+> ultimately reporting success, for consistency with every other detector,
+> even though the captured artifact (the hash) is useful regardless of
+> outcome.
+
+---
+
+## SNMP — Port 161 (UDP)
+
+The only UDP-carried detector in tscan-ng (see `capture._build_port_filter`
+for the BPF change this required). Captures the community string, which is
+present in *every* SNMPv1/v2c message, request or response — there is no
+separate auth handshake. SNMPv3 (USM, not a plaintext community string) is
+out of scope. See `tscan_ng/detectors/snmp.py` for why "outcome" is a much
+weaker signal here than elsewhere: a rejected community string is often
+silently dropped rather than answered.
+
+### snmpget / snmpwalk commands
+
+| Test | Command | Expected result |
+|------|---------|-----------------|
+| GetRequest — community `public` | `snmpget -v2c -c public <host> 1.3.6.1.2.1.1.1.0` | Response-PDU with sysDescr, or a timeout if `public` isn't a valid community on the target |
+| Walk — community `public` | `snmpwalk -v2c -c public <host> 1.3.6.1.2.1.1` | Multiple Response-PDUs, all carrying the same community string |
+| Bad community | `snmpget -v2c -c wrongcommunity <host> 1.3.6.1.2.1.1.1.0` | Typically a silent timeout (no Response-PDU) — expected per the module's "weak outcome signal" note above |
+
+---
+
+## IRC — Ports 6667 / 6666 / 6668 / 6669
+
+IRC itself has no login concept — the credential tscan-ng targets is the one
+sent to a network's NickServ services bot as an ordinary chat message. See
+`tscan_ng/detectors/irc.py` for the exact matched patterns and why SASL
+PLAIN authentication is explicitly out of scope.
+
+### nc manual session (against a server running NickServ, e.g. Atheme/Anope)
+
+Connect with: `nc <host> 6667`
+
+| Step | You type | Server replies |
+|------|----------|-----------------|
+| 1 | `NICK mynick` / `USER mynick 0 * :Test User` | Standard connection registration numerics |
+| 2a | `PRIVMSG NickServ :IDENTIFY hunter2` | `:NickServ!NickServ@services... NOTICE mynick :Password accepted - you are now recognized.` |
+| 2b | `PRIVMSG NickServ :IDENTIFY wrongpass` | `:NickServ!NickServ@services... NOTICE mynick :Password incorrect.` |
+| 2c (short alias) | `PRIVMSG NickServ :ID hunter2` | Same as 2a — `ID` is a common alias for `IDENTIFY` |
+
+> **Note:** Exact NOTICE wording is services-daemon-specific (Atheme, Anope,
+> etc.) and not standardized by any IRC RFC. A NOTICE that doesn't match a
+> recognized phrasing is skipped rather than treated as a failure.
+
+---
+
+## PostgreSQL — Port 5432
+
+Captures the PostgreSQL wire protocol's `PasswordMessage` — a genuine
+cleartext password — but only when the server is configured for `password`
+auth in `pg_hba.conf`. The modern default, SCRAM-SHA-256, is explicitly out
+of scope (see `tscan_ng/detectors/postgres.py`): it's designed so the
+plaintext password never crosses the wire at all. `md5` auth is also out of
+scope for the same reason (it sends a salted hash, not a password).
+
+### psql commands
+
+Requires a test server/database with `pg_hba.conf` set to `password` (not
+`scram-sha-256` or `md5`) for the relevant host/user entry.
+
+| Test | Command | Expected result |
+|------|---------|-----------------|
+| Cleartext auth — good | `PGSSLMODE=disable psql "host=<host> user=testuser password=hunter2 dbname=postgres"` | Connects; `PasswordMessage` visible in capture |
+| Cleartext auth — bad | `PGSSLMODE=disable psql "host=<host> user=testuser password=wrongpass dbname=postgres"` | `FATAL: password authentication failed for user "testuser"` — `PasswordMessage` still captured |
+
+> **Important:** `PGSSLMODE=disable` (or an equivalent client setting) is
+> required — TLS-wrapped connections are not captured by tscan-ng, same as
+> LDAPS/SMTPS elsewhere in this reference.
+
+---
+
 ## Protocol Summary
 
 | Protocol | Port | Auth method | Encoding | Server | Notes |
@@ -241,3 +334,7 @@ Connect with: `nc <host> 6379`
 | Telnet | 2323 | Login prompt | Plaintext | cloud.sisypheansecurity.com | Raw ASCII on wire |
 | LDAP | 389, 3268 | Simple bind | Plaintext BER | Local test instance | 636/3269 are TLS — not captured |
 | Redis | 6379, 6380 | AUTH command | Plaintext RESP | Local test instance | Redis 6+ supports ACL username |
+| SMB | 445, 139 | NTLM SESSION_SETUP | NTLMv2 challenge/response (hashcat -m 5600) | Real SMB server / local Samba | Captures a crackable hash, not a password |
+| SNMP | 161 (UDP) | Community string | Plaintext BER | Any SNMPv1/v2c agent | Only UDP detector; SNMPv3 (USM) not captured |
+| IRC | 6667, 6666, 6668, 6669 | NickServ IDENTIFY | Plaintext PRIVMSG | Server running NickServ (Atheme/Anope) | SASL PLAIN auth out of scope |
+| PostgreSQL | 5432 | PasswordMessage | Plaintext | Local test instance | Requires `password` auth in pg_hba.conf; SCRAM/md5 not captured |

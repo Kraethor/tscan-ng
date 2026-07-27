@@ -271,6 +271,9 @@ def _find_ntlm_authenticate(data: bytes):
         msg = sec_buf[idx:]
 
         def field(off):
+            """Read one NTLM AUTHENTICATE field: a (length, max_length,
+            offset) triplet at *off*, where length/offset describe the
+            actual field bytes located at msg[offset:offset+length]."""
             length = struct.unpack_from("<H", msg, off)[0]
             offset = struct.unpack_from("<I", msg, off + 4)[0]
             if length == 0 or offset < 0 or offset + length > len(msg):
@@ -342,19 +345,6 @@ def _outcome(status: int) -> str:
     if status in _STATUS_FAILED_CODES:
         return "failed"
     return "server_error"
-
-
-def detect(pkt: dict) -> list:
-    """
-    Per-packet interface — retained for API compatibility, always returns [].
-
-    Args:
-        pkt: Normalized packet dict from parsing.net.parse_basic.
-
-    Returns:
-        Empty list.
-    """
-    return []
 
 
 def detect_stream(session, ts: float) -> list:

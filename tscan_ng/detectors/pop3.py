@@ -82,19 +82,6 @@ def _outcome(status: bytes) -> str:
     return "failed"
 
 
-def detect(pkt: dict) -> list:
-    """
-    Per-packet interface — retained for API compatibility, always returns [].
-
-    Args:
-        pkt: Normalized packet dict from parsing.net.parse_basic.
-
-    Returns:
-        Empty list.
-    """
-    return []
-
-
 def detect_stream(session, ts: float) -> list:
     """
     Stream-aware POP3 USER/PASS credential detector.

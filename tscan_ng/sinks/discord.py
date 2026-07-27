@@ -24,14 +24,29 @@ Design goals (carried over from scripts/discord_alert.py):
     of `creds`, and `session_id` are sent for findings.
   - Never raise back into the caller: exceptions from the network call are
     swallowed inside the background thread.
+  - Never leak the webhook URL itself into logs: the URL's path *is* the
+    secret (anyone who has it can post to the channel), and it's the POST
+    target of every call in this module. requests delegates the actual
+    HTTP exchange to urllib3, whose connectionpool logger emits the full
+    request URL at DEBUG level -- and pipeline_worker (see pipeline.py)
+    runs with the root logger at DEBUG for its own operational logging.
+    Silencing urllib3 specifically, below, keeps that useful DEBUG output
+    everywhere else while stopping this module from being the reason the
+    webhook secret ends up in `journalctl -u tscan-pipeline`. Fixed here
+    rather than at each caller so it holds regardless of what log level
+    any future caller configures.
 """
 
 import fcntl
+import logging
 import os
 import threading
 import time
 
 import requests
+
+# See "Never leak the webhook URL itself into logs" above.
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # Default marker file for notify()'s cooldown. Every pipeline_worker process
 # constructs its own DiscordSink independently (there is no shared memory
@@ -64,6 +79,7 @@ class DiscordSink:
     def __init__(self, webhook_url: str,
                  cooldown_path: str = _DEFAULT_COOLDOWN_PATH,
                  cooldown_sec: float = 300):
+        """Store webhook config. See the class docstring for Args."""
         self._webhook_url = webhook_url
         self._cooldown_path = cooldown_path
         self._cooldown_sec = cooldown_sec

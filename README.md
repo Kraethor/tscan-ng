@@ -5,7 +5,8 @@ monitoring via SPAN / mirror ports.
 
 ## Repository layout
 - `tscan_ng/` – Python capture pipeline, detectors, and output sinks
-- `scripts/` – operational scripts (live viewer, health check, deploy/update)
+- `scripts/` – operational scripts (live viewer, dashboard, status snapshot,
+  health check, deploy/update/push)
 - `systemd/` – systemd service/timer units
 - `logrotate/` – log rotation configuration
 - `docs/` – rebuild and deployment documentation
@@ -137,19 +138,40 @@ entirely. Three kinds of alert share the one webhook:
   failures the in-process code structurally can't see, such as an
   OOM-kill or a startup failure before configuration even loads.
 
-## Live monitor
+## Monitoring & status
 
-`scripts/watch.py` tails the results file and displays colour-coded
-findings in real time. It's a read-only viewer — logging and alerting both
-already happen inside `tscan-pipeline.service` regardless of whether this
-is running, so closing it never turns anything off. No root required:
+Three read-only tools:
+
+- `scripts/watch.py` — tails the results file and displays colour-coded
+  credential findings in real time. Reads only the world-readable results
+  JSONL; no elevated privileges needed.
+- `scripts/dashboard.py` — live full-screen status dashboard (service
+  state, monitor/admin interface health, capture throughput, recent
+  findings, worker/load info), refreshing once a second. Everything it
+  reads (systemd unit properties, `/sys/class/net` statistics, the results
+  JSONL) is world-readable too — no elevated privileges needed here either.
+- `scripts/status.sh` — a quick, non-interactive snapshot of the same
+  service/interface/log state for a single glance or piping elsewhere.
+  Unlike the two above, this one does run `systemctl`/`journalctl`/`ip` via
+  `sudo` — passwordless (NOPASSWD, see `/etc/sudoers.d/`) so it needs no
+  interactive root login, but it is genuinely running those specific calls
+  as root.
+
+None of these affect logging or alerting — both already happen inside
+`tscan-pipeline.service` regardless of whether any viewer is running, so
+closing them never turns anything off.
 
 ```bash
 python3 /opt/tscan/scripts/watch.py
+python3 /opt/tscan/scripts/dashboard.py
+bash /opt/tscan/scripts/status.sh
 ```
 
 ## Deployment
-See `docs/REBUILD.md` for full rebuild instructions.
+See `docs/REBUILD.md` for full rebuild instructions. `scripts/push.sh
+"commit message" [file ...]` stages, commits, and pushes local changes as
+the `tscan` service user (the repo at `/opt/tscan` is owned by `tscan`, not
+whichever admin is running the script).
 
 ## Notes
 - Designed to run with a non-login service account

@@ -1,42 +1,35 @@
 """
-run.py - Dispatcher and worker entry point for tscan-ng.
+run.py - Shared response-correlation logic for tscan-ng.
 
-Receives raw packets from the capture process via a Unix datagram socket,
-dispatches them to a pool of worker processes using flow-affinity routing,
-and writes detection findings to a JSONL sink.
+_try_resolve() below is imported directly by pipeline.py and runs in every
+pipeline_worker process -- it is the shared response-correlation logic
+(matching a pending finding like "credentials seen, no server reply yet"
+against newly arrived server_buf data) for every protocol detector. See
+pipeline_worker()'s docstring in pipeline.py, which calls out that its own
+detector/session/pending-resolution loop is "architecturally identical to
+run.py's old worker_main()".
+
+This module used to also hold the original two-process design's dispatcher
+and worker pool (dispatcher() receiving raw packets from capture.py's
+capture_into_unix_dgram() over a Unix datagram socket and routing them by
+flow-affinity hash to worker_main() processes over bounded multiprocessing
+Queues) plus a `python -m tscan_ng.run` standalone entry point, paired with
+tscan-dispatcher.service. pipeline.py's N self-contained fan-out processes
+superseded that design (see pipeline.py's module docstring for why), and
+the dispatcher/worker code was removed as dead weight once nothing still
+ran it -- see git history if it's ever needed for reference.
 
 Configuration is loaded from /opt/tscan/tscan_ng/config/tscan_ng.conf at
 startup. See tscan_ng/config.py for all available settings and their defaults.
 
-Flow affinity ensures all packets belonging to the same TCP/UDP session
-(identified by src_ip, dst_ip, sport, dport) are always routed to the same
-worker. Each worker maintains a SessionTable that buffers reassembled streams
-per flow in both directions.
-
-The dispatcher performs packet parsing once to extract the flow key and then
-forwards the parsed packet dict to the appropriate worker, avoiding a second
-parse in the worker process.
-
-Per-packet detectors run on every parsed packet. Stream-aware detectors run
-after each packet is added to its session, operating on the full reassembled
-client and server buffers. Pending findings (credentials seen but no server
-response yet) are registered on the session and resolved when the response
-arrives, or closed out as no_response on session expiry or shutdown.
-
-Phase status:
-    Phase 1 - Flow affinity routing:        COMPLETE
-    Phase 2 - Per-worker stream buffering:  COMPLETE
-    Phase 3 - Stream-aware detectors:       COMPLETE
-    Phase 4 - Response correlation:         COMPLETE
-    Phase 5 - Session expiry and cleanup:   COMPLETE
+Pending findings (credentials seen but no server response yet) are
+registered on the session by each stream detector and resolved here when
+the response arrives, or closed out as no_response elsewhere (session
+expiry or shutdown, in session.py).
 """
 
-import os, queue as _queue, struct, socket, time, logging, multiprocessing as mp
-from tscan_ng.config import Config
-from tscan_ng.parsing.net import parse_basic
-from tscan_ng.detectors import DETECTORS, STREAM_DETECTORS, configure_all
-from tscan_ng.detectors.http_basic import _parse_response, _outcome, _RESPONSE_LINE_RE as _HTTP_RESPONSE_LINE_RE
-from tscan_ng.detectors.imap import (_IMAP_RESPONSE_RE, _IMAP_RESPONSE_BYTES_RE,
+from tscan_ng.detectors.http_basic import _parse_response, _outcome
+from tscan_ng.detectors.imap import (_IMAP_RESPONSE_BYTES_RE,
                                       _outcome as _imap_outcome)
 from tscan_ng.detectors.ftp import _FTP_RESPONSE_RE, _outcome as _ftp_outcome
 from tscan_ng.detectors.smtp import (
@@ -50,36 +43,6 @@ from tscan_ng.detectors.smb import _find_final_status, _outcome as _smb_outcome
 from tscan_ng.detectors.snmp import _find_snmp_response, _outcome as _snmp_outcome
 from tscan_ng.detectors.irc import _find_identify_response, _outcome as _irc_outcome
 from tscan_ng.detectors.postgres import _find_auth_outcome
-from tscan_ng.sinks.jsonl import JSONLSink
-from tscan_ng.session import SessionTable
-
-HDR = struct.Struct("!IIIHH")  # sec, usec, caplen, l2type, pad
-
-
-def _flow_key(src: str, dst: str, sport: int, dport: int) -> int:
-    """
-    Compute a stable hash for a network flow used to select a worker.
-
-    The hash is symmetric with respect to the direction of the flow —
-    both (src->dst) and (dst->src) map to the same worker. This ensures
-    that request and response packets for the same session are always
-    handled by the same worker process, which is required for stateful
-    stream reassembly and response correlation.
-
-    Args:
-        src:   Source IP address string.
-        dst:   Destination IP address string.
-        sport: Source port number.
-        dport: Destination port number.
-
-    Returns:
-        A stable non-negative integer hash suitable for worker selection
-        via modulo.
-    """
-    a, b = (src, sport), (dst, dport)
-    if a > b:
-        a, b = b, a
-    return hash((a, b)) & 0x7FFFFFFF
 
 
 def _try_resolve(p, session, ts: float) -> dict | None:
@@ -309,222 +272,3 @@ def _try_resolve(p, session, ts: float) -> dict | None:
             }
 
     return None
-
-
-def worker_main(q: mp.Queue, cfg: Config):
-    """
-    Worker process entry point.
-
-    Receives (ts, pkt) tuples from the dispatcher via a bounded
-    multiprocessing Queue, accumulates each packet into the per-flow
-    SessionTable, runs per-packet detectors, runs stream-aware detectors,
-    resolves any pending findings against newly arrived server responses,
-    and writes all findings to the configured JSONLSink.
-
-    Session expiry runs on a wall-clock timer using cfg.expiry_interval.
-    The queue get() uses a 1-second timeout so expiry fires even during
-    quiet periods with no incoming traffic.
-
-    Shutdown paths:
-      - Normal: dispatcher puts a None sentinel; worker flushes all sessions
-        (emitting no_response for any unresolved pending findings) and exits.
-      - Unexpected: workers are daemon processes and are killed by the OS
-        when the dispatcher process exits. Sessions are not flushed in this
-        case; it is an abnormal exit scenario.
-      - Runaway failures: if packet processing raises 100 consecutive
-        exceptions the worker logs an error and exits to avoid silently
-        consuming packets without producing any output.
-
-    Args:
-        q:   Bounded multiprocessing Queue shared with the dispatcher.
-        cfg: Loaded Config object.
-    """
-    # Apply port lists from config to each protocol detector.
-    configure_all(cfg)
-    sink = JSONLSink(cfg.out_path or None)
-    sessions = SessionTable(
-        max_buf=cfg.session_max_buf,
-        timeout=cfg.session_timeout,
-        pending_max_age=cfg.pending_max_age,
-        max_sessions=cfg.max_sessions,
-    )
-    last_expiry = time.monotonic()
-    logging.basicConfig(level=logging.DEBUG,
-                        format="%(levelname)s worker pid=%(process)d %(message)s")
-    logging.info("worker_main started")
-
-    # Consecutive failure counter — reset to 0 on every successful packet.
-    fail_count = 0
-    while True:
-        try:
-            msg = q.get(timeout=1.0)
-        except _queue.Empty:
-            # No packets for 1 second. Run session expiry and loop.
-            now = time.monotonic()
-            if now - last_expiry >= cfg.expiry_interval:
-                for f in sessions.expire():
-                    sink.write({"ts": f["ts_start"], **f})
-                last_expiry = now
-            continue
-
-        if msg is None:
-            # Normal shutdown sentinel from the dispatcher.
-            for f in sessions.flush_all():
-                sink.write({"ts": f["ts_start"], **f})
-            break
-
-        try:
-            ts, pkt = msg
-            session, expired_pending = sessions.add_packet(pkt, ts)
-            for f in expired_pending:
-                sink.write({"ts": f["ts_start"], **f})
-            for det in DETECTORS:
-                for f in det(pkt):
-                    sink.write({"ts": ts, **f})
-            for det in STREAM_DETECTORS:
-                for f in det(session, ts):
-                    sink.write({"ts": ts, **f})
-            if session.pending:
-                still_pending = []
-                for p in session.pending:
-                    resolved = _try_resolve(p, session, ts)
-                    if resolved:
-                        sink.write(resolved)
-                    else:
-                        still_pending.append(p)
-                session.pending = still_pending
-            now = time.monotonic()
-            if now - last_expiry >= cfg.expiry_interval:
-                for f in sessions.expire():
-                    sink.write({"ts": f["ts_start"], **f})
-                last_expiry = now
-            fail_count = 0  # Reset on success
-        except Exception:
-            logging.exception("worker_main unhandled exception processing packet")
-            fail_count += 1
-            if fail_count >= 100:
-                logging.error("worker_main: %d consecutive failures, exiting", fail_count)
-                break
-
-
-def dispatcher(cfg: Config):
-    """
-    Main dispatcher loop.
-
-    Binds a Unix datagram socket to receive packets from the capture process,
-    spawns a pool of worker processes, and routes packets to workers using
-    flow-affinity hashing on (src_ip, dst_ip, sport, dport).
-
-    Each worker receives packets via a bounded multiprocessing Queue
-    (maxsize=2000).  The dispatcher uses put_nowait() so that a slow or
-    overwhelmed worker never blocks packet processing for other workers.
-    If a worker's queue is full, the packet for that flow is dropped and
-    counted.  This prevents a single high-volume session from stalling the
-    entire pipeline.
-
-    Parses each packet once in the dispatcher to extract the flow key, then
-    forwards the parsed pkt dict to the worker to avoid a redundant parse in
-    the worker.  Packets that cannot be parsed (non-IP, non-TCP/UDP) are
-    counted and discarded; they are not forwarded to workers.
-
-    A caplen bounds check is applied before slicing the payload to guard
-    against corrupt headers from the capture process.
-
-    Flow affinity guarantees that all packets from a given TCP/UDP session
-    are handled by the same worker, which is required for stateful stream
-    reassembly and response correlation.
-
-    Shuts down cleanly on KeyboardInterrupt, sending a None sentinel to each
-    worker queue to trigger graceful session flushing.  Workers that do not
-    exit within 5 seconds are forcibly terminated to prevent process leaks.
-
-    Args:
-        cfg: Loaded Config object.
-    """
-    queues, procs = [], []
-    for _ in range(cfg.workers):
-        # Bounded queue — put_nowait() in the dispatch loop drops packets
-        # rather than blocking when a worker falls behind.
-        q = mp.Queue(maxsize=2000)
-        p = mp.Process(target=worker_main, args=(q, cfg), daemon=True)
-        p.start()
-        queues.append(q)
-        procs.append(p)
-
-    try:
-        os.unlink(cfg.socket_path)
-    except FileNotFoundError:
-        pass
-    old_umask = os.umask(0o117)  # Results in 0o660 permissions on bind
-    try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        s.bind(cfg.socket_path)
-    finally:
-        os.umask(old_umask)
-
-    # Running totals for observability.
-    parse_drops = 0   # packets dropped because parse_basic() returned None
-    worker_drops = 0  # packets dropped because a worker queue was full
-    try:
-        while True:
-            buf = s.recv(cfg.snaplen + HDR.size)
-            if len(buf) < HDR.size:
-                continue
-            sec, usec, caplen, l2type, _ = HDR.unpack_from(buf, 0)
-            # Reject packets where the claimed caplen exceeds available bytes.
-            if caplen > len(buf) - HDR.size:
-                continue
-            payload = memoryview(buf)[HDR.size:HDR.size + caplen].tobytes()
-            ts = sec + usec / 1_000_000.0
-
-            pkt = parse_basic(l2type, payload)
-            if not pkt:
-                # Expected for non-IP or non-TCP/UDP traffic (ARP, ICMP, etc.).
-                parse_drops += 1
-                if parse_drops % 1000 == 1:
-                    logging.debug("dispatcher: %d packet(s) unparseable (non-IP/non-TCP/UDP)",
-                                  parse_drops)
-                continue
-
-            worker_idx = _flow_key(pkt["src"], pkt["dst"],
-                                   pkt["sport"], pkt["dport"]) % cfg.workers
-            try:
-                queues[worker_idx].put_nowait((ts, pkt))
-            except _queue.Full:
-                # Worker queue is full — drop this packet rather than blocking
-                # the dispatcher and stalling all other workers.
-                worker_drops += 1
-                if worker_drops % 1000 == 1:
-                    logging.warning(
-                        "dispatcher: %d packet(s) dropped — worker %d queue full",
-                        worker_drops, worker_idx)
-
-    except KeyboardInterrupt:
-        pass
-    finally:
-        for q in queues:
-            try:
-                q.put(None, timeout=5)
-            except _queue.Full:
-                pass
-        for p in procs:
-            p.join(timeout=5)
-            if p.is_alive():
-                # Worker did not respond to the None sentinel in time.
-                logging.warning("dispatcher: worker pid=%d did not exit cleanly, terminating",
-                                p.pid)
-                p.terminate()
-                p.join(timeout=1)
-
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(levelname)s %(message)s",
-    )
-    try:
-        cfg = Config()
-    except ValueError as exc:
-        logging.critical("tscan-dispatcher: configuration error — %s", exc)
-        raise SystemExit(1)
-    dispatcher(cfg)

@@ -328,19 +328,6 @@ def _outcome(error_status: int) -> str:
     return "success"
 
 
-def detect(pkt: dict) -> list:
-    """
-    Per-packet interface — retained for API compatibility, always returns [].
-
-    Args:
-        pkt: Normalized packet dict from parsing.net.parse_basic.
-
-    Returns:
-        Empty list.
-    """
-    return []
-
-
 def detect_stream(session, ts: float) -> list:
     """
     Stream-aware SNMPv1/v2c community string detector.

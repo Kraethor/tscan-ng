@@ -38,7 +38,7 @@ filter, so no translation is needed.
 import ctypes, logging, multiprocessing as mp, os, socket, struct, sys, time
 from tscan_ng.config import Config
 from tscan_ng.parsing.net import parse_basic, DLT_EN10MB
-from tscan_ng.detectors import DETECTORS, STREAM_DETECTORS, configure_all
+from tscan_ng.detectors import STREAM_DETECTORS, configure_all
 from tscan_ng.sinks.jsonl import JSONLSink
 from tscan_ng.sinks.discord import DiscordSink
 from tscan_ng.session import SessionTable
@@ -351,9 +351,6 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
             session, closed = sessions.add_packet(pkt, ts)
             for f in closed:
                 _emit(sink, discord, {"ts": f["ts_start"], **f})
-            for det in DETECTORS:
-                for f in det(pkt):
-                    _emit(sink, discord, {"ts": ts, **f})
             for det in STREAM_DETECTORS:
                 for f in det(session, ts):
                     _emit(sink, discord, {"ts": ts, **f})

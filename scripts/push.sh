@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+# scripts/push.sh - Stage, commit, and push local tscan-ng changes.
+#
+# Runs every git operation as the tscan service user (the repo at /opt/tscan
+# is owned by tscan, not the operator running this script), so the commit
+# author and pushed history stay consistent regardless of which admin ran it.
+#
+# Usage: sudo /opt/tscan/scripts/push.sh "commit message" [file ...]
+#   With no file arguments, all changes (including new files) are staged.
 set -euo pipefail
 
 # Must be run as root so we can run git as the tscan service user.

@@ -292,19 +292,6 @@ def _outcome(result_code: int) -> str:
     return "server_error"
 
 
-def detect(pkt: dict) -> list:
-    """
-    Per-packet interface — retained for API compatibility, always returns [].
-
-    Args:
-        pkt: Normalized packet dict from parsing.net.parse_basic.
-
-    Returns:
-        Empty list.
-    """
-    return []
-
-
 def detect_stream(session, ts: float) -> list:
     """
     Stream-aware LDAP simple-bind credential detector.

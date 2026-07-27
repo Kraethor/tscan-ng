@@ -1,3 +1,23 @@
+# Rotates the JSONL findings log (see tscan_ng/sinks/jsonl.py).
+#
+# copytruncate is required, not just preferred: every pipeline_worker
+# process holds results.jsonl open for the life of the service, with no
+# signal-driven reopen-on-rotate logic, so a create-and-reopen rotation
+# strategy would leave writers appending to a now-unlinked inode forever.
+# copytruncate instead truncates the same inode in place, so existing
+# writers keep working across rotation with no coordination needed.
+#
+# scripts/watch.py and scripts/dashboard.py's FindingsTailer both depend on
+# this too -- their rotation handling specifically detects a same-inode
+# size shrink (copytruncate's signature) rather than watching for a new
+# inode. Switching this to a create/rename strategy would silently break
+# both without any error, since they'd keep reading from a moved-away file.
+#
+# su tscan tscan: performs the rotation as the tscan user/group instead of
+# logrotate's default (root), so the compressed rotated files end up owned
+# by the same account that owns and writes /var/log/tscan. Required --
+# see docs/REBUILD.md's "Logs stop updating after rotation" failure mode
+# for what breaks without it.
 /var/log/tscan/*.jsonl {
     daily
     rotate 14

@@ -357,6 +357,27 @@ Discord alerting already happen inside `tscan-pipeline.service`
 regardless of whether this is running. Run as any user — no root
 required.
 
+### Live Status Dashboard
+```bash
+python3 /opt/tscan/scripts/dashboard.py
+```
+
+Full-screen, auto-refreshing view of service state, monitor/admin
+interface health, capture throughput, recent findings, and worker/load
+info. Everything it reads (systemd unit properties, `/sys/class/net`
+statistics, the results JSONL) is world-readable, so this also runs as any
+user — no root required. Press `q` or Ctrl-C to quit.
+
+### Quick Status Snapshot
+```bash
+bash /opt/tscan/scripts/status.sh
+```
+
+A non-interactive, one-shot version of the same status information —
+useful for a quick check or piping into something else. Uses the
+NOPASSWD sudo grants for `systemctl`/`journalctl`/`ip` (see
+`/etc/sudoers.d/`) rather than requiring a root login.
+
 ### Health check timer
 ```bash
 sudo systemctl list-timers tscan-pipeline-healthcheck.timer --no-pager
@@ -465,5 +486,7 @@ sudo systemctl restart tscan-pipeline
 - [ ] Discord webhook configured in `[discord]` section (optional) and a
       test finding/failure confirmed to arrive
 - [ ] Live monitor tested: `python3 /opt/tscan/scripts/watch.py`
+- [ ] Live dashboard tested: `python3 /opt/tscan/scripts/dashboard.py`
+- [ ] Quick status snapshot tested: `bash /opt/tscan/scripts/status.sh`
 - [ ] Healthcheck timer confirmed running:
       `systemctl list-timers tscan-pipeline-healthcheck.timer`

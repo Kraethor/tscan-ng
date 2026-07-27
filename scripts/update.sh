@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# scripts/update.sh - Deploy the latest tscan-ng code and restart the service.
+#
+# Stops tscan-pipeline.service, pulls the latest commit as the tscan user,
+# updates the venv from requirements.txt if present, reinstalls any systemd
+# unit file under systemd/ that differs from what's in /etc/systemd/system/
+# (reloading the daemon only if something actually changed), then restarts
+# the pipeline and enables the healthcheck timer.
+#
+# Usage: sudo /opt/tscan/scripts/update.sh
 set -euo pipefail
 
 # Must be run as root (we call systemctl, copy into /etc/systemd, etc.)
