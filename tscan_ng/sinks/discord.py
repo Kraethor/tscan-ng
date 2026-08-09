@@ -4,9 +4,12 @@ sinks/discord.py - Discord webhook alerting for tscan-ng.
 Two kinds of alert, both posted to the same webhook:
   - write(finding):  a credential-finding alert, fired for every finding
     whose outcome isn't in DiscordSink._SUPPRESSED_OUTCOMES (currently
-    "pending" and "failed" -- see that constant for why). Exposes the same
-    write(finding) interface as JSONLSink so pipeline.py can treat both
-    sinks identically at each finding call site.
+    "pending" and "failed" -- see that constant for why), and which isn't
+    still within its (dst, dport, creds) cooldown window -- see
+    _finding_cooldown_sec, added so a spammer replaying the same bad
+    credentials at the same service doesn't turn into one Discord message
+    per packet. Exposes the same write(finding) interface as JSONLSink so
+    pipeline.py can treat both sinks identically at each finding call site.
   - notify(message): a free-text operational alert -- pipeline_worker exit,
     kernel packet drops, etc. -- for the "is the pipeline itself healthy"
     channel of alerting, distinct from "did we catch a credential".
@@ -39,6 +42,7 @@ Design goals (carried over from scripts/discord_alert.py):
 """
 
 import fcntl
+import hashlib
 import logging
 import os
 import threading
@@ -59,6 +63,13 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 # plausibly call notify().
 _DEFAULT_COOLDOWN_PATH = "/run/tscan/discord_notify_last"
 
+# Default marker directory for write()'s per-(dst, dport, creds) finding
+# cooldown -- one marker file per key, same cross-process reasoning as
+# _DEFAULT_COOLDOWN_PATH above. Unlike notify()'s single marker, this needs
+# a directory because findings fan out over however many distinct
+# (target, credential) pairs are actually seen.
+_DEFAULT_FINDING_COOLDOWN_DIR = "/run/tscan/discord_finding_cooldown"
+
 
 class DiscordSink:
     """
@@ -75,15 +86,34 @@ class DiscordSink:
             sends), which is correct for a caller that already does its own
             edge-triggered dedup (e.g. the external healthcheck, which only
             calls notify() on an up/down state transition).
+        finding_cooldown_dir: Marker directory used to rate-limit write()
+            alerts sharing the same (dst, dport, creds) key across
+            processes. See _try_claim_alert_slot().
+        finding_cooldown_sec: Minimum seconds between write() alerts for the
+            same (dst, dport, creds) key. 0 disables the cooldown (every
+            non-suppressed finding sends).
     """
 
     def __init__(self, webhook_url: str,
                  cooldown_path: str = _DEFAULT_COOLDOWN_PATH,
-                 cooldown_sec: float = 300):
+                 cooldown_sec: float = 300,
+                 finding_cooldown_dir: str = _DEFAULT_FINDING_COOLDOWN_DIR,
+                 finding_cooldown_sec: float = 1800):
         """Store webhook config. See the class docstring for Args."""
         self._webhook_url = webhook_url
         self._cooldown_path = cooldown_path
         self._cooldown_sec = cooldown_sec
+        self._finding_cooldown_dir = finding_cooldown_dir
+        self._finding_cooldown_sec = finding_cooldown_sec
+        if webhook_url and finding_cooldown_sec > 0:
+            # Best-effort: if this fails, write()'s os.open() below will
+            # fail too and _try_claim_alert_slot() fails open (see its
+            # docstring), so a missing/unwritable directory means "no
+            # dedup", never "no alerts".
+            try:
+                os.makedirs(finding_cooldown_dir, exist_ok=True)
+            except OSError:
+                pass
 
     # Outcomes not worth an alert: "pending" never reaches write() (it isn't
     # a terminal state — see pipeline.py's resolution loop), and "failed"
@@ -98,14 +128,27 @@ class DiscordSink:
 
     def write(self, finding: dict) -> None:
         """
-        Fire a background alert for *finding* if alerting is enabled and the
-        finding's outcome isn't in _SUPPRESSED_OUTCOMES. No-op otherwise.
+        Fire a background alert for *finding* if alerting is enabled, the
+        finding's outcome isn't in _SUPPRESSED_OUTCOMES, and this exact
+        (dst, dport, creds) combination hasn't already alerted within
+        finding_cooldown_sec. No-op otherwise.
+
+        The cooldown key deliberately excludes "type" and "src": the same
+        attacker (or botnet) replaying the same credentials at the same
+        service from many source ports/IPs is exactly the noise this is
+        meant to collapse into one alert per cooldown window.
 
         Args:
             finding: Finding dict, same shape as written to the JSONL sink.
         """
         if not self._webhook_url or finding.get("outcome") in self._SUPPRESSED_OUTCOMES:
             return
+        if self._finding_cooldown_sec > 0:
+            key = f"{finding.get('dst', '')}:{finding.get('dport', '')}:{finding.get('creds', '')}"
+            marker_path = os.path.join(
+                self._finding_cooldown_dir, hashlib.sha256(key.encode()).hexdigest())
+            if not _try_claim_alert_slot(marker_path, self._finding_cooldown_sec):
+                return
         threading.Thread(
             target=_send_finding, args=(self._webhook_url, finding), daemon=True
         ).start()

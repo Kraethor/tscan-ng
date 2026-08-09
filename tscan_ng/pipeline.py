@@ -303,7 +303,8 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
     sock.settimeout(1.0)
 
     sink = JSONLSink(cfg.out_path or None)
-    discord = DiscordSink(cfg.discord_webhook, cooldown_sec=cfg.discord_notify_cooldown)
+    discord = DiscordSink(cfg.discord_webhook, cooldown_sec=cfg.discord_notify_cooldown,
+                           finding_cooldown_sec=cfg.discord_finding_cooldown)
     sessions = SessionTable(
         max_buf=cfg.session_max_buf,
         timeout=cfg.session_timeout,

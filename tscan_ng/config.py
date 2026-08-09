@@ -48,8 +48,9 @@ Config file format:
     postgres = 5432
 
     [discord]
-    discord_webhook     = https://discord.com/api/webhooks/...
-    notify_cooldown_sec = 300
+    discord_webhook      = https://discord.com/api/webhooks/...
+    notify_cooldown_sec  = 300
+    finding_cooldown_sec = 1800
 """
 
 import configparser
@@ -386,14 +387,29 @@ class Config:
         e.g. a pipeline_worker exiting abnormally.
 
         Distinct from credential-finding alerts (DiscordSink.write()), which
-        have no cooldown -- every successful capture is meaningful on its
-        own. Operational alerts need one because a sustained failure (e.g.
-        the capture interface staying down) makes every pipeline_worker
-        process re-raise and re-alert on every RestartSec cycle; without a
-        cooldown that's one Discord message every few seconds for as long
-        as the outage lasts.
+        are deduped per (dst, dport, creds) key instead -- see
+        discord_finding_cooldown. Operational alerts need their own cooldown
+        because a sustained failure (e.g. the capture interface staying
+        down) makes every pipeline_worker process re-raise and re-alert on
+        every RestartSec cycle; without a cooldown that's one Discord
+        message every few seconds for as long as the outage lasts.
         """
         return float(self._getint("discord", "notify_cooldown_sec", fallback=300))
+
+    @property
+    def discord_finding_cooldown(self) -> float:
+        """
+        Minimum seconds between credential-finding Discord alerts that share
+        the same (dst, dport, creds) key -- i.e. the same credentials
+        submitted to the same service. 0 disables the cooldown (every
+        non-suppressed finding alerts).
+
+        Exists so a spammer (or scanner) that keeps replaying the same bad
+        credentials at the same service doesn't turn into one Discord
+        message per packet; each distinct (target, credential) pair still
+        gets its own first alert immediately.
+        """
+        return float(self._getint("discord", "finding_cooldown_sec", fallback=1800))
 
     def _validate(self):
         """
