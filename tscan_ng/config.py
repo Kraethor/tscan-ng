@@ -50,6 +50,8 @@ Config file format:
     [discord]
     discord_webhook      = https://discord.com/api/webhooks/...
     notify_cooldown_sec  = 300
+
+    [dedup]
     finding_cooldown_sec = 1800
 """
 
@@ -387,29 +389,38 @@ class Config:
         e.g. a pipeline_worker exiting abnormally.
 
         Distinct from credential-finding alerts (DiscordSink.write()), which
-        are deduped per (dst, dport, creds) key instead -- see
-        discord_finding_cooldown. Operational alerts need their own cooldown
-        because a sustained failure (e.g. the capture interface staying
-        down) makes every pipeline_worker process re-raise and re-alert on
-        every RestartSec cycle; without a cooldown that's one Discord
-        message every few seconds for as long as the outage lasts.
+        aren't cooldown-limited on the Discord side at all -- see
+        finding_cooldown below, which suppresses repeat findings upstream of
+        every sink (JSONL included), before either one ever sees them.
+        Operational alerts need their own cooldown because a sustained
+        failure (e.g. the capture interface staying down) makes every
+        pipeline_worker process re-raise and re-alert on every RestartSec
+        cycle; without a cooldown that's one Discord message every few
+        seconds for as long as the outage lasts.
         """
         return float(self._getint("discord", "notify_cooldown_sec", fallback=300))
 
+    # -------------------------------------------------------------------------
+    # [dedup]
+    # -------------------------------------------------------------------------
+
     @property
-    def discord_finding_cooldown(self) -> float:
+    def finding_cooldown(self) -> float:
         """
-        Minimum seconds between credential-finding Discord alerts that share
-        the same (dst, dport, creds) key -- i.e. the same credentials
-        submitted to the same service. 0 disables the cooldown (every
-        non-suppressed finding alerts).
+        Minimum seconds between findings that share the same
+        (dst, dport, creds) key -- i.e. the same credentials submitted to
+        the same service -- before pipeline.py's _emit() will write another
+        one to *any* sink (JSONLSink and DiscordSink alike). 0 disables the
+        cooldown (every finding is emitted).
 
         Exists so a spammer (or scanner) that keeps replaying the same bad
-        credentials at the same service doesn't turn into one Discord
-        message per packet; each distinct (target, credential) pair still
-        gets its own first alert immediately.
+        credentials at the same service doesn't turn into one results.jsonl
+        line (and one Discord message) per packet; each distinct
+        (target, credential) pair still gets its own first emission
+        immediately, and starts alerting again on its own once
+        finding_cooldown_sec has passed since the last one.
         """
-        return float(self._getint("discord", "finding_cooldown_sec", fallback=1800))
+        return float(self._getint("dedup", "finding_cooldown_sec", fallback=1800))
 
     def _validate(self):
         """

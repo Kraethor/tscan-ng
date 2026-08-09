@@ -35,18 +35,27 @@ is identical whether it ends up driving a pcap handle or a Linux socket
 filter, so no translation is needed.
 """
 
-import ctypes, logging, multiprocessing as mp, os, socket, struct, sys, time
+import ctypes, hashlib, logging, multiprocessing as mp, os, socket, struct, sys, time
 from tscan_ng.config import Config
 from tscan_ng.parsing.net import parse_basic, DLT_EN10MB
 from tscan_ng.detectors import STREAM_DETECTORS, configure_all
 from tscan_ng.sinks.jsonl import JSONLSink
 from tscan_ng.sinks.discord import DiscordSink
+from tscan_ng.sinks.cooldown import claim_slot
 from tscan_ng.session import SessionTable
 from tscan_ng.run import _try_resolve
 from tscan_ng.capture import (
     pcap_open_dead, bpf_program, pcap_compile, pcap_freecode, pcap_close,
     PCAP_NETMASK_UNKNOWN, _err, _build_port_filter,
 )
+
+# Marker directory for _emit()'s per-(dst, dport, creds) finding cooldown --
+# one marker file per key, same cross-process reasoning as DiscordSink's own
+# notify() cooldown (see sinks/cooldown.py): all cfg.workers pipeline_worker
+# processes must agree on whether a given key was already emitted recently,
+# and the only thing they all share is the filesystem. /run/tscan is created
+# by tscan-pipeline.service via RuntimeDirectory=tscan.
+_FINDING_COOLDOWN_DIR = "/run/tscan/finding_cooldown"
 
 # --- Linux AF_PACKET / PACKET_FANOUT constants ---
 # Not exposed by Python's socket module (Linux-specific, not POSIX); values
@@ -192,27 +201,47 @@ def _open_fanout_socket(iface: str, group_id: int, bpf_filter: str,
     return sock
 
 
-def _emit(sink: JSONLSink, discord: DiscordSink, finding: dict) -> None:
+def _emit(sink: JSONLSink, discord: DiscordSink, finding: dict,
+          finding_cooldown_sec: float = 0) -> None:
     """
-    Write *finding* to the JSONL sink and forward it to Discord alerting.
+    Write *finding* to the JSONL sink and forward it to Discord alerting,
+    unless it's still within its (dst, dport, creds) cooldown window.
+
+    The cooldown is checked once here, upstream of both sinks, rather than
+    inside each sink -- so a spammer replaying the same bad credentials at
+    the same service produces at most one results.jsonl line *and* at most
+    one Discord alert per finding_cooldown_sec window, instead of the two
+    sinks disagreeing about what counts as a repeat. The cooldown key
+    deliberately excludes "type" and "src": the same attacker (or botnet)
+    replaying the same credentials at the same service from many source
+    ports/IPs is exactly the noise this is meant to collapse.
 
     Both sinks share the same write(finding) interface, so every finding
     site in this module calls through here once instead of duplicating the
-    two calls. DiscordSink.write() is itself a no-op unless the finding is
-    a successful credential capture and alerting is configured.
+    two calls. DiscordSink.write() is itself a further no-op unless the
+    finding is a successful credential capture and alerting is configured.
 
     Args:
-        sink:    The pipeline's JSONLSink.
-        discord: The pipeline's DiscordSink.
-        finding: Finding dict to write/alert on.
+        sink:                 The pipeline's JSONLSink.
+        discord:              The pipeline's DiscordSink.
+        finding:              Finding dict to write/alert on.
+        finding_cooldown_sec: Minimum seconds between emissions sharing the
+            same (dst, dport, creds) key. 0 disables the cooldown (every
+            finding is emitted) -- see Config.finding_cooldown.
     """
+    if finding_cooldown_sec > 0:
+        key = f"{finding.get('dst', '')}:{finding.get('dport', '')}:{finding.get('creds', '')}"
+        marker_path = os.path.join(
+            _FINDING_COOLDOWN_DIR, hashlib.sha256(key.encode()).hexdigest())
+        if not claim_slot(marker_path, finding_cooldown_sec):
+            return
     sink.write(finding)
     discord.write(finding)
 
 
 def _maybe_run_periodic(sock: socket.socket, sessions: SessionTable, sink: JSONLSink,
                         discord: DiscordSink, pipeline_id: int, last_expiry: float,
-                        expiry_interval: float) -> float:
+                        expiry_interval: float, finding_cooldown_sec: float = 0) -> float:
     """
     Run session expiry and log kernel-level packet drops, if expiry_interval
     has elapsed since the last run.
@@ -231,13 +260,14 @@ def _maybe_run_periodic(sock: socket.socket, sessions: SessionTable, sink: JSONL
     polling it on this same timer is the only way to catch it.
 
     Args:
-        sock:            The pipeline's fanout socket.
-        sessions:        The pipeline's SessionTable.
-        sink:            The pipeline's JSONLSink.
-        discord:         The pipeline's DiscordSink.
-        pipeline_id:     0-based index, used only for logging.
-        last_expiry:     Monotonic timestamp of the last periodic run.
-        expiry_interval: Minimum seconds between periodic runs.
+        sock:                 The pipeline's fanout socket.
+        sessions:             The pipeline's SessionTable.
+        sink:                 The pipeline's JSONLSink.
+        discord:              The pipeline's DiscordSink.
+        pipeline_id:          0-based index, used only for logging.
+        last_expiry:          Monotonic timestamp of the last periodic run.
+        expiry_interval:      Minimum seconds between periodic runs.
+        finding_cooldown_sec: Passed through to _emit() -- see its docstring.
 
     Returns:
         The new last_expiry timestamp (unchanged if the interval hasn't
@@ -247,7 +277,7 @@ def _maybe_run_periodic(sock: socket.socket, sessions: SessionTable, sink: JSONL
     if now - last_expiry < expiry_interval:
         return last_expiry
     for f in sessions.expire():
-        _emit(sink, discord, {"ts": f["ts_start"], **f})
+        _emit(sink, discord, {"ts": f["ts_start"], **f}, finding_cooldown_sec)
     _, drops = struct.unpack(
         "=II", sock.getsockopt(SOL_PACKET, PACKET_STATISTICS, 8))
     if drops:
@@ -303,8 +333,16 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
     sock.settimeout(1.0)
 
     sink = JSONLSink(cfg.out_path or None)
-    discord = DiscordSink(cfg.discord_webhook, cooldown_sec=cfg.discord_notify_cooldown,
-                           finding_cooldown_sec=cfg.discord_finding_cooldown)
+    discord = DiscordSink(cfg.discord_webhook, cooldown_sec=cfg.discord_notify_cooldown)
+    finding_cooldown_sec = cfg.finding_cooldown
+    if finding_cooldown_sec > 0:
+        # Best-effort: if this fails, _emit()'s os.open() will fail too and
+        # claim_slot() fails open (see sinks/cooldown.py), so a missing or
+        # unwritable directory means "no dedup", never "no logging".
+        try:
+            os.makedirs(_FINDING_COOLDOWN_DIR, exist_ok=True)
+        except OSError:
+            pass
     sessions = SessionTable(
         max_buf=cfg.session_max_buf,
         timeout=cfg.session_timeout,
@@ -332,7 +370,8 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
         except socket.timeout:
             # No packets for 1 second. Run session expiry and loop.
             last_expiry = _maybe_run_periodic(
-                sock, sessions, sink, discord, pipeline_id, last_expiry, cfg.expiry_interval)
+                sock, sessions, sink, discord, pipeline_id, last_expiry, cfg.expiry_interval,
+                finding_cooldown_sec)
             continue
         except OSError as exc:
             logging.exception("pipeline[%d]: recv error, exiting", pipeline_id)
@@ -351,21 +390,22 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
         try:
             session, closed = sessions.add_packet(pkt, ts)
             for f in closed:
-                _emit(sink, discord, {"ts": f["ts_start"], **f})
+                _emit(sink, discord, {"ts": f["ts_start"], **f}, finding_cooldown_sec)
             for det in STREAM_DETECTORS:
                 for f in det(session, ts):
-                    _emit(sink, discord, {"ts": ts, **f})
+                    _emit(sink, discord, {"ts": ts, **f}, finding_cooldown_sec)
             if session.pending:
                 still_pending = []
                 for p in session.pending:
                     resolved = _try_resolve(p, session, ts)
                     if resolved:
-                        _emit(sink, discord, resolved)
+                        _emit(sink, discord, resolved, finding_cooldown_sec)
                     else:
                         still_pending.append(p)
                 session.pending = still_pending
             last_expiry = _maybe_run_periodic(
-                sock, sessions, sink, discord, pipeline_id, last_expiry, cfg.expiry_interval)
+                sock, sessions, sink, discord, pipeline_id, last_expiry, cfg.expiry_interval,
+                finding_cooldown_sec)
             fail_count = 0  # Reset on success
         except Exception:
             logging.exception(
@@ -378,7 +418,7 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
                 break
 
     for f in sessions.flush_all():
-        _emit(sink, discord, {"ts": f["ts_start"], **f})
+        _emit(sink, discord, {"ts": f["ts_start"], **f}, finding_cooldown_sec)
     sock.close()
 
     if abnormal_exit:
