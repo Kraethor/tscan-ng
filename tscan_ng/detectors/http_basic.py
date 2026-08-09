@@ -40,9 +40,21 @@ Finding outcomes:
     failed       - Server responded with 401
     redirect     - Server responded with 3xx (excluding 304)
     server_error - Server responded with 5xx
+    unknown      - Server responded with any other status (e.g. 403, 404,
+                   411). Common for Basic Auth: a 403 in particular usually
+                   means the credentials *were* accepted and something else
+                   (ACL, WAF, path rule) blocked the request, so this is not
+                   noise — see _outcome()'s docstring.
     pending      - Credentials seen, no server response yet in this packet
     no_response  - Session expired before a server response was seen
                    (emitted by SessionTable.expire())
+
+Alerting note:
+    DiscordSink alerts on every outcome above except "pending" and
+    "failed" (see DiscordSink._SUPPRESSED_OUTCOMES) — "unknown" and
+    "no_response" both alert, since both represent credentials that were
+    actually submitted and are worth a human look, even though neither is
+    a confirmed success.
 
 Note on 304:
     Per RFC 7232, a server may only return 304 Not Modified for a conditional
@@ -97,6 +109,10 @@ def _outcome(status: int) -> str:
     server can only return 304 for a conditional request that would otherwise
     have succeeded (including Authorization), so it's equally strong evidence
     of valid credentials as a 2xx. See the module docstring's "Note on 304".
+
+    Everything not explicitly matched below (403, 404, 411, ...) falls
+    through to "unknown" — see the module docstring's "Finding outcomes"
+    for why that still alerts rather than being treated as noise.
 
     Args:
         status: HTTP status code integer.

@@ -3,9 +3,10 @@ sinks/discord.py - Discord webhook alerting for tscan-ng.
 
 Two kinds of alert, both posted to the same webhook:
   - write(finding):  a credential-finding alert, fired for every finding
-    with outcome == "success". Exposes the same write(finding) interface
-    as JSONLSink so pipeline.py can treat both sinks identically at each
-    finding call site.
+    whose outcome isn't in DiscordSink._SUPPRESSED_OUTCOMES (currently
+    "pending" and "failed" -- see that constant for why). Exposes the same
+    write(finding) interface as JSONLSink so pipeline.py can treat both
+    sinks identically at each finding call site.
   - notify(message): a free-text operational alert -- pipeline_worker exit,
     kernel packet drops, etc. -- for the "is the pipeline itself healthy"
     channel of alerting, distinct from "did we catch a credential".
@@ -84,15 +85,26 @@ class DiscordSink:
         self._cooldown_path = cooldown_path
         self._cooldown_sec = cooldown_sec
 
+    # Outcomes not worth an alert: "pending" never reaches write() (it isn't
+    # a terminal state — see pipeline.py's resolution loop), and "failed"
+    # means the server rejected the credentials (401), so there's nothing
+    # actionable to page on. Every other terminal outcome (success, redirect,
+    # server_error, no_response, and the catch-all "unknown" for status
+    # codes _outcome() doesn't otherwise classify -- e.g. 403, which for
+    # Basic Auth usually means the credentials *were* accepted and something
+    # else blocked the request) is alert-worthy: each represents credentials
+    # that were actually submitted and merits a human look.
+    _SUPPRESSED_OUTCOMES = frozenset({"pending", "failed"})
+
     def write(self, finding: dict) -> None:
         """
-        Fire a background alert for *finding* if alerting is enabled and
-        the finding is a successful credential capture. No-op otherwise.
+        Fire a background alert for *finding* if alerting is enabled and the
+        finding's outcome isn't in _SUPPRESSED_OUTCOMES. No-op otherwise.
 
         Args:
             finding: Finding dict, same shape as written to the JSONL sink.
         """
-        if not self._webhook_url or finding.get("outcome") != "success":
+        if not self._webhook_url or finding.get("outcome") in self._SUPPRESSED_OUTCOMES:
             return
         threading.Thread(
             target=_send_finding, args=(self._webhook_url, finding), daemon=True
@@ -141,14 +153,17 @@ def _send_finding(webhook_url: str, finding: dict) -> None:
 
     Args:
         webhook_url: Discord webhook URL.
-        finding: Finding dict for one successful credential capture.
+        finding: Finding dict for one credential capture (any outcome not
+                 in DiscordSink._SUPPRESSED_OUTCOMES).
     """
     ftype = finding.get("type", "unknown")
     username = finding.get("creds", "").split(":", 1)[0] or "unknown"
     session_id = finding.get("session_id", "unknown")
+    outcome = finding.get("outcome", "unknown")
 
     payload = {
-        "content": f"Credential found — type: `{ftype}`  user: `{username}`  session: `{session_id}`",
+        "content": f"Credential found — type: `{ftype}`  user: `{username}`  "
+                    f"outcome: `{outcome}`  session: `{session_id}`",
         "allowed_mentions": {"parse": []},
     }
     _post(webhook_url, payload)

@@ -64,13 +64,15 @@ Outcome semantics — a deliberate departure from every other detector here:
     succeeded on that specific server — unlike a plaintext password, a
     "failed" capture is not a wasted one. This detector still maps outcome
     from the real SMB2 status code for consistency with the rest of the
-    codebase (and because DiscordSink only alerts on outcome == "success"),
-    but that means a captured hash tied to a failed logon will show up in
-    the JSONL log with outcome="failed"/"server_error" and will NOT trigger
-    a Discord alert even though the hash itself is just as usable. Worth
-    revisiting (e.g. alerting on any complete capture regardless of
-    outcome) if failed-but-crackable captures turn out to be common enough
-    to matter in practice.
+    codebase, but that means a captured hash tied to a failed logon shows
+    up in the JSONL log with outcome="failed" and will NOT trigger a
+    Discord alert (DiscordSink._SUPPRESSED_OUTCOMES suppresses "failed"
+    for every detector, not just SMB) even though the hash itself is just
+    as usable. outcome="server_error" is a separate case and DOES alert,
+    same as every other detector — only "failed" and "pending" are
+    suppressed. Worth revisiting (e.g. alerting on any complete capture
+    regardless of outcome) if failed-but-crackable captures turn out to be
+    common enough to matter in practice.
 
 Port handling:
     Gates on _SMB_PORTS. Sessions on other ports are skipped immediately.

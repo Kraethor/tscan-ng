@@ -22,10 +22,10 @@ its own capture → TCP stream reassembly (`SessionTable`) → protocol
 detection → output, with no coordination needed between workers.
 
 Every finding is written to a shared JSONL file (`tscan_ng/sinks/jsonl.py`,
-`flock()`-safe for concurrent writers) and, for successful credential
-captures, to a Discord webhook (`tscan_ng/sinks/discord.py`) — both fire
-from inside the pipeline itself, independent of whether anything is
-watching. A worker that dies abnormally (e.g. the capture interface going
+`flock()`-safe for concurrent writers) and, for any finding whose outcome
+isn't "pending" or "failed" (see `DiscordSink._SUPPRESSED_OUTCOMES`), to a
+Discord webhook (`tscan_ng/sinks/discord.py`) — both fire from inside the
+pipeline itself, independent of whether anything is watching. A worker that dies abnormally (e.g. the capture interface going
 down) exits non-zero so systemd's `Restart=on-failure` actually restarts
 the service, and fires its own Discord alert. A separate
 `tscan-pipeline-healthcheck` timer polls the service's status every 2
@@ -63,8 +63,9 @@ gets captured is the NTLMv2 hash itself, formatted ready for `hashcat -m
 use), not a password. See `tscan_ng/detectors/smb.py` for the full
 protocol-correlation details and the resulting alerting tradeoff (a
 captured hash is equally crackable whether or not that specific logon
-attempt succeeded, but Discord alerting is still gated on the SMB session
-actually succeeding, for consistency with every other detector).
+attempt succeeded, but a failed SMB logon still maps to outcome="failed"
+and so still won't alert, for consistency with every other detector —
+only outcome="failed" and outcome="pending" are suppressed).
 
 SNMP is the other exception, in the other direction: it's the first and
 only UDP-carried detector (every other protocol here is TCP), and its
