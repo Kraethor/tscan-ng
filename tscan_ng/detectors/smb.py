@@ -92,6 +92,20 @@ Finding extras:
                     creds.split(":", 1)[0] still yields just the username,
                     same as every other detector, while the full field
                     remains directly hashcat/John-ready.
+    "status"      — the SMB2 NTSTATUS of the final SESSION_SETUP response,
+                    as a decimal string (e.g. "0" for success,
+                    "3221225581" for 0xC000006D LOGON_FAILURE).
+
+Correlation caveats:
+    - The ServerChallenge is the first NTLM CHALLENGE found in the first
+      4 KB of server_buf; it is removed only when a final status is consumed.
+      An AUTHENTICATE that follows a different (later) CHALLENGE, for example
+      on a re-authentication over the same connection, may be paired with the
+      stale first challenge and produce a hash that will not crack.
+    - The final status is the first non-MORE_PROCESSING SESSION_SETUP
+      response in server_buf, not matched by MessageId/SessionId.
+    - Encrypted (SMB 3 transform header) or signed-and-sealed traffic hides
+      later exchanges, but SESSION_SETUP itself is always in the clear.
 """
 
 import struct
@@ -110,11 +124,23 @@ _SMB_PORTS: frozenset = frozenset({
 _MAX_SCAN_SERVER = 4096
 _MAX_SCAN_CLIENT = 8192
 
+# SMB2 packet header (MS-SMB2 §2.2.1.2), all fields little-endian:
+#   0  ProtocolId (4)   = 0xFE 'S' 'M' 'B'
+#   4  StructureSize(2) = 64
+#   6  CreditCharge (2)
+#   8  Status (4)        (ChannelSequence+Reserved in requests)
+#   12 Command (2)
+#   14 CreditRequest/Response (2)
+#   16 Flags (4)
+#   20 NextCommand (4), 24 MessageId (8), 32 ProcessId/Reserved (4),
+#   36 TreeId (4), 40 SessionId (8), 48 Signature (16)
 _SMB2_MAGIC = b"\xfeSMB"
 _SMB2_HEADER_LEN = 64
 _CMD_SESSION_SETUP = 0x0001
 _FLAG_SERVER_TO_REDIR = 0x00000001  # set on responses, clear on requests
 
+# NTSTATUS values. MORE_PROCESSING_REQUIRED is the *intermediate* status that
+# accompanies the NTLM CHALLENGE; it is not a login verdict.
 _STATUS_MORE_PROCESSING_REQUIRED = 0xC0000016
 _STATUS_SUCCESS = 0x00000000
 # SMB2 status codes that unambiguously mean "the credentials were rejected"
@@ -131,6 +157,9 @@ _STATUS_FAILED_CODES = frozenset({
     0xC0000224,  # STATUS_PASSWORD_MUST_CHANGE
 })
 
+# NTLMSSP message header (MS-NLMP §2.2.1): 8-byte signature "NTLMSSP\0"
+# followed by a 4-byte little-endian MessageType (1=NEGOTIATE, 2=CHALLENGE,
+# 3=AUTHENTICATE).
 _NTLMSSP_SIG = b"NTLMSSP\x00"
 _NTLM_TYPE_CHALLENGE = 2
 _NTLM_TYPE_AUTHENTICATE = 3
@@ -165,6 +194,7 @@ def _iter_smb2_messages(data: bytes):
             return
         if idx + _SMB2_HEADER_LEN > len(data):
             return  # Header truncated — wait for more data.
+        # Field offsets are from the header layout above the constants.
         status = struct.unpack_from("<I", data, idx + 8)[0]
         command = struct.unpack_from("<H", data, idx + 12)[0]
         flags = struct.unpack_from("<I", data, idx + 16)[0]
@@ -195,6 +225,11 @@ def _extract_security_buffer(data: bytes, header_start: int,
         field. Returns (None, None) if the structure is truncated, empty,
         or malformed.
     """
+    # Offsets below are relative to payload_start (the end of the 64-byte
+    # header). Response (MS-SMB2 §2.2.6): StructureSize(2) SessionFlags(2)
+    # SecurityBufferOffset(2) SecurityBufferLength(2). Request (§2.2.5):
+    # StructureSize(2) Flags(1) SecurityMode(1) Capabilities(4) Channel(4)
+    # SecurityBufferOffset(2) SecurityBufferLength(2) PreviousSessionId(8).
     if is_response:
         fixed_len = 8  # StructureSize, SessionFlags, SecBufOffset, SecBufLen
         off_field, len_field = 4, 6
@@ -207,6 +242,8 @@ def _extract_security_buffer(data: bytes, header_start: int,
     sec_len = struct.unpack_from("<H", data, payload_start + len_field)[0]
     buf_start = header_start + sec_off
     buf_end = buf_start + sec_len
+    # Reject empty buffers, offsets pointing back into the header, and buffers
+    # that extend past the data received so far (truncated: wait for more).
     if sec_len == 0 or buf_start < payload_start or buf_end > len(data):
         return None, None
     return data[buf_start:buf_end], buf_end
@@ -230,12 +267,16 @@ def _find_ntlm_challenge(data: bytes):
         sec_buf, _buf_end = _extract_security_buffer(data, header_start, payload_start, True)
         if not sec_buf:
             continue
+        # The NTLMSSP message sits verbatim inside the SPNEGO wrapper.
         idx = sec_buf.find(_NTLMSSP_SIG)
         if idx == -1 or idx + 32 > len(sec_buf):
             continue
         msg_type = struct.unpack_from("<I", sec_buf, idx + 8)[0]
         if msg_type != _NTLM_TYPE_CHALLENGE:
             continue
+        # CHALLENGE layout (MS-NLMP §2.2.1.2): signature(8) type(4)
+        # TargetNameFields(8) NegotiateFlags(4) ServerChallenge(8) ...
+        # so the 8-byte challenge is at message offset 24.
         return bytes(sec_buf[idx + 24:idx + 32])  # ServerChallenge, fixed offset
     return None
 
@@ -265,6 +306,8 @@ def _find_ntlm_authenticate(data: bytes):
         if not sec_buf:
             continue
         idx = sec_buf.find(_NTLMSSP_SIG)
+        # 64 = size of the fixed AUTHENTICATE header up to NegotiateFlags
+        # (through offset 63); NEGOTIATE (type 1) is skipped by the type test.
         if idx == -1 or idx + 64 > len(sec_buf):
             continue
         msg_type = struct.unpack_from("<I", sec_buf, idx + 8)[0]
@@ -278,15 +321,25 @@ def _find_ntlm_authenticate(data: bytes):
             actual field bytes located at msg[offset:offset+length]."""
             length = struct.unpack_from("<H", msg, off)[0]
             offset = struct.unpack_from("<I", msg, off + 4)[0]
+            # (offset is an unsigned 32-bit value, so "offset < 0" can never be
+            # true; the upper-bound test is the effective bounds check.)
             if length == 0 or offset < 0 or offset + length > len(msg):
                 return b""
             return bytes(msg[offset:offset + length])
 
+        # AUTHENTICATE fixed header (MS-NLMP §2.2.1.3), each "Fields" entry is
+        # Len(2) MaxLen(2) BufferOffset(4), offsets relative to the message:
+        #   12 LmChallengeResponse (unused)   20 NtChallengeResponse
+        #   28 DomainName                     36 UserName
+        #   44 Workstation                    52 EncryptedRandomSessionKey
+        #   60 NegotiateFlags
         nt_response = field(20)
         domain_raw = field(28)
         user_raw = field(36)
         workstation_raw = field(44)
 
+        # NTLMSSP_NEGOTIATE_UNICODE (bit 0) selects UTF-16LE vs OEM (the code
+        # page is unknown here, so latin-1 is used as a byte-preserving guess).
         neg_flags = struct.unpack_from("<I", msg, 60)[0]
         unicode = bool(neg_flags & 0x00000001)
         enc = "utf-16-le" if unicode else "latin-1"
@@ -353,6 +406,9 @@ def detect_stream(session, ts: float) -> list:
     """
     Stream-aware SMB2/3 NTLMv2 credential detector.
 
+    Only the first 4 KB of server_buf and 8 KB of client_buf are examined for
+    the CHALLENGE and AUTHENTICATE respectively.
+
     Requires both a CHALLENGE already present in session.server_buf and an
     AUTHENTICATE present in session.client_buf before anything can be
     detected — unlike every other detector here, the "request" alone
@@ -386,9 +442,13 @@ def detect_stream(session, ts: float) -> list:
     # 24-byte response is classic NTLMv1, which this detector doesn't
     # extract (see module docstring).
     if not username or not nt_response or len(nt_response) <= 24:
+        # Anonymous/NULL-session or NTLMv1 AUTHENTICATE: consume it so it is
+        # not re-parsed on every subsequent packet, and emit nothing.
         del session.client_buf[:req_end]
         return []
 
+    # hashcat -m 5600 / John netntlmv2 line format:
+    #   USER::DOMAIN:ServerChallenge:NTProofStr:blob   (all hex except names)
     ntproofstr_hex = nt_response[:16].hex()
     blob_hex = nt_response[16:].hex()
     server_challenge_hex = challenge.hex()
@@ -409,13 +469,17 @@ def detect_stream(session, ts: float) -> list:
                                     session.sport, session.dport),
     }
 
+    # The final response may already be in server_buf (it is fetched over the
+    # whole buffer here, not just the bounded scan window).
     server_bytes = bytes(session.server_buf)
     status, rsp_end = _find_final_status(server_bytes)
 
     del session.client_buf[:req_end]
 
     if status is not None:
-        # Final response already in server_buf — resolve immediately.
+        # Final response already in server_buf — resolve immediately. This
+        # also consumes the earlier CHALLENGE (everything up to rsp_end); it
+        # does not call session.shift_pending_floors() (run.py's path does).
         del session.server_buf[:rsp_end]
         return [{
             **base,

@@ -19,8 +19,10 @@ superseded that design (see pipeline.py's module docstring for why), and
 the dispatcher/worker code was removed as dead weight once nothing still
 ran it -- see git history if it's ever needed for reference.
 
-Configuration is loaded from /opt/tscan/tscan_ng/config/tscan_ng.conf at
-startup. See tscan_ng/config.py for all available settings and their defaults.
+This module loads no configuration itself; importing it just pulls in
+every detector's response-matching helpers (their private _outcome() /
+_find_*() functions and response regexes), so a rename there breaks this
+import. See tscan_ng/config.py for configuration.
 
 Pending findings (credentials seen but no server response yet) are
 registered on the session by each stream detector and resolved here when
@@ -49,11 +51,21 @@ def _try_resolve(p, session, ts: float) -> dict | None:
     """
     Attempt to resolve a pending finding against available server buffer data.
 
-    Dispatches to the appropriate resolver based on the finding type.
-    Returns a completed finding dict if resolved, or None if still pending.
+    Dispatches on p.finding["type"] to the matching protocol's response
+    matcher, which scans session.server_buf. Returns a completed finding
+    dict if resolved, or None if still pending (also None for an unknown
+    type). On a match, the matched response (and everything before it) is
+    deleted from session.server_buf and pending floors are shifted, so the
+    same response cannot resolve a later pending finding. telnet_creds is
+    the exception: its matcher does not consume any buffer.
 
-    Private fields prefixed with '_' are stripped from the final emitted
-    finding.
+    Private fields prefixed with '_' are stripped from the returned
+    finding. Side effects: mutates session.server_buf and the pending
+    floors of every pending finding on the session.
+
+    Note the returned dicts are not uniform: only the http_basic branch
+    sets "ts" (and "status_text"); the other branches leave "ts" to
+    whatever the detector's original finding carried, which is nothing.
 
     Args:
         p:       PendingFinding object from the session.

@@ -56,6 +56,31 @@ Finding extras:
     "creds" — formatted as "user:password", or ":password" if no user was
               found, for display consistency with every other detector
               that has an optional username component.
+    "status" — "0" (AuthenticationOk), or the SQLSTATE of the ErrorResponse
+              (e.g. "28P01" invalid_password), or "" if the error carried no
+              SQLSTATE field.
+
+Outcomes: success (AuthenticationOk), failed (ErrorResponse with SQLSTATE
+28P01), server_error (any other ErrorResponse, e.g. 28000
+invalid_authorization_specification or 3D000 invalid_catalog_name).
+
+Message framing (v3.0): after the StartupMessage, every message is
+Byte1(type) Int32(length) payload, where length counts itself and the payload
+but not the type byte. Multi-byte integers are big-endian.
+
+Known limitations:
+    - The message search is a raw single-byte find, and _find_password_message
+      gives up (returns "not found, wait for more data") the first time the
+      candidate byte 'p' is followed by a length field that exceeds the data
+      buffered so far. Because the StartupMessage stays at the front of
+      client_buf and its text (for example "postgres", "application_name",
+      "psql") contains the letter 'p', the real PasswordMessage can be missed
+      whenever a 'p' inside the startup parameters is followed by four bytes
+      that decode to a length larger than the whole buffer. See that
+      function's docstring.
+    - Only the first 4 KB of each buffer is examined for the pre-conditions;
+      client_buf is consumed only when a PasswordMessage is matched.
+    - TLS negotiated via SSLRequest ('S' response) makes the rest opaque.
 """
 
 import struct
@@ -71,8 +96,11 @@ _POSTGRES_PORTS: frozenset = frozenset({5432})
 _MAX_SCAN_CLIENT = 4096
 _MAX_SCAN_SERVER = 4096
 
+# StartupMessage protocol version: major 3 in the high 16 bits, minor 0 in the
+# low 16 bits (Int32 0x00030000).
 _PG_PROTOCOL_VERSION_3_0 = 0x00030000
 
+# 'R' (Authentication) message sub-codes, from the Int32 following the length.
 _AUTH_TYPE_OK = 0
 _AUTH_TYPE_CLEARTEXT = 3
 
@@ -83,6 +111,9 @@ _SQLSTATE_INVALID_PASSWORD = b"28P01"
 def _find_startup_user(data: bytes) -> str:
     """
     Best-effort scan for the "user" parameter in a StartupMessage.
+
+    StartupMessage layout: Int32 length, Int32 protocol version, then
+    null-terminated key/value string pairs, ended by an extra NUL.
 
     Locates the message by searching for the literal 4-byte big-endian
     protocol version 0x00030000 and backing up 4 bytes for the presumed
@@ -109,6 +140,8 @@ def _find_startup_user(data: bytes) -> str:
     if length < 8 or msg_end > len(data):
         return ""
     params = data[idx + 4:msg_end]
+    # "user\0alice\0database\0db\0\0" splits into alternating key, value, ...
+    # (plus trailing empty strings from the terminators).
     parts = params.split(b"\x00")
     for i in range(0, len(parts) - 1, 2):
         if parts[i].lower() == b"user":
@@ -123,6 +156,11 @@ def _find_cleartext_auth_request(data: bytes):
     Args:
         data: Raw bytes from the server stream buffer (bounded to
               _MAX_SCAN_SERVER by the caller).
+
+    Wire form: 'R' Int32(8) Int32(3), i.e. 9 bytes. Any 'R' with a different
+    length (or auth code) is skipped and the search continues. If fewer than
+    9 bytes follow a candidate 'R', the search stops and reports "not present"
+    (waits for more data) rather than trying later candidates.
 
     Returns:
         End offset past the matched message, or None if not present.
@@ -149,7 +187,15 @@ def _find_cleartext_auth_request(data: bytes):
 
 def _find_password_message(data: bytes):
     """
-    Scan *data* (client_buf) for a PasswordMessage.
+    Scan *data* (client_buf) for a PasswordMessage: 'p' Int32(length)
+    password NUL.
+
+    Weakness: the first 'p' byte whose following Int32 is a plausible-looking
+    length (>= 5) but larger than the bytes buffered is treated as a
+    truncated message and the scan STOPS, returning (None, None); later 'p'
+    candidates are not tried. Since client_buf begins with the StartupMessage
+    (which usually contains 'p' characters), this can mask the real
+    PasswordMessage. A length below 5 just skips that candidate.
 
     Args:
         data: Raw bytes from the client stream buffer (bounded to
@@ -181,7 +227,8 @@ def _find_password_message(data: bytes):
 
 def _extract_error_field(payload: bytes, field_type: bytes):
     """
-    Extract one field from an ErrorResponse payload.
+    Extract one field from an ErrorResponse payload. Field type codes are
+    single ASCII letters, e.g. b"S" severity, b"C" SQLSTATE, b"M" message.
 
     ErrorResponse payload is a sequence of (1-byte field type, null-
     terminated string) pairs, terminated by a final zero byte.
@@ -211,6 +258,14 @@ def _find_auth_outcome(data: bytes):
     """
     Scan *data* (server_buf) for the final AuthenticationOk or ErrorResponse
     following a PasswordMessage.
+
+    Candidates are the earliest 'R' or 'E' byte. 'R' must be an 8-byte-length
+    AuthenticationOk (code 0) to count; other 'R' messages (including the
+    earlier AuthenticationCleartextPassword) are skipped. The first 'E'
+    candidate with a complete, plausible length (>= 4) is taken as an
+    ErrorResponse. A candidate whose declared length runs past the buffered
+    data stops the scan (treated as truncated). Also imported by run.py's
+    _try_resolve().
 
     Args:
         data: Raw bytes from the server stream buffer.
@@ -269,6 +324,13 @@ def detect_stream(session, ts: float) -> list:
     client credential" shape rather than the simpler single
     request/response pair most other detectors use.
 
+    The server's cleartext-password request is NOT consumed (only the final
+    AuthenticationOk/ErrorResponse and everything before it is, on
+    resolution), and the client's StartupMessage is not consumed either
+    (only up to the end of the PasswordMessage). On immediate resolution
+    server_buf is trimmed without a session.shift_pending_floors() call
+    (run.py's path does call it). An empty password is consumed and ignored.
+
     Args:
         session: Session object from session.SessionTable.
         ts:      Unix timestamp of the current packet.
@@ -295,6 +357,7 @@ def detect_stream(session, ts: float) -> list:
         del session.client_buf[:req_end]
         return []
 
+    # Best-effort: look for the StartupMessage in the same client window.
     user = _find_startup_user(client_bytes)
     creds_str = f"{user}:{password}" if user else f":{password}"
 
@@ -311,12 +374,15 @@ def detect_stream(session, ts: float) -> list:
                                    session.sport, session.dport),
     }
 
+    # The outcome search runs over the whole server_buf (not the 4 KB window),
+    # since AuthenticationOk/ErrorResponse follow the cleartext request.
     server_bytes_full = bytes(session.server_buf)
     outcome, status, rsp_end = _find_auth_outcome(server_bytes_full)
 
     del session.client_buf[:req_end]
 
     if outcome is not None:
+        # Removes everything up to and including the final auth message.
         del session.server_buf[:rsp_end]
         return [{
             **base,

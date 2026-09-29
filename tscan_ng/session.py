@@ -1,8 +1,10 @@
 """
 session.py - TCP flow session tracking for tscan-ng.
 
-Maintains a per-worker table of active network flows, buffering reassembled
-byte streams in each direction. Tracks pending credential findings awaiting
+Maintains a per-worker table of active network flows, buffering the payload
+bytes of each direction. Buffers are simple arrival-order concatenations of
+packet payloads -- there is no TCP sequence-number tracking, so
+retransmissions and out-of-order segments are appended as they arrive. Tracks pending credential findings awaiting
 server response correlation.
 
 Each session tracks:
@@ -12,6 +14,7 @@ Each session tracks:
     - Pending findings: credential detections awaiting response correlation
     - session_id: stable 8-character hex identifier for the lifetime of the flow
     - ts_first/last_ts: wall-clock timestamps of first and last packets seen
+      (last_seen/created_at, by contrast, are time.monotonic() values)
 
 Flow identity is based on the canonical 4-tuple:
     (src_ip, dst_ip, sport, dport)
@@ -23,7 +26,8 @@ session.sport always refer to the *client* endpoint.  This means client_buf
 always contains client-originated bytes and server_buf always contains
 server-originated bytes, without any per-detector direction sniffing.
 
-Phase status:
+Phase status (historical build plan; Phase 1 is now done by the kernel's
+PACKET_FANOUT_HASH in pipeline.py rather than by application code):
     Phase 1 - Flow affinity routing:        COMPLETE
     Phase 2 - Per-worker stream buffering:  COMPLETE
     Phase 3 - Stream-aware detectors:       COMPLETE
@@ -41,6 +45,10 @@ from dataclasses import dataclass, field
 # When a packet arrives whose *source* port is in this set and whose
 # *destination* port is not, we treat the packet as server->client and
 # store the session from the client's perspective by swapping src/dst.
+# This is a hardcoded list, independent of the [ports] config section: ports
+# of the other detectors (LDAP, Redis, SMB, IRC, PostgreSQL, ...) and any
+# non-default configured ports are absent, so for those a flow first seen
+# mid-stream from the server side is stored with client/server swapped.
 _SERVER_PORTS: frozenset = frozenset({
     21,    # FTP control
     22,    # SSH
@@ -74,7 +82,7 @@ def _normalize_direction(pkt: dict) -> dict:
         pkt: Normalized packet dict from parsing.net.parse_basic.
 
     Returns:
-        pkt unchanged if already client-perspective, or a new dict with
+        pkt (the same object, not a copy) unchanged if already client-perspective, or a new dict with
         src/dst and sport/dport swapped if direction was inverted.
     """
     if pkt["sport"] in _SERVER_PORTS and pkt["dport"] not in _SERVER_PORTS:
@@ -104,6 +112,9 @@ def _make_session_id(src: str, dst: str, sport: int, dport: int,
         sport:      Source port number.
         dport:      Destination port number.
         created_at: Monotonic timestamp when the session was created.
+            (Monotonic time is not comparable across processes or
+            restarts, so ids are only unique in practice, not guaranteed:
+            32 bits of SHA-1.)
 
     Returns:
         8-character lowercase hex string.
@@ -143,6 +154,7 @@ def _close_finding(p: "PendingFinding", last_ts: float) -> dict:
 def _make_filter(src: str, dst: str, sport: int, dport: int) -> str:
     """
     Build a Wireshark/tcpdump display filter string for this flow.
+    (No caller in the tscan_ng package uses it; kept for tooling.)
 
     The resulting filter can be used directly with tcpdump -r or as a
     Wireshark display filter to isolate this session in a full pcap
@@ -198,10 +210,13 @@ class Session:
         sport:      Source port of the flow initiator (ephemeral).
         dport:      Destination port of the flow target (well-known).
         session_id: Stable 8-char hex identifier for this flow.
-        client_buf: Reassembled byte stream from client to server.
-        server_buf: Reassembled byte stream from server to client.
+        client_buf: Concatenated payloads from client to server, in arrival
+                    order (not sequence-number reassembled).
+        server_buf: Concatenated payloads from server to client, in arrival
+                    order (not sequence-number reassembled).
         pending:    Credential findings awaiting response correlation.
-        last_seen:  Monotonic timestamp of the most recently processed packet.
+        last_seen:  Monotonic timestamp of the most recently processed packet
+                    (drives idle expiry and eviction order).
         created_at: Monotonic timestamp when the session was first created.
         ts_first:   Unix timestamp of the first packet seen (for findings).
         last_ts:    Unix timestamp of the most recently processed packet.
@@ -228,6 +243,7 @@ class Session:
     _server_trim_warned: bool = field(default=False, repr=False)
 
     def __post_init__(self):
+        """Derive session_id from the flow tuple and created_at (init=False field)."""
         self.session_id = _make_session_id(
             self.src, self.dst, self.sport, self.dport, self.created_at
         )
@@ -320,6 +336,14 @@ class Session:
 
         Returns:
             List of no_response finding dicts for any findings force-closed.
+            Age is measured in the caller's timestamp domain (packet wall
+            time, as passed by SessionTable.add_packet), and the closed
+            findings' ts_end is the session's last_ts.
+
+        Side effects:
+            Replaces self.pending with the still-pending subset. Does NOT
+            shift floors: the surviving findings' floors are unaffected,
+            since no buffer bytes are removed.
         """
         expired_findings = []
         still_pending = []
@@ -339,7 +363,8 @@ class Session:
             timeout: Maximum idle time in seconds before a session expires.
 
         Returns:
-            True if the session should be expired and cleaned up.
+            True if the session should be expired and cleaned up. Uses
+            last_seen (monotonic), so it is immune to wall-clock steps.
         """
         return (time.monotonic() - self.last_seen) > timeout
 
@@ -405,7 +430,10 @@ class SessionTable:
             dport: Destination port number.
 
         Returns:
-            A tuple suitable for use as a dict key.
+            A tuple suitable for use as a dict key: the two (ip, port)
+            endpoints ordered lexicographically, so both directions of a
+            flow yield the same key. The key carries no protocol, so a TCP
+            and a UDP flow between the same endpoints would share a session.
         """
         a, b = (src, sport), (dst, dport)
         if a > b:
@@ -427,6 +455,9 @@ class SessionTable:
 
         Args:
             pkt: Normalized packet dict from parsing.net.parse_basic.
+
+        Note the returned session is not touched (no last_seen update); the
+        caller (add_packet) does that via Session.add_packet.
 
         Returns:
             Tuple of (session, evicted_findings) — the Session object for
@@ -460,10 +491,14 @@ class SessionTable:
         new connection must always get a session even if that means giving
         up on one in-flight correlation.
 
+        Cost is O(n) in the number of sessions per eviction (a full scan),
+        paid on every new flow once the table is at capacity.
+
         Returns:
             List of no_response finding dicts for any pending findings the
             evicted session was holding (empty if it had none).
         """
+        # "idle" here means "no pending findings", not "inactive".
         idle = [(k, s) for k, s in self._sessions.items() if not s.pending]
         pool = idle if idle else list(self._sessions.items())
         key, victim = min(pool, key=lambda kv: kv[1].last_seen)
@@ -501,6 +536,9 @@ class SessionTable:
             pkt: Normalized packet dict from parsing.net.parse_basic.
             ts:  Unix timestamp of this packet.
 
+        Trimming runs after every packet, so only a freshly grown buffer is
+        ever trimmed; the client_buf cut keeps the newest max_buf bytes.
+
         Returns:
             Tuple of (session, closed_findings) — the updated Session object
             for this flow, and a list of no_response finding dicts for any
@@ -521,6 +559,9 @@ class SessionTable:
                 session._client_trim_warned = True
             del session.client_buf[:-self._max_buf]
 
+        # naive_cut: bytes over the cap. The real cut is limited to the
+        # lowest outstanding floor (bytes before it are the only ones no
+        # pending finding still needs).
         naive_cut = len(session.server_buf) - self._max_buf
         if naive_cut > 0:
             floor = min((p.server_buf_floor for p in session.pending),
@@ -545,6 +586,9 @@ class SessionTable:
         For any session with pending findings, emits a no_response finding
         for each so the output record is closed out rather than silently
         dropped.
+
+        Called periodically (pipeline._maybe_run_periodic). Idleness is
+        measured on the monotonic clock via Session.is_expired.
 
         Returns:
             List of no_response finding dicts for any expired pending findings.

@@ -28,6 +28,37 @@ Finding outcomes:
     failed      - Server responded with -ERR after PASS
     no_response - Session expired before a server response was seen
                   (emitted by SessionTable.expire())
+
+Credentials extracted:
+    The first USER argument and the first PASS argument that follows it,
+    joined as "user:password". Each is a single non-whitespace token, so a
+    password containing spaces is truncated at the first space. APOP and
+    AUTH (SASL) exchanges are not handled; only the USER/PASS pair.
+
+Response correlation (positional, not tagged -- POP3 has no command tags):
+    Server lines beginning "+OK" or "-ERR" are collected in order from
+    server_buf. The greeting banner is assumed to be the first one, the USER
+    reply the second and the PASS reply the third. Rules applied (identically
+    in run.py's _try_resolve()):
+      - any "-ERR" anywhere in server_buf resolves immediately as failed;
+      - otherwise, once three responses are present, the third decides;
+      - otherwise the finding is parked as pending.
+    This is an approximation: it assumes the capture saw the banner and that
+    no other +OK/-ERR replies (CAPA, STAT, a previous attempt's replies that
+    were not consumed, ...) precede the PASS reply.
+
+Known limitations:
+    - After a resolved attempt the consumed server_buf no longer contains a
+      banner, so a second USER/PASS attempt on the same connection needs three
+      fresh +OK lines and will normally stay pending (no_response) on success.
+    - A CAPA (or any other +OK-answered command) before login shifts the
+      "third response" to the USER reply.
+    - Commands are matched without requiring the terminating CRLF, so a line
+      split across TCP segments can produce a truncated user or password.
+    - Only the first 4 KB of client_buf is scanned; it is consumed only on a
+      match.
+    - 995 (POP3S) is normally TLS and yields nothing unless traffic on that
+      port is actually cleartext.
 """
 
 import logging
@@ -47,19 +78,24 @@ _POP3_PORTS: frozenset = frozenset({
 # Bounding the scan keeps per-packet work O(1) regardless of buffer lifetime.
 _MAX_CMD_SCAN = 4096
 
-# Matches POP3 USER command
+# Matches POP3 USER command at the start of any line (MULTILINE).
+#   Group 1: username token. \s+ can cross a line break ("USER\r\nPASS x").
 _POP3_USER_RE = re.compile(
     rb"^USER\s+(\S+)",
     re.IGNORECASE | re.MULTILINE
 )
 
-# Matches POP3 PASS command
+# Matches POP3 PASS command at the start of any line (MULTILINE).
+#   Group 1: password token (first whitespace-delimited word only).
 _POP3_PASS_RE = re.compile(
     rb"^PASS\s+(\S+)",
     re.IGNORECASE | re.MULTILINE
 )
 
-# Matches a POP3 server response line (+OK or -ERR)
+# Matches a POP3 server response line (+OK or -ERR) at the start of a line.
+# \b after the status keeps "+OKAY"-style junk from matching. Case-sensitive
+# (no IGNORECASE); RFC 1939 status indicators are upper case.
+#   Group 1: "+OK" or "-ERR".
 _POP3_RESPONSE_RE = re.compile(
     rb"^(\+OK|-ERR)\b",
     re.MULTILINE
@@ -75,7 +111,8 @@ def _outcome(status: bytes) -> str:
         status: b'+OK' or b'-ERR'.
 
     Returns:
-        One of: success, failed.
+        One of: success, failed. Anything that is not "+OK" (case-insensitive)
+        maps to failed.
     """
     if status.upper() == b"+OK":
         return "success"
@@ -92,7 +129,9 @@ def detect_stream(session, ts: float) -> list:
 
     Registers a pending finding if no server response is available yet,
     and consumes the matched commands from the client buffer to avoid
-    re-detection on subsequent packets.
+    re-detection on subsequent packets. On resolution, server_buf is consumed
+    up to the end of the deciding response line; unlike run.py's
+    _try_resolve(), this path does not call session.shift_pending_floors().
 
     The scan is bounded to _MAX_CMD_SCAN bytes per call to keep per-packet
     work O(1) regardless of buffer lifetime.
@@ -123,8 +162,9 @@ def detect_stream(session, ts: float) -> list:
     user   = user_match.group(1).decode("utf-8", "ignore")
     passwd = pass_match.group(1).decode("utf-8", "ignore")
 
-    # Guard against empty captures — emit nothing rather than a finding
-    # with blank credentials, which would be noise in the output.
+    # Defensive guard against empty captures. Both patterns capture (\S+),
+    # which cannot be empty, so this branch is currently unreachable; it stops
+    # a future regex change from emitting findings with blank credentials.
     if not user or not passwd:
         logging.debug(
             "pop3: session %s: USER or PASS matched but captured empty string",
@@ -158,7 +198,9 @@ def detect_stream(session, ts: float) -> list:
     # and can be resolved immediately.
     responses = list(_POP3_RESPONSE_RE.finditer(server_bytes))
 
-    # Find the first -ERR if any — it's an unambiguous authentication failure
+    # Find the first -ERR if any — treated as an unambiguous authentication
+    # failure. (It is not strictly unambiguous: an -ERR to CAPA/STAT etc. also
+    # matches. Kept identical to run.py._try_resolve.)
     err_response = next((r for r in responses if r.group(1).upper() == b"-ERR"), None)
     if err_response:
         code = err_response.group(1)

@@ -7,8 +7,17 @@ with safe defaults for every setting.
 
 Default config path: /opt/tscan/tscan_ng/config/tscan_ng.conf
 
-All sections and keys are optional — missing values fall back to defaults
-so the service can start with a minimal or empty config file.
+Nearly every section and key is optional — missing values fall back to
+defaults. The one exception is capture.iface, which has no usable default:
+Config() raises ValueError (see Config._validate) if it is unset or names
+an interface that does not exist, so a truly empty config file does not
+start. Values are re-read from the parsed file on every property access
+(nothing is cached); the file itself is parsed once, in Config.__init__.
+
+Legacy keys: dispatcher.socket and capture.no_immediate date from the
+retired capture.py -> run.py dispatcher design. pipeline.py does not use
+either; they are still parsed (and socket is still validated) but have no
+runtime effect.
 
 Config file format:
 
@@ -16,12 +25,12 @@ Config file format:
     iface               = eth1
     snaplen             = 65535
     buffer_bytes        = 268435456
-    no_immediate        = false
+    no_immediate        = false   (legacy, unused)
     bpf_filter          = tcp and (port 21 or port 25)
 
     [dispatcher]
     workers             = 4
-    socket              = /run/tscan/tscan.sock
+    socket              = /run/tscan/tscan.sock   (legacy, unused)
     out                 = /var/log/tscan/results.jsonl
 
     [sessions]
@@ -67,10 +76,17 @@ class Config:
     Typed configuration accessor for tscan_ng.
 
     Reads from an INI-style config file. All values have safe defaults
-    so the service starts correctly even with a minimal config.
+    except capture.iface, which must be set (see _validate).
 
     Args:
         path: Path to the config file. Defaults to /opt/tscan/tscan_ng/config/tscan_ng.conf.
+
+    Raises:
+        ValueError: From __init__, if validation fails (all problems are
+            reported together in one message). Individual property reads
+            can also raise ValueError if a value is not parseable as the
+            expected type (e.g. a non-integer timeout_seconds), and that
+            surfaces through _validate as well.
     """
 
     def __init__(self, path: str = DEFAULT_CONFIG_PATH):
@@ -78,10 +94,15 @@ class Config:
         Load configuration from the given path.
 
         Missing files or sections are silently ignored — all values
-        fall back to their defaults.
+        fall back to their defaults — but the result is then validated
+        (see _validate), which rejects a missing capture.iface and other
+        unusable values. The path is remembered only for __repr__.
 
         Args:
             path: Filesystem path to the INI config file.
+
+        Raises:
+            ValueError: If _validate finds any invalid setting.
         """
         self._cfg = configparser.ConfigParser()
         if os.path.exists(path):
@@ -99,7 +120,8 @@ class Config:
             fallback: Value to return if section/key is missing.
 
         Returns:
-            String value from config or fallback.
+            String value from config or fallback. Note the fallback is
+            returned as-is (it may be None), not coerced to str.
         """
         return self._cfg.get(section, key, fallback=fallback)
 
@@ -114,6 +136,10 @@ class Config:
 
         Returns:
             Integer value from config or fallback.
+
+        Raises:
+            ValueError: If the configured value is not a valid integer
+                (configparser.getint; floats such as "0.5" are rejected).
         """
         return self._cfg.getint(section, key, fallback=fallback)
 
@@ -130,6 +156,9 @@ class Config:
 
         Returns:
             Boolean value from config or fallback.
+
+        Raises:
+            ValueError: If the configured value is not a recognised boolean.
         """
         return self._cfg.getboolean(section, key, fallback=fallback)
 
@@ -138,8 +167,11 @@ class Config:
         Retrieve a frozenset of port numbers from a comma-separated config value.
 
         Each token is stripped of whitespace and parsed as an integer. Tokens
-        that are empty or non-numeric are silently skipped.  If the key is
-        absent the fallback frozenset is returned unchanged.
+        that are empty or non-numeric (including ranges like "80-90") are
+        silently skipped.  If the key is absent -- or present but yields no
+        valid ports at all (e.g. an empty value) -- the fallback frozenset
+        is returned, so a detector cannot be disabled by emptying its list.
+        Range checking (1-65535) is left to _validate.
 
         Args:
             section:  INI section name.
@@ -147,7 +179,8 @@ class Config:
             fallback: frozenset to return if the section/key is missing.
 
         Returns:
-            frozenset[int] of port numbers parsed from the config value.
+            frozenset[int] of port numbers parsed from the config value,
+            or the fallback.
         """
         raw = self._cfg.get(section, key, fallback=None)
         if raw is None:
@@ -170,7 +203,13 @@ class Config:
 
     @property
     def snaplen(self) -> int:
-        """Maximum bytes to capture per packet."""
+        """
+        Maximum bytes to capture per packet.
+
+        Used as the recv() size in pipeline.pipeline_worker (longer frames
+        are truncated in userspace) and as the snaplen the BPF filter is
+        compiled against; the kernel socket filter itself does not truncate.
+        """
         return self._getint("capture", "snaplen", fallback=65535)
 
     @property
@@ -188,8 +227,8 @@ class Config:
         live replay-load test: the worst single 30-second window saw
         ~63,000 kernel-level drops on one pipeline before this increase,
         and 256MB leaves headroom for roughly double that while keeping
-        worst-case total memory (all 4 sockets + typical session buffer
-        load) comfortably under MemoryHigh -- pushing right up against
+        worst-case total memory (all dispatcher.workers sockets + typical
+        session buffer load) comfortably under MemoryHigh -- pushing right up against
         MemoryHigh risks throttling/reclaim pressure that could itself slow
         packet processing and cause more drops, not fewer.
         """
@@ -197,13 +236,19 @@ class Config:
 
     @property
     def no_immediate(self) -> bool:
-        """If True, disable immediate mode and use 1ms timeout instead."""
+        """
+        Legacy libpcap immediate-mode toggle; parsed but unused.
+
+        Only the retired libpcap capture path read this. pipeline.py's raw
+        AF_PACKET sockets have no equivalent, so it has no runtime effect.
+        """
         return self._getbool("capture", "no_immediate", fallback=False)
 
     @property
     def bpf_filter(self) -> str | None:
         """
-        Explicit BPF filter override for pcap capture, or None if unset.
+        Explicit BPF filter override (attached to each pipeline's AF_PACKET
+        socket via SO_ATTACH_FILTER), or None if unset.
 
         None (key absent) means: auto-build a filter from every protocol
         detector's configured ports (see capture._build_port_filter), which
@@ -221,19 +266,27 @@ class Config:
 
     @property
     def workers(self) -> int:
-        """Number of worker processes to spawn."""
+        """
+        Number of pipeline processes to spawn (one per PACKET_FANOUT
+        member). Defaults to the CPU count.
+        """
         return self._getint("dispatcher", "workers",
                             fallback=max(1, os.cpu_count() or 1))
 
     @property
     def socket_path(self) -> str:
-        """Filesystem path for the Unix datagram socket."""
+        """
+        Legacy Unix datagram socket path (capture -> dispatcher design).
+
+        Unused by pipeline.py, but still validated in _validate (must be
+        set and absolute).
+        """
         return self._get("dispatcher", "socket",
                          fallback="/run/tscan/tscan.sock")
 
     @property
     def out_path(self) -> str:
-        """Output JSONL file path."""
+        """Output JSONL file path. Empty string means write to stdout."""
         return self._get("dispatcher", "out",
                          fallback="/var/log/tscan/results.jsonl")
 
@@ -248,13 +301,22 @@ class Config:
 
     @property
     def session_max_buf(self) -> int:
-        """Maximum bytes buffered per directional stream per session."""
+        """
+        Maximum bytes buffered per directional stream per session.
+
+        server_buf may temporarily exceed this while a pending finding holds
+        a trim floor (see session.SessionTable.add_packet).
+        """
         return self._getint("sessions", "max_buf_bytes",
                             fallback=4 * 1024 * 1024)
 
     @property
     def expiry_interval(self) -> float:
-        """How often (in seconds) each worker runs session expiry."""
+        """
+        Minimum seconds between periodic runs in each pipeline process
+        (session expiry plus the kernel packet-drop check; see
+        pipeline._maybe_run_periodic).
+        """
         return float(self._getint("sessions", "expiry_interval_sec",
                                   fallback=30))
 
@@ -446,7 +508,8 @@ class Config:
             errors.append("capture.iface must be set")
         else:
             # Validate against the kernel's interface list so misconfigured
-            # interface names fail at startup rather than at pcap_create().
+            # interface names fail at startup with a clear message rather
+            # than later at socket bind() in each pipeline process.
             try:
                 available = sorted(os.listdir("/sys/class/net"))
                 if self.iface not in available:
@@ -547,6 +610,7 @@ class Config:
                 "Invalid configuration:\n" + "\n".join(f"  - {e}" for e in errors))
 
     def __repr__(self) -> str:
+        """Summarise the main settings (not the webhook URL, which is a secret)."""
         return (
             f"Config(path={self._path!r}, "
             f"iface={self.iface!r}, "

@@ -1,3 +1,10 @@
+# Oneshot external health check for tscan-pipeline.service. Not enabled or
+# started directly: tscan-pipeline-healthcheck.timer triggers it every 2
+# minutes. Runs scripts/pipeline_healthcheck.py as the tscan user;
+# StateDirectory= creates /var/lib/tscan-healthcheck (owned by tscan,
+# persistent across reboots) for the up/down marker. Exit status 0 on every
+# normal path, 1 only if the script itself failed (see its module docstring).
+# Install: copy to /etc/systemd/system/ (scripts/update.sh does this).
 [Unit]
 Description=External health check for tscan-pipeline.service (Discord alert on down/recovered)
 Documentation=file:/opt/tscan/docs/REBUILD.md

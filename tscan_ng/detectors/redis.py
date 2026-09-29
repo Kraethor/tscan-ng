@@ -26,12 +26,29 @@ Server responses:
 Port handling:
     Gates on _REDIS_PORTS. Sessions on other ports are skipped immediately.
     6379 — standard Redis
-    6380 — common alternate / Redis Cluster bus
+    6380 — common alternate port (the cluster bus itself is 16379, not covered)
 
 Finding type: "redis_creds"
 Finding extras:
     "username" — ACL username if present (empty string for password-only AUTH).
     "creds"    — "username:password" or ":password" for display consistency.
+
+Response correlation:
+    Positional, no request ids: the first server_buf line that is exactly
+    "+OK" (success) or begins with "-" (failure) is taken as the AUTH reply.
+    Other replies to earlier commands (e.g. "+OK" to CLIENT SETNAME/SELECT, or
+    "-NOAUTH ..." to a command sent before AUTH) will be attributed to the
+    AUTH if they precede it in server_buf. Matching is repeated in run.py's
+    _try_resolve() for pending findings.
+
+Known limitations:
+    - "HELLO <ver> AUTH <user> <pass>" (the RESP3 handshake, whose reply is
+      not a simple +OK) is not recognised; only a top-level AUTH array or
+      inline AUTH command is.
+    - Only the first 4 KB of client_buf is scanned and it is consumed only on
+      an AUTH match, so an AUTH arriving after 4 KB of other commands on
+      the same connection is not seen.
+    - AUTH with an empty password is skipped. Redis over TLS is opaque.
 """
 
 import logging
@@ -41,7 +58,7 @@ from tscan_ng.session import _make_filter
 # Well-known cleartext Redis ports.
 _REDIS_PORTS: frozenset = frozenset({
     6379,  # Redis default (IANA assigned)
-    6380,  # Common alternate / Redis Cluster
+    6380,  # Common alternate Redis port
 })
 
 # Maximum bytes of the client buffer to scan per call.
@@ -50,15 +67,21 @@ _MAX_SCAN = 4096
 
 # Regex for inline AUTH commands (fallback for non-RESP clients).
 # Captures optional username and mandatory password.
+#   Group 1: first argument (the password, or the username if a second
+#            argument follows); Group 2: second argument (password) or None.
+# Requires a CRLF terminator. \s+ can also span a line break.
 _AUTH_INLINE_RE = re.compile(
     rb"^AUTH\s+(\S+)(?:\s+(\S+))?\r\n",
     re.IGNORECASE | re.MULTILINE,
 )
 
 # Server +OK response line.
+# NOTE: _OK_RE and _ERR_RE are not referenced anywhere in the package;
+# _find_auth_response() below does its own line-by-line scan instead.
 _OK_RE = re.compile(rb"^\+OK\b", re.MULTILINE)
 
 # Server error response line (any leading '-' response to AUTH).
+# (Unused -- see the note above _OK_RE.)
 _ERR_RE = re.compile(rb"^-\S+", re.MULTILINE)
 
 
@@ -69,6 +92,9 @@ def _parse_resp_array(data: bytes, offset: int):
     Reads the element count from the '*N\\r\\n' header, then parses each
     element as a bulk string '$N\\r\\n<data>\\r\\n'. The bulk string length
     prefix is used to correctly handle element data that contains \\r\\n.
+    Only bulk-string elements are accepted (other RESP types inside the
+    array make the parse fail). A negative bulk length (the RESP null string
+    "$-1") is not rejected and mis-advances the offset.
 
     Args:
         data:   Raw bytes buffer from the client stream.
@@ -77,7 +103,8 @@ def _parse_resp_array(data: bytes, offset: int):
     Returns:
         (elements, new_offset) where elements is a list of bytes objects and
         new_offset points past the last byte of the parsed array.
-        Returns (None, None) if the array is incomplete or malformed.
+        Returns (None, None) if the array is incomplete or malformed
+        (callers cannot distinguish "not yet fully received" from "invalid").
     """
     if offset >= len(data) or data[offset:offset + 1] != b'*':
         return None, None
@@ -122,7 +149,11 @@ def _find_auth_command(data: bytes):
     Scan *data* for the first Redis AUTH command in RESP or inline format.
 
     Tries RESP array format first at each position; falls back to the inline
-    regex for clients that use raw text commands.
+    regex for clients that use raw text commands. Walks the buffer one byte
+    at a time (bounded by _MAX_SCAN), so an AUTH does not have to be the first
+    command; complete non-AUTH RESP arrays are skipped over whole. An AUTH
+    array with an element count other than 2 or 3 is skipped as a non-match.
+    Text is decoded with errors="replace" (other detectors use "ignore").
 
     Args:
         data: Raw bytes from the client stream buffer (bounded to _MAX_SCAN).
@@ -181,6 +212,9 @@ def _find_auth_response(data: bytes):
     Looks for '+OK' (success) or any '-<error>' line (failure).  The first
     response found is returned, as it corresponds to the earliest unconsumed
     AUTH command after detect_stream has consumed matched client data.
+    Lines are split on CRLF only; other reply types ('+PONG', ':1', bulk
+    replies) are skipped line by line. Also imported by run.py's
+    _try_resolve().
 
     Args:
         data: Raw bytes from the server stream buffer.
@@ -231,6 +265,9 @@ def detect_stream(session, ts: float) -> list:
     and correlates it with the server response in session.server_buf.  Both
     buffers are consumed up to the end of the matched exchange on resolution
     to prevent re-detection on subsequent AUTH commands in the same connection.
+    The client command is consumed even when the response is not yet known (a
+    pending finding is registered instead); the server line is consumed
+    without a session.shift_pending_floors() call (run.py's path does call it).
 
     The scan is bounded to _MAX_SCAN bytes per call to keep per-packet CPU
     cost O(1) regardless of buffer depth.
@@ -255,13 +292,16 @@ def detect_stream(session, ts: float) -> list:
         return []
 
     if not password:
-        # AUTH with an empty password is unusual; skip to avoid noise.
+        # AUTH with an empty password is unusual; skip to avoid noise. The
+        # command is consumed so it is not re-examined on the next packet.
         logging.debug(
             "redis: session %s: AUTH command with empty password — skipping",
             session.session_id)
         del session.client_buf[:cmd_end]
         return []
 
+    # Password-only AUTH (Redis < 6, or the default user) has no username, so
+    # the leading ":" keeps the "user:password" shape sinks split on.
     creds_str = f"{username}:{password}" if username else f":{password}"
 
     base = {

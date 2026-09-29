@@ -86,6 +86,24 @@ Finding extras:
                  concept), so DiscordSink's creds.split(":", 1)[0] just
                  yields the whole community string, which is exactly the
                  credential worth showing.
+    "status"   — the Response-PDU's error-status integer, stringified.
+
+Direction: the flow's client/server orientation comes from session.py's
+_normalize_direction(), which only knows the TCP server ports in
+session._SERVER_PORTS (161 is not among them). A flow is therefore oriented
+by whichever datagram was seen first: if that is a Response from port 161
+(e.g. capture started mid-exchange), the session's client/server roles are
+inverted for its lifetime and requests will land in server_buf, where this
+module does not look.
+
+Known limitations:
+    - Requests are matched to responses by request-id only (not by source
+      address or community), and only within one 4-tuple session, so a poller
+      that reuses one source port sends many requests down one session.
+    - Only the first 2 KB of client_buf is scanned; client_buf is consumed
+      only when a request with a non-empty community is matched (or an empty
+      one is discarded), so unmatched datagrams accumulate at the front.
+    - A datagram whose community is empty is dropped silently (no log).
 """
 
 from tscan_ng.session import _make_filter
@@ -98,6 +116,9 @@ _SNMP_PORTS: frozenset = frozenset({161})
 # headroom while still bounding worst-case scan cost.
 _MAX_SCAN = 2048
 
+# BER tag bytes. A PDU tag is Context-specific, constructed (0xA0 | n), where
+# n is the PDU type from RFC 1157 / RFC 3416 (n=4, the v1 Trap, is 0xA4 and
+# is ignored, as is n=6 InformRequest / n=7 SNMPv2-Trap).
 _TAG_INTEGER = 0x02
 _TAG_OCTET = 0x04
 _TAG_SEQUENCE = 0x30
@@ -108,6 +129,7 @@ _PDU_GET_RESPONSE = 0xA2
 _PDU_SET_REQUEST = 0xA3
 _PDU_GET_BULK_REQUEST = 0xA5
 
+# Request PDU tag -> name recorded in the "pdu_type" field.
 _REQUEST_PDU_NAMES = {
     _PDU_GET_REQUEST: "GetRequest",
     _PDU_GET_NEXT_REQUEST: "GetNextRequest",
@@ -115,6 +137,9 @@ _REQUEST_PDU_NAMES = {
     _PDU_GET_BULK_REQUEST: "GetBulkRequest",
 }
 
+# Wire value of the message's version INTEGER -> label. (SNMPv3 is 3 and has a
+# different message structure; it would not parse as the SEQUENCE layout used
+# here and would be reported by its raw number only if it did.)
 _VERSION_NAMES = {0: "v1", 1: "v2c"}
 
 
@@ -199,6 +224,11 @@ def _find_snmp_request(data: bytes):
     Scan *data* for the first complete SNMP message carrying a request PDU
     (GetRequest, GetNextRequest, SetRequest, or GetBulkRequest).
 
+    Locates a message by finding a SEQUENCE tag (0x30) and parsing
+    version / community / PDU outward from there. Non-request messages
+    (Responses, Traps) are skipped by their full length; structural
+    mismatches advance one byte. An incomplete message stops the scan.
+
     Args:
         data: Raw bytes from the client stream buffer (bounded to
               _MAX_SCAN by the caller).
@@ -229,6 +259,7 @@ def _find_snmp_request(data: bytes):
             i += 1
             continue
 
+        # The PDU is the third element of the message; its tag selects the type.
         pdu_tag, pdu_val, _pdu_end = _parse_ber_tlv(msg_value, off)
         pdu_name = _REQUEST_PDU_NAMES.get(pdu_tag)
         if pdu_name is None:
@@ -236,6 +267,7 @@ def _find_snmp_request(data: bytes):
             i = msg_end
             continue
 
+        # First field of every PDU body is request-id INTEGER.
         rid_tag, rid_val, _ = _parse_ber_tlv(pdu_val, 0)
         if rid_tag != _TAG_INTEGER:
             i += 1
@@ -253,9 +285,14 @@ def _find_snmp_response(data: bytes, request_id: int):
     """
     Scan *data* for a Response-PDU (GetResponse) matching *request_id*.
 
+    Same scanning approach as _find_snmp_request(). Responses with a different
+    request-id are skipped by their full length (and not consumed). Also
+    imported by run.py's _try_resolve().
+
     Args:
         data:       Raw bytes from the server stream buffer.
-        request_id: The request-id to match against.
+        request_id: The request-id to match against (the SNMP request-id
+                    INTEGER, which may be negative).
 
     Returns:
         (error_status, end_offset) if a matching response is found, where
@@ -297,6 +334,7 @@ def _find_snmp_response(data: bytes, request_id: int):
             i = msg_end
             continue
 
+        # Second field is error-status INTEGER (poff is now just past request-id).
         err_tag, err_val, _ = _parse_ber_tlv(pdu_val, poff)
         if err_tag != _TAG_INTEGER:
             i = msg_end
@@ -335,7 +373,10 @@ def detect_stream(session, ts: float) -> list:
     Scans session.client_buf for a request PDU and correlates it with a
     Response-PDU (matched by request-id) in session.server_buf. Both
     buffers are consumed up to the end of the matched message on
-    resolution to prevent re-detection.
+    resolution to prevent re-detection. The client request is consumed even
+    when no response has arrived yet (a pending finding carrying the private
+    "_request_id" is registered instead); the server response is deleted
+    without a session.shift_pending_floors() call (run.py's path does call it).
 
     Args:
         session: Session object from session.SessionTable.
@@ -355,7 +396,8 @@ def detect_stream(session, ts: float) -> list:
         return []
 
     if not community:
-        # Empty community string -- no exploitable credential.
+        # Empty community string -- no exploitable credential. Consumed so it
+        # is not re-parsed on every packet.
         del session.client_buf[:req_end]
         return []
 

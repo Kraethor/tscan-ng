@@ -1,3 +1,6 @@
+# Fires tscan-pipeline-healthcheck.service 2 minutes after boot and then every
+# 2 minutes after the service was last activated (OnUnitActiveSec). Enable with: systemctl enable --now
+# tscan-pipeline-healthcheck.timer (scripts/update.sh does this).
 [Unit]
 Description=Periodic trigger for tscan-pipeline-healthcheck.service
 

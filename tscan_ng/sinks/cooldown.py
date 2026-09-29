@@ -36,6 +36,10 @@ def claim_slot(marker_path: str, cooldown_sec: float) -> bool:
     brand new marker's mtime is "now", which is indistinguishable from "an
     alert was just sent" and would wrongly deny the very first claim.
 
+    Marker files are created on demand and never removed by this module;
+    the caller owns cleanup (in practice /run/tscan is tmpfs, cleared at
+    reboot or service restart).
+
     Fails open (returns True) if the marker file can't be opened at all --
     a missing/unwritable state directory should never be the reason a real
     alert silently never gets sent, or a real finding silently never gets
@@ -48,6 +52,10 @@ def claim_slot(marker_path: str, cooldown_sec: float) -> bool:
     Returns:
         True if this call claimed the slot and the caller should act; False
         if still within another call's cooldown window.
+
+    Raises:
+        OSError: If flock/ftruncate/write fail after a successful open
+            (only the open itself fails open). The fd is always closed.
     """
     try:
         fd = os.open(marker_path, os.O_CREAT | os.O_RDWR, 0o644)

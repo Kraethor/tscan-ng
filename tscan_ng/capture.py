@@ -21,14 +21,18 @@ superseded it, and the standalone capture code was removed as dead weight
 once nothing still ran it -- see git history if it's ever needed for
 reference.
 
-Configuration is loaded from /opt/tscan/tscan_ng/config/tscan_ng.conf at
-startup. See tscan_ng/config.py for all available settings and their
-defaults.
+This module loads no configuration itself; it only receives a Config
+(see tscan_ng/config.py) as an argument to _build_port_filter(). Importing
+it raises RuntimeError if libpcap cannot be found. Many of the bindings
+below (pcap_create, pcap_activate, pcap_next_ex, ...) are leftovers from
+the removed live-capture code and are no longer called by anything.
 """
 
 import ctypes, ctypes.util
 from tscan_ng.config import Config
 
+# Size of the error buffer libpcap functions expect (PCAP_ERRBUF_SIZE in
+# pcap.h). Not referenced by the bindings still in use.
 PCAP_ERRBUF_SIZE = 256
 
 libpcap_path = ctypes.util.find_library('pcap')
@@ -36,6 +40,7 @@ if not libpcap_path:
     raise RuntimeError("libpcap not found")
 pcap = ctypes.CDLL(libpcap_path)
 
+# Opaque handle type for a C `pcap_t *`; never dereferenced from Python.
 pcap_t = ctypes.c_void_p
 
 
@@ -68,7 +73,9 @@ class bpf_program(ctypes.Structure):
 PCAP_NETMASK_UNKNOWN = 0xffffffff
 
 
-# libpcap function bindings
+# libpcap function bindings (argtypes/restype declarations; without them
+# ctypes would default every argument and return to a C int, which truncates
+# 64-bit pointers).
 pcap_create = pcap.pcap_create
 pcap_create.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
 pcap_create.restype = pcap_t
@@ -129,6 +136,8 @@ pcap_setfilter.restype = ctypes.c_int
 pcap_freecode = pcap.pcap_freecode
 pcap_freecode.argtypes = [ctypes.POINTER(bpf_program)]
 
+# pcap_set_immediate_mode only exists in libpcap >= 1.5; bind it to None on
+# older libraries so callers can feature-test instead of crashing at import.
 try:
     pcap_set_immediate_mode = pcap.pcap_set_immediate_mode
     pcap_set_immediate_mode.argtypes = [pcap_t, ctypes.c_int]
@@ -137,7 +146,16 @@ except AttributeError:
 
 
 def _err(pc):
-    """Return a human-readable error string from a pcap handle."""
+    """
+    Return the last error message recorded on a pcap handle.
+
+    Args:
+        pc: A pcap_t handle (e.g. the dead handle from pcap_open_dead).
+
+    Returns:
+        The message decoded as UTF-8 (undecodable bytes replaced), or
+        "unknown" if libpcap has no message.
+    """
     return (pcap_geterr(pc) or b"unknown").decode("utf-8", "replace")
 
 
@@ -147,7 +165,7 @@ def _build_port_filter(cfg: Config) -> str:
     protocol detector actually looks at.
 
     Without this, capture forwards 100% of traffic on the interface to the
-    dispatcher for full parsing, even on a SPAN/mirror port carrying mostly
+    pipeline for full parsing, even on a SPAN/mirror port carrying mostly
     irrelevant traffic (bulk HTTPS, video, etc.) that no detector will ever
     match. Filtering at the pcap/kernel layer means that traffic never
     reaches userspace at all, rather than being parsed and then discarded.
@@ -156,7 +174,10 @@ def _build_port_filter(cfg: Config) -> str:
     virtually always deployed over UDP in practice) -- so cfg.snmp_ports
     feeds a separate "udp and (...)" clause rather than joining the TCP
     port union. If snmp_ports is somehow empty, the udp clause is omitted
-    entirely rather than emitting an invalid empty "udp and ()".
+    entirely rather than emitting an invalid empty "udp and ()" (defensive:
+    Config._getports falls back to defaults on an empty list, so this is
+    not normally reachable). The TCP clause has no such guard, but the
+    same fallback guarantees it is non-empty.
 
     Args:
         cfg: Loaded Config object.

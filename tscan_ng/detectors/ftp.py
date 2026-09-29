@@ -31,6 +31,32 @@ Finding outcomes:
     server_error - Server responded with 421 Service unavailable
     no_response  - Session expired before a server response was seen
                    (emitted by SessionTable.expire())
+
+Credentials extracted:
+    The first USER argument and the first PASS argument that follows it in
+    client_buf, joined as "user:password". Each is a single whitespace-free
+    non-whitespace token, so a password containing spaces is truncated at the first
+    space. Anonymous logins (user "anonymous", any case) are typed
+    "ftp_anonymous"; the "password" is then conventionally an e-mail address.
+
+Response correlation:
+    Server replies are matched by code only, not by position: the first
+    line in server_buf starting with "230 ", "530 " or "421 " is taken as the
+    answer to the PASS. Lines are not consumed unless they are matched, so an
+    earlier unrelated 530/421 (e.g. 530 "Please login with USER and PASS" sent
+    for a pre-login command) will be attributed to the next credential.
+    The same matching is repeated in run.py's _try_resolve() for findings
+    that were parked as pending.
+
+Known limitations:
+    - USER/PASS lines are matched without requiring the terminating CRLF, so a
+      command split across TCP segments can yield a truncated password.
+    - Only the first 4 KB of client_buf is scanned and the buffer is only
+      consumed on a match, so a USER/PASS that starts beyond 4 KB of earlier
+      unmatched client bytes is not seen.
+    - FTPS/AUTH TLS sessions are encrypted after the AUTH TLS exchange and
+      produce no findings; FTP data connections (passive/active ports) are
+      never inspected.
 """
 
 import logging
@@ -50,21 +76,27 @@ _FTP_PORTS: frozenset = frozenset({
 # Bounding the scan keeps per-packet work O(1) regardless of buffer lifetime.
 _MAX_CMD_SCAN = 4096
 
-# Matches FTP USER command
+# Matches FTP USER command at the start of any line (MULTILINE).
+#   Group 1: the username token. \s+ is used between verb and argument, so it
+#   can cross a line break ("USER\r\nPASS x" would capture "PASS" as the user).
 _FTP_USER_RE = re.compile(
     rb"^USER\s+(\S+)",
     re.IGNORECASE | re.MULTILINE
 )
 
-# Matches FTP PASS command
+# Matches FTP PASS command at the start of any line (MULTILINE).
+#   Group 1: the password token (first whitespace-delimited word only).
 _FTP_PASS_RE = re.compile(
     rb"^PASS\s+(\S+)",
     re.IGNORECASE | re.MULTILINE
 )
 
 # Matches FTP server response codes we care about.
+#   230 = User logged in, 530 = Not logged in / login incorrect,
+#   421 = Service not available (connection closing).
 # Only matches terminating response lines (space after code, not hyphen).
 # Multi-line responses use 230- for continuation and 230 for termination.
+#   Group 1: the 3-digit code.
 _FTP_RESPONSE_RE = re.compile(
     rb"^(230|530|421) ",
     re.MULTILINE
@@ -79,7 +111,9 @@ def _outcome(code: bytes) -> str:
         code: FTP 3-digit response code bytes.
 
     Returns:
-        One of: success, failed, server_error, unknown.
+        One of: success, failed, server_error, unknown. In practice "unknown"
+        is unreachable from this module, because _FTP_RESPONSE_RE only ever
+        yields 230, 530 or 421; it is kept as a safe default.
     """
     if code == b"230":
         return "success"
@@ -104,7 +138,10 @@ def detect_stream(session, ts: float) -> list:
 
     Registers a pending finding if no server response is available yet,
     and consumes the matched commands from the client buffer to avoid
-    re-detection on subsequent packets.
+    re-detection on subsequent packets. When a response is already present it
+    is also consumed from server_buf (up to and including the matched line).
+    Unlike run.py's _try_resolve(), this immediate-resolve path does not call
+    session.shift_pending_floors() after deleting from server_buf.
 
     The scan is bounded to _MAX_CMD_SCAN bytes so that a large client
     buffer does not cause O(n) work on every arriving packet.
@@ -129,7 +166,8 @@ def detect_stream(session, ts: float) -> list:
     if not user_match:
         return []
 
-    # Search for PASS only within the remaining scan window after USER.
+    # Search for PASS only within the remaining scan window after USER, so a
+    # PASS that precedes the USER (stale/out-of-order data) is never paired.
     # user_match.end() is always within client_bytes, so this is safe.
     pass_match = _FTP_PASS_RE.search(client_bytes, user_match.end())
     if not pass_match:
@@ -138,9 +176,10 @@ def detect_stream(session, ts: float) -> list:
     user   = user_match.group(1).decode("utf-8", "ignore")
     passwd = pass_match.group(1).decode("utf-8", "ignore")
 
-    # Guard against empty captures — regex group(1) can theoretically match
-    # an empty string if the pattern allows it. Emit nothing rather than a
-    # finding with blank credentials, which would be noise in the output.
+    # Defensive guard against empty captures. Both patterns capture (\S+), which
+    # cannot be empty, so this branch is currently unreachable; it is kept so a
+    # future loosening of the regexes cannot produce findings with blank
+    # credentials, which would be noise in the output.
     if not user or not passwd:
         logging.debug(
             "ftp: session %s: USER or PASS matched but captured empty string",

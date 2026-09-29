@@ -19,6 +19,7 @@ import logging
 import socket
 import dpkt
 
+# libpcap datalink (link-layer header) type numbers, from pcap/dlt.h.
 DLT_EN10MB    = 1    # Standard Ethernet
 DLT_RAW       = 12   # Raw IP
 DLT_LINUX_SLL = 113  # Linux cooked capture
@@ -63,16 +64,20 @@ def parse_basic(l2type: int, data: bytes) -> dict | None:
     All expected non-TCP/UDP cases are handled with explicit return None
     before the except block.  Any exception that reaches the except clause
     therefore indicates a genuinely malformed packet and is logged at DEBUG
-    level.  In production (INFO level), this has no overhead.
+    level.  Note pipeline.pipeline_worker() configures the root logger at
+    DEBUG, so in the deployed service each malformed packet does produce a
+    logged traceback.
 
     Args:
         l2type: libpcap datalink type (e.g. DLT_EN10MB, DLT_RAW,
                 DLT_LINUX_SLL).
-        data:   Raw packet bytes as captured by libpcap.
+        data:   Raw packet bytes as captured (pipeline.py passes frames from
+                its AF_PACKET socket with l2type=DLT_EN10MB).
 
     Returns:
         A dict with keys: src, dst, tcp, udp, sport, dport, payload.
         Returns None if the packet is not parseable or not of interest.
+        Never raises; all exceptions are caught and logged at DEBUG.
     """
     try:
         if l2type == DLT_EN10MB:
@@ -109,6 +114,7 @@ def parse_basic(l2type: int, data: bytes) -> dict | None:
             "udp":     isinstance(l4, dpkt.udp.UDP),
             "sport":   l4.sport,
             "dport":   l4.dport,
+            # Normalise to bytes; empty for payload-less segments (bare ACKs).
             "payload": bytes(l4.data) if l4.data else b"",
         }
 

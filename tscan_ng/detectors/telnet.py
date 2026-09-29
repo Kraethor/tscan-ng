@@ -38,6 +38,29 @@ Finding outcomes:
     failed       - Server showed "Login incorrect" or equivalent
     no_response  - Session expired before outcome could be determined
                    (emitted by SessionTable.expire())
+
+Outcome determination is heuristic (text matching, no protocol status code):
+    _outcome() searches the ENTIRE server_buf, failure patterns first, for
+    login-failure text or success text ("Last login", "Welcome to", or a line
+    ending in a $ # > prompt character). Consequences worth knowing:
+      - The search is not limited to output after the password was sent, and
+        server_buf is never consumed by this module or by run.py's
+        _try_resolve(). A "Welcome to ..." banner that precedes the login
+        prompt therefore yields "success" immediately, and once any failure
+        text has appeared it wins over every later success.
+      - Success/failure text that never appears leaves the finding pending
+        until it expires as no_response.
+
+Known limitations:
+    - Only the first two non-empty client lines are used, and only the first
+      4 KB of each buffer is examined for the prompts, so a long banner can
+      hide the prompts. Backspace/DEL editing is not interpreted, so a mistyped
+      and corrected character sequence is reported literally.
+    - Server-side echo is ignored (only client_buf is parsed) and the server
+      stream is not IAC-stripped before the regexes run.
+    - Only one credential pair is extracted per call; a retry after a
+      failed login is picked up by later calls only because the previous
+      window was consumed.
 """
 
 import re
@@ -68,7 +91,8 @@ _SE   = 0xF0  # Subnegotiation end
 
 # ── Server-side patterns ──────────────────────────────────────────────────────
 
-# Matches common login prompts sent by the server.
+# Matches common login prompts sent by the server ("login:", "Username:",
+# "Last login:" also matches, being a substring hit on "login" + ":").
 # Must appear in server_buf before we attempt credential extraction.
 _LOGIN_PROMPT_RE = re.compile(
     rb'(?:login|username)\s*:\s*',
@@ -76,7 +100,9 @@ _LOGIN_PROMPT_RE = re.compile(
 )
 
 # Matches password prompts sent by the server.
-# Must appear in server_buf after the login prompt.
+# Must appear in server_buf (detect_stream only checks that it is present
+# somewhere in the first _MAX_CMD_SCAN bytes; it does NOT verify the ordering
+# relative to the login prompt). IGNORECASE makes the [Pp] class redundant.
 _PASS_PROMPT_RE = re.compile(
     rb'[Pp]assword\s*:\s*',
     re.IGNORECASE,
@@ -84,6 +110,8 @@ _PASS_PROMPT_RE = re.compile(
 
 # Matches common success indicators in the server stream after authentication.
 # Shell prompts ($, #, >) and "Last login:" are reliable success signals.
+# Note "Welcome to" is weaker: many devices print it in the pre-login banner,
+# and this regex is run over the whole server buffer (see _outcome).
 _SUCCESS_RE = re.compile(
     rb'(?:'
     rb'Last\s+login'           # Linux/Unix last-login line
@@ -93,7 +121,8 @@ _SUCCESS_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Matches common failure indicators in the server stream.
+# Matches common failure indicators in the server stream. Checked before
+# _SUCCESS_RE in _outcome(), so a failure message anywhere in the buffer wins.
 _FAIL_RE = re.compile(
     rb'(?:'
     rb'Login\s+incorrect'      # Linux PAM / getty
@@ -118,6 +147,14 @@ def _strip_iac(data: bytes) -> bytes:
       - Subnegotiation:   IAC SB ... IAC SE
       - 2-byte sequences: IAC <other-cmd>
 
+    Edge cases: an escaped literal 0xFF (IAC IAC) is treated as an ordinary
+    2-byte command and dropped rather than emitted as one 0xFF data byte. An
+    IAC as the very last byte, or an IAC SB with no terminating IAC SE in the
+    data, is truncated/incomplete: the trailing partial sequence is discarded
+    (in the unterminated-SB case the buffer's final byte is then re-read as
+    ordinary data). Because callers strip a whole window at a time, an IAC
+    sequence split across two segments can leave its tail bytes in the text.
+
     Non-IAC bytes are passed through unchanged so that the resulting
     byte string contains only application-layer data (typed text).
 
@@ -137,6 +174,9 @@ def _strip_iac(data: bytes) -> bytes:
             continue
 
         # IAC sequence — determine length and skip.
+        # (RFC 854: option negotiation is IAC + verb + option-code; IAC SB
+        # starts a variable-length subnegotiation closed by IAC SE; every
+        # other command such as NOP/GA/AYT is IAC + one byte.)
         if i + 1 >= len(data):
             # Incomplete IAC at end of buffer — discard and stop.
             break
@@ -167,8 +207,10 @@ def _extract_lines(data: bytes) -> list:
     """
     Split IAC-stripped Telnet data into non-empty lines.
 
-    Handles both standard Telnet line endings (\r\n) and NVT binary-mode
-    endings (\r\0). Empty lines and whitespace-only lines are discarded.
+    Handles both standard Telnet line endings (CR LF) and NVT binary-mode
+    endings (CR NUL). Empty lines and whitespace-only lines are discarded.
+    A bare CR (or LF) on its own is not special: a lone LF still splits a line,
+    a lone CR does not.
 
     Args:
         data: IAC-stripped bytes from the client stream.
@@ -191,6 +233,11 @@ def _outcome(server_buf: bytearray) -> str | None:
     Returns None if neither has appeared yet — the caller should
     register a pending finding and retry on the next packet.
 
+    The whole of server_buf is searched (unbounded, on every call), failure
+    patterns first; nothing is consumed, so old prompts/banners/failures
+    persist and influence later results on the same connection. Also imported
+    by run.py's _try_resolve() for pending findings.
+
     Args:
         server_buf: Reassembled server-direction byte stream.
 
@@ -212,12 +259,15 @@ def detect_stream(session, ts: float) -> list:
     Stream-aware Telnet credential detector.
 
     Waits until the server has sent both a login prompt and a password
-    prompt, then extracts the first two non-empty lines from the
-    (IAC-stripped) client buffer as username and password.
+    prompt (both within the first _MAX_CMD_SCAN bytes of server_buf, in either
+    order), then extracts the first two non-empty lines from the
+    (IAC-stripped) client buffer as username and password. Sessions where
+    either buffer is empty are skipped.
 
     Emits a finding immediately if an outcome is already visible in the
     server buffer, or registers a pending finding for later resolution
     when the outcome arrives. Consumes the inspected portion of client_buf
+    (the whole scanned window, including anything typed after the password)
     to prevent re-detection on subsequent packets.
 
     Args:
@@ -258,6 +308,8 @@ def detect_stream(session, ts: float) -> list:
     user   = lines[0].decode("utf-8", "ignore")
     passwd = lines[1].decode("utf-8", "ignore")
 
+    # Defensive: _extract_lines() drops empty lines, so both values are
+    # normally non-empty; this only fires if a line decodes to nothing.
     if not user or not passwd:
         logging.debug(
             "telnet: session %s: credential lines present but decoded empty",
@@ -281,6 +333,7 @@ def detect_stream(session, ts: float) -> list:
                                    session.sport, session.dport),
     }
 
+    # "status" mirrors "outcome" (there is no protocol status code to report).
     result = _outcome(session.server_buf)
     if result:
         return [{

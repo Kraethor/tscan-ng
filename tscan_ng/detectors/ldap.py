@@ -28,6 +28,33 @@ Finding type: "ldap_creds"
 Finding extras:
     "dn" — raw Distinguished Name string from the BindRequest name field.
     "creds" — formatted as "dn:password" for display consistency.
+    "status" — the numeric resultCode, stringified.
+
+BER framing (all of LDAP is BER, X.690): every element is Tag, Length, Value.
+Length is one byte if < 128, otherwise 0x80|n followed by n big-endian length
+bytes. Both directions are located by scanning for a SEQUENCE tag (0x30) and
+parsing outward from there rather than by tracking message boundaries.
+
+Response correlation:
+    Not keyed on messageID. The FIRST BindResponse found anywhere in
+    server_buf is taken as the answer to the BindRequest just captured. Binds
+    that this module skips (anonymous, unauthenticated, SASL) still produce a
+    BindResponse that is not consumed, so it can be paired with a later simple
+    bind. SASL multi-step binds answer with resultCode 14
+    (saslBindInProgress), which maps to "server_error".
+
+Known limitations:
+    - Only the first 8 KB of client_buf is scanned. Non-bind messages
+      (searches etc.) are skipped over but never consumed, so a simple bind
+      that starts after 8 KB of other LDAP traffic on the same connection is
+      not seen.
+    - A message whose declared length exceeds the scan window (or is bogus)
+      stops the scan for that call, since it is indistinguishable from a
+      message still being received.
+    - resultCode is read from a single byte, so values above 127 (two-byte
+      ENUMERATED) would be misread; standard codes are all below 128.
+    - Text is decoded with errors="replace" (most other detectors use
+      "ignore").
 """
 
 import logging
@@ -44,7 +71,10 @@ _LDAP_PORTS: frozenset = frozenset({
 # LDAP BindRequests are modest in size; 8 KB covers any realistic auth exchange.
 _MAX_SCAN = 8192
 
-# BER/ASN.1 tag constants used in LDAPMessage (RFC 4511).
+# BER/ASN.1 tag constants used in LDAPMessage (RFC 4511). A tag byte is
+# class (top 2 bits) | constructed flag (0x20) | tag number (low 5 bits), so
+# e.g. 0x60 = Application class, constructed, number 0; 0x80 = context-specific
+# class, primitive, number 0.
 _TAG_INTEGER  = 0x02   # Universal primitive: INTEGER
 _TAG_ENUM     = 0x0A   # Universal primitive: ENUMERATED (resultCode)
 _TAG_OCTET    = 0x04   # Universal primitive: OCTET STRING (DN, password)
@@ -61,7 +91,8 @@ def _parse_ber_len(data: bytes, offset: int):
     Supports short form (single byte, high bit clear) and definite long form
     (high bit set; low 7 bits give the count of subsequent length bytes).
     Indefinite form (first byte == 0x80) is not used by LDAP and is treated
-    as an error.
+    as an error. More than 4 length bytes (lengths above 4 GiB) is also
+    treated as an error.
 
     Args:
         data:   Raw bytes buffer containing the BER stream.
@@ -79,6 +110,7 @@ def _parse_ber_len(data: bytes, offset: int):
     if first & 0x80 == 0:
         # Short form: the byte itself is the length.
         return first, offset
+    # Long form: low 7 bits = number of length bytes that follow.
     num_bytes = first & 0x7F
     if num_bytes == 0 or num_bytes > 4 or offset + num_bytes > len(data):
         # Indefinite form (num_bytes==0), oversized, or truncated.
@@ -105,7 +137,8 @@ def _parse_ber_tlv(data: bytes, offset: int):
         (tag, value_bytes, new_offset) on success, where value_bytes is a
         bytes slice of the TLV value field and new_offset points past the end
         of this TLV.  Returns (None, None, None) on any error or if the data
-        is truncated (value extends beyond available bytes).
+        is truncated (value extends beyond available bytes). Malformed and
+        merely-incomplete input are indistinguishable to the caller.
     """
     if offset >= len(data):
         return None, None, None
@@ -138,9 +171,15 @@ def _find_bind_request(data: bytes):
             }
         }
 
-    SASL binds carry a different authentication tag and are skipped silently.
-    Anonymous binds (both name and password empty) are also skipped since
-    they carry no exploitable credentials.
+    SASL binds carry a different authentication tag ([3]) and are skipped
+    silently. Anonymous binds (both name and password empty) are also skipped
+    since they carry no exploitable credentials. A non-empty DN with an empty
+    password is returned (the caller discards it as an unauthenticated bind).
+
+    Skipped messages advance the scan by their full length (i = msg_end);
+    structural mismatches advance one byte so a false 0x30 in the middle of
+    other data does not hide a real message. No bytes are consumed from the
+    buffer here; the caller deletes up to end_offset only on a match.
 
     Args:
         data: Raw bytes from the client stream buffer (bounded to _MAX_SCAN).
@@ -152,7 +191,7 @@ def _find_bind_request(data: bytes):
     """
     i = 0
     while i < len(data):
-        # LDAPMessage always starts with a SEQUENCE tag.
+        # LDAPMessage always starts with a SEQUENCE tag (0x30).
         if data[i] != _TAG_SEQUENCE:
             i += 1
             continue
@@ -162,7 +201,9 @@ def _find_bind_request(data: bytes):
             # Data is truncated — wait for more bytes.
             break
 
-        # Parse the first field: messageID INTEGER.
+        # Parse the first field: messageID INTEGER. (Offsets from here on are
+        # relative to msg_value / req_value, not to the whole buffer; the
+        # value itself is not needed and is ignored.)
         off = 0
         id_tag, _id_val, off = _parse_ber_tlv(msg_value, off)
         if id_tag != _TAG_INTEGER:
@@ -225,6 +266,11 @@ def _find_bind_response(data: bytes):
             }
         }
 
+    The messageID is parsed but NOT compared with the request's; the first
+    BindResponse in the buffer wins. Also imported by run.py's
+    _try_resolve(). The result code is taken from the first byte of the
+    ENUMERATED value only.
+
     Args:
         data: Raw bytes from the server stream buffer.
 
@@ -257,7 +303,8 @@ def _find_bind_response(data: bytes):
             i = msg_end
             continue
 
-        # First field inside BindResponse is always the resultCode ENUMERATED.
+        # First field inside BindResponse is always the resultCode ENUMERATED
+        # (LDAPResult: resultCode, matchedDN, diagnosticMessage, referral...).
         roff = 0
         rc_tag, rc_val, roff = _parse_ber_tlv(rsp_value, roff)
         if rc_tag != _TAG_ENUM or not rc_val:
@@ -276,7 +323,9 @@ def _outcome(result_code: int) -> str:
 
     Result codes are defined in RFC 4511 §4.1.9. Only the two codes
     that are directly relevant to authentication are mapped to specific
-    outcomes; all others fall through to "server_error".
+    outcomes; all others fall through to "server_error" (this includes, for
+    example, 14 saslBindInProgress, 48 inappropriateAuthentication and
+    53 unwillingToPerform, none of which are a credential verdict).
 
     Args:
         result_code: Integer result code from the BindResponse ENUMERATED field.
@@ -302,7 +351,11 @@ def detect_stream(session, ts: float) -> list:
     matched message on resolution to prevent re-detection.
 
     Only simple-bind (password as plaintext in the [0] CHOICE) is detected.
-    SASL, anonymous, and TLS-wrapped sessions are out of scope.
+    SASL, anonymous, and TLS-wrapped sessions are out of scope. A non-empty DN
+    with an empty password (unauthenticated bind) is consumed and ignored.
+    The matched BindResponse is deleted from server_buf on immediate
+    resolution without a session.shift_pending_floors() call (run.py's path
+    does call it).
 
     The scan is bounded to _MAX_SCAN bytes per call to keep per-packet CPU
     cost O(1) regardless of buffer depth.

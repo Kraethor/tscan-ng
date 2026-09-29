@@ -2,33 +2,72 @@
 """
 scripts/watch.py - Live display of successful tscan-ng credential findings.
 
-Tails the JSONL results file and prints a human-readable, coloured summary
-for each finding whose outcome is "success".  All other outcomes are silently
-skipped.  Log rotation is handled transparently — the file is reopened
-automatically when it is truncated or replaced by a new inode.
+Purpose:
+    Tails the JSONL results file written by tscan-pipeline.service
+    (tscan_ng/sinks/jsonl.py) and prints a human-readable, coloured summary
+    for each *new* finding whose outcome is "success". Findings with any
+    other outcome (failed, pending, no_response, server_error, redirect,
+    unknown, ...) are silently skipped by this viewer, even though they are
+    present in the JSONL file and (except "failed"/"pending") still trigger
+    Discord alerts -- read the file directly (or with jq) to see them.
 
-This is a read-only viewer. Logging and Discord alerting both happen inside
-tscan-pipeline.service itself (see tscan_ng/sinks/jsonl.py and
-tscan_ng/sinks/discord.py) regardless of whether this script is running, so
-closing this terminal never turns alerting off.
+    The viewer starts at the *end* of the file, so it shows only findings
+    written after it was launched, never history. Because pipeline.py's
+    _emit() applies the [dedup] finding_cooldown_sec cooldown before writing
+    to the JSONL file, repeat submissions of the same credentials to the
+    same (dst, dport) inside the cooldown window (default 1800 s) never
+    reach this display either.
+
+    Log rotation is handled transparently: the file is reopened when its
+    inode changes or its size drops below the current read position
+    (logrotate's copytruncate, see logrotate/tscan, is the normal case).
+
+    This is a read-only viewer. Logging and Discord alerting both happen inside
+    tscan-pipeline.service itself (see tscan_ng/sinks/jsonl.py and
+    tscan_ng/sinks/discord.py) regardless of whether this script is running, so
+    closing this terminal never turns alerting off.
 
 Usage:
-    sudo python3 /opt/tscan/scripts/watch.py [results_file]
+    python3 /opt/tscan/scripts/watch.py [results_file]
 
-Default results file: /var/log/tscan/results.jsonl
+    results_file   optional path to a JSONL findings file
+                   (default: /var/log/tscan/results.jsonl). If it does not
+                   exist yet the script prints "Waiting for <path> ..." and
+                   polls once a second until it appears.
+
+Environment:
+    None read. Output uses ANSI escape codes unconditionally (no isatty()
+    check, no NO_COLOR support), so piping to a file embeds escape sequences.
+
+Privileges:
+    None beyond read access to the results file. On the current host
+    /var/log/tscan is mode 775 and results.jsonl is 644 (tscan-owned, created
+    by the service), so any user can run it. If /var/log/tscan is tightened
+    to 750 as docs/REBUILD.md's "Logging Directory" step suggests, only
+    tscan and its group can read it and this script then needs `sudo`.
+
+Exit codes:
+    0  Ctrl-C (prints "Monitor stopped." and exits cleanly).
+    1  any unhandled exception (e.g. PermissionError opening the file);
+       Python prints a traceback. There is no other explicit exit path.
 
 Colour coding:
-    Protocol label   — unique colour per protocol for instant identification
-    Source / dest    — white
-    Credentials      — bold bright-red   (the primary artefact)
-    Filter string    — bold bright-yellow (designed for easy selection/copy)
-    Outcome          — bold bright-green
+    Protocol label   - unique colour per protocol for instant identification
+    Source / dest    - white
+    Credentials      - bold bright-red   (the primary artefact)
+    Filter string    - bold bright-yellow (designed for easy selection/copy)
+    Outcome          - bold bright-green
 
-The filter string on each finding is a Wireshark/tcpdump-compatible BPF
-expression that isolates the exact session.  Highlight and copy it directly
-into Wireshark or:
+The filter string on each finding is a tcpdump/pcap-filter (BPF) expression
+that isolates the exact session; Wireshark accepts it as a capture filter.
+Highlight and copy it directly into Wireshark or:
 
     sudo tcpdump -r capture.pcap '<filter>'
+
+Known limitation: the filter text is built by tscan_ng.session._make_filter(),
+which always emits "tcp port ... and tcp port ...", including for snmp_creds
+findings whose transport is UDP. For SNMP, change "tcp" to "udp" by hand before
+using the filter, or it will match nothing.
 """
 
 import json
@@ -56,7 +95,10 @@ BRIGHT_CYAN    = "\033[96m"
 BRIGHT_WHITE   = "\033[97m"
 
 # Per-protocol colour + label --------------------------------------------------
-# Each entry is (ansi_colour_string, display_label).
+# Keyed by the finding's "type" field (one per detector; ftp has two types).
+# Each entry is (ansi_colour_string, display_label). A type missing from this
+# table (e.g. a newly added detector) still displays, in bold bright white,
+# with ftype.upper() as its label -- see _format().
 _PROTO = {
     "http_basic":    (BOLD + BRIGHT_CYAN,    "HTTP Basic"),
     "ftp_creds":     (BOLD + BRIGHT_BLUE,    "FTP"),
@@ -143,7 +185,7 @@ def _format(finding: dict) -> str | None:
     proto_color, label = _PROTO.get(ftype, (BOLD + BRIGHT_WHITE, ftype.upper()))
 
     # Timestamp
-    ts_raw = finding.get("ts_start") or finding.get("ts") or 0
+    ts_raw = finding.get("ts_start") or finding.get("ts") or 0  # epoch seconds; 0 -> 1970 if neither key is present
     ts_str = datetime.fromtimestamp(ts_raw).strftime("%Y-%m-%d %H:%M:%S")
 
     lines = [_header(proto_color, label, ts_str)]

@@ -2,14 +2,59 @@
 """
 scripts/dashboard.py - Live full-screen status dashboard for tscan-ng.
 
-Read-only. Everything shown here is world-readable (systemd unit properties,
-/sys/class/net statistics, /var/log/tscan/results.jsonl), so this runs as an
-unprivileged user -- no sudo, no root login needed.
+Purpose:
+    A curses UI, refreshed once a second (REFRESH_SEC), showing at a glance:
+      * SERVICE     - tscan-pipeline.service state/substate, uptime (from
+                      ActiveEnterTimestamp), MemoryCurrent/MemoryMax, restart
+                      count (NRestarts); tscan-pipeline-healthcheck.timer
+                      state, time since its last trigger, and whether the
+                      external healthcheck currently considers the pipeline
+                      down (presence of DOWN_MARKER).
+      * INTERFACES  - operstate, rx/tx bit rate and (for the capture NIC) packet
+                      rate and per-interval rx_dropped delta for the SPAN
+                      capture NIC (MONITOR_IFACE) and the management NIC
+                      (ADMIN_IFACE, plus its IPv4 address).
+      * THROUGHPUT - sparkline of the capture NIC's packets/sec over the last
+                      SPARK_WIDTH samples, current/peak rate, and since-boot
+                      totals.
+      * FINDINGS    - count, last one, and per-type breakdown of findings in
+                      RESULTS_PATH since the last log rotation. NOTE: only
+                      findings with outcome == "success" are counted here,
+                      unlike Discord alerting (every outcome except
+                      "pending"/"failed") and the JSONL log itself (all
+                      outcomes), so this number is expected to be lower than
+                      the line count of results.jsonl.
+      * WORKERS     - the hard-coded WORKERS_CONFIGURED value (NOT read from
+                      the config file; keep in sync with [dispatcher] workers
+                      in tscan_ng.conf) and the 1/5/15-minute load average.
 
 Usage:
     python3 /opt/tscan/scripts/dashboard.py
 
-Press q or Ctrl-C to quit.
+    Press q, Q or Esc to quit (Ctrl-C also works; it is caught in __main__
+    and exits silently). No arguments and no command-line options.
+
+Environment / configuration:
+    None read from the environment. The interface names, unit names, paths and
+    worker count are module-level constants (see below) that must be edited in
+    the source when the host changes. Requires Python >= 3.11 (datetime.UTC)
+    and a terminal that supports curses colour.
+
+Privileges:
+    None. Read-only and unprivileged: everything it reads is world-readable
+    (`systemctl show` properties, /sys/class/net/*/statistics and operstate,
+    `ip -4 -brief addr show`, /var/lib/tscan-healthcheck/down existence,
+    /var/log/tscan/results.jsonl). No sudo, no root. Caveat: reading
+    results.jsonl also needs search permission on /var/log/tscan and read
+    permission on the file; if either is denied the FINDINGS panel silently
+    stays at zero rather than erroring (see FindingsTailer).
+
+Exit codes:
+    0  normal quit (q/Esc/Ctrl-C).
+    1  stdout is not a TTY (message on stderr); curses is never started.
+    Any other unhandled exception is re-raised by curses.wrapper() after the
+    terminal has been restored, giving Python's usual exit status 1 and a
+    traceback.
 """
 
 import curses
@@ -20,6 +65,8 @@ import subprocess
 import sys
 import time
 
+# Unit names and paths below must match the units in systemd/ and
+# scripts/pipeline_healthcheck.py (DOWN_MARKER is the same path written there).
 PIPELINE_UNIT = "tscan-pipeline.service"
 HEALTHCHECK_TIMER = "tscan-pipeline-healthcheck.timer"
 DOWN_MARKER = "/var/lib/tscan-healthcheck/down"
@@ -28,11 +75,14 @@ MONITOR_IFACE = "enx00242788e34c"   # SPAN/mirror capture interface
 ADMIN_IFACE = "enp2s0"              # management/SSH interface
 
 RESULTS_PATH = "/var/log/tscan/results.jsonl"
+# Display-only: NOT read from tscan_ng.conf. Update by hand if [dispatcher]
+# workers changes.
 WORKERS_CONFIGURED = 12
 
-REFRESH_SEC = 1.0
+REFRESH_SEC = 1.0          # redraw period; also the curses getch() timeout
+# Eight block heights, lowest to highest, used by sparkline().
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
-SPARK_WIDTH = 40
+SPARK_WIDTH = 40           # number of pps samples kept/shown (= seconds of history)
 
 
 # ── systemd helpers ───────────────────────────────────────────────────────────
@@ -105,7 +155,12 @@ def fmt_duration(delta: datetime.timedelta) -> str:
 
 
 def parse_systemd_timestamp(ts: str):
-    """Parse systemd's 'Mon 2026-07-27 00:45:02 UTC' timestamps."""
+    """Parse systemd's 'Mon 2026-07-27 00:45:02 UTC' timestamps into a naive
+    datetime (the timezone name is discarded, so the result is only comparable
+    to another UTC-naive datetime -- run() compares against naive UTC 'now').
+
+    Returns None for empty/'n/a'/'0' values (unit never activated) or anything
+    that does not parse."""
     if not ts or ts in ("n/a", "0"):
         return None
     try:
@@ -155,6 +210,7 @@ def read_iface_ipv4(iface: str) -> str:
     return "-"
 
 
+# Counters from /sys/class/net/<iface>/statistics/ that snapshot_iface() reads.
 IFACE_STATS = ("rx_bytes", "rx_packets", "rx_dropped", "rx_errors",
                "tx_bytes", "tx_packets")
 
@@ -170,7 +226,17 @@ def snapshot_iface(iface: str) -> dict:
 class FindingsTailer:
     """Tracks success-finding count/last-seen in RESULTS_PATH, tailing new
     lines each poll. Handles logrotate's copytruncate (size shrinks in place,
-    inode stays the same)."""
+    inode stays the same). Counters are reset by neither rotation nor
+    truncation: they keep accumulating for the life of the dashboard process,
+    so "since last log rotation" is accurate only for a dashboard started
+    after the most recent rotation.
+
+    Attributes:
+        path:       Path of the JSONL file being tailed.
+        total:      Number of outcome == "success" findings consumed so far.
+        by_proto:   {finding "type": count} for those findings.
+        last_line:  The most recent successful finding dict, or None.
+    """
 
     def __init__(self, path: str):
         """Create the tailer and immediately prime counters from *path* if
@@ -299,6 +365,8 @@ def run(stdscr):
         ])
         timer = systemctl_show(HEALTHCHECK_TIMER, ["ActiveState", "LastTriggerUSec"])
         down_flagged = os.path.exists(DOWN_MARKER)
+        # Naive UTC, to be comparable with parse_systemd_timestamp()'s naive
+        # results (systemd is assumed to print timestamps in UTC on this host).
         now_utc = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
 
         # ── render ──
@@ -415,6 +483,8 @@ def run(stdscr):
 
         stdscr.refresh()
 
+        # getch() blocks for at most REFRESH_SEC (stdscr.timeout above), which
+        # doubles as the loop's sleep; -1 (timeout) falls through and redraws.
         ch = stdscr.getch()
         if ch in (ord("q"), ord("Q"), 27):
             break

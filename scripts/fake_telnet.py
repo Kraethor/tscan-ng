@@ -7,11 +7,36 @@ prompt, and a tiny fake shell) to generate real cleartext credential traffic
 for the telnet detector to capture. No encryption. Valid creds: testuser /
 hunter2 -- everything else is rejected after 3 attempts. See
 docs/test_reference.md for how this fits into the manual test workflow.
+
+Usage:
+    python3 /opt/tscan/scripts/fake_telnet.py
+
+    No arguments or environment variables. Listens on 0.0.0.0:2323 (TCP,
+    threaded: one daemon thread per connection, SO_REUSEADDR set) and logs
+    every line sent/received, with a timestamp and client address, to stdout.
+    HOST, PORT, VALID_USER and VALID_PASS are module constants to edit in the
+    source. The service is intentionally not installed as a systemd unit; run
+    it by hand on the test host that generates traffic for the capture NIC to
+    see (traffic originating on the capture host itself is NOT visible to a
+    SPAN port on that same host, see docs/REBUILD.md).
+
+Privileges:
+    None -- the port is above 1024. Do not run as root.
+
+Exit codes:
+    The server loop has no shutdown path of its own and, unlike the other
+    scripts here, runs at import time (there is no `if __name__` guard), so
+    do not import this module. Stop it with Ctrl-C/SIGTERM. A bind failure
+    (port already in use) raises OSError and exits 1 with a traceback.
+
+Security: accepts any client on every interface and prints attempted
+passwords in the clear to stdout -- test use only, never expose to an
+untrusted network.
 """
 
 import socket, threading, datetime
 
-HOST = "0.0.0.0"
+HOST = "0.0.0.0"   # listen on all interfaces
 PORT = 2323  # avoid 23 which needs root
 
 VALID_USER = "testuser"
@@ -115,6 +140,8 @@ def handle(conn, addr):
     finally:
         conn.close()
 
+# Accept loop (runs at import time): one handler thread per client so a slow
+# or stuck connection never blocks the next.
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((HOST, PORT))

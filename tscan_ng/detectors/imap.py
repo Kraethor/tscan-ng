@@ -35,6 +35,35 @@ Finding outcomes:
     bad_command  - Server responded with tagged BAD
     no_response  - Session expired before a server response was seen
                    (emitted by SessionTable.expire())
+
+Finding type: "imap_creds"
+Finding extras:
+    "tag"       - the client's command tag (e.g. "a001"). Used to pair the
+                  request with its tagged server response, in both
+                  detect_stream() and run.py's _try_resolve().
+    "mechanism" - "AUTHENTICATE_PLAIN" for SASL PLAIN; absent for LOGIN.
+    "creds"     - "user:password".
+
+Response correlation (tag-based, unlike FTP/POP3/SMTP):
+    server_buf is searched for the first "<tag> OK|NO|BAD " line whose tag
+    equals the request's tag (case-insensitive). Because of this, unrelated
+    untagged ("* ...") or differently-tagged responses cannot be mistaken for
+    the answer. The immediate-resolve path in detect_stream() does not consume
+    the matched line from server_buf; run.py's _try_resolve() (pending path)
+    does.
+
+Known limitations:
+    - LOGIN arguments given as IMAP literals ("LOGIN {5}<CRLF>alice ...") are
+      not handled, and backslash-escaped quotes inside quoted strings end the
+      string early.
+    - AUTHENTICATE mechanisms other than PLAIN (LOGIN, XOAUTH2, CRAM-MD5, ...)
+      are ignored. STARTTLS upgrades make everything after them opaque.
+    - Only the first 4 KB of client_buf is scanned, and the buffer is
+      consumed only when a LOGIN/AUTHENTICATE is matched.
+    - LOGIN is matched without requiring the terminating CRLF, so a command
+      split across TCP segments can be captured truncated.
+    - 993 (IMAPS) is normally TLS; it only yields findings if the traffic on
+      that port is actually cleartext.
 """
 
 import base64
@@ -95,13 +124,20 @@ _IMAP_AUTH_PLAIN_RE = re.compile(
 # "tag SP command"), so a real command line always contains a space and
 # cannot match this tag-less, whole-line pattern; no verb denylist is
 # needed here the way detectors/smtp.py needs one for tag-less SMTP verbs.
+# The exceptions are the few tag-less client lines IMAP does have -- "DONE"
+# (ends IDLE) is pure alphabet and would match -- but they only matter if
+# they follow an AUTHENTICATE PLAIN line that has no inline blob.
+#   Group 1: the base64 text, with any trailing "=" padding.
 _BASE64_LINE_RE = re.compile(
     rb'^([A-Za-z0-9+/]+=*)\r?$',
     re.MULTILINE
 )
 
 # Matches a tagged server response (string regex — used by detect_stream
-# when server_buf has already been decoded to str):
+# when server_buf has already been decoded to str). The trailing \s+ means the
+# status must be followed by at least one whitespace character (a bare "a1 OK"
+# with nothing after it, or split at the segment boundary, is not matched).
+#   Group 1: tag, Group 2: OK / NO / BAD.
 #   a001 OK [CAPABILITY ...] Welcome
 #   a001 NO [AUTHENTICATIONFAILED] Invalid credentials
 #   a001 BAD Command unknown
@@ -128,7 +164,9 @@ def _outcome(status: str) -> str:
         status: IMAP status word (OK, NO, or BAD).
 
     Returns:
-        One of: success, failed, bad_command, unknown.
+        One of: success, failed, bad_command, unknown. ("unknown" is
+        unreachable from this module's own callers, which pass only the
+        OK/NO/BAD group captured by the response regexes.)
     """
     status = status.upper()
     if status == "OK":
@@ -147,7 +185,10 @@ def _decode_plain(blob: bytes) -> tuple | None:
     SASL PLAIN format after base64 decode: \x00username\x00password
     or: authzid\x00username\x00password (with optional authorization id).
     Same mechanism and wire format as SMTP/POP3 AUTH PLAIN — see
-    detectors/smtp.py's _decode_plain for the shared rationale.
+    detectors/smtp.py's _decode_plain for the shared rationale. This is a
+    byte-for-byte copy of smtp._decode_plain (each detector is kept
+    self-contained). Only two- or three-field payloads are accepted; the
+    authorization id in the three-field form is discarded.
 
     Args:
         blob: Raw base64 encoded bytes.
@@ -181,7 +222,10 @@ def detect_stream(session, ts: float) -> list[dict]:
     or registers a pending finding on the session for later resolution
     (run.py's _try_resolve handles both mechanisms identically, since
     resolution only depends on the "tag" field matching an eventual
-    tagged OK/NO/BAD response — see run.py).
+    tagged OK/NO/BAD response — see run.py). LOGIN is scanned with finditer,
+    so several LOGIN commands in one buffer each produce a finding;
+    AUTHENTICATE PLAIN uses search, so only the first such command per call
+    is handled.
 
     Both mechanisms are scanned against the same immutable buffer snapshot
     and consumed from session.client_buf in a single operation at the end,
@@ -214,6 +258,8 @@ def detect_stream(session, ts: float) -> list[dict]:
     scan = bytes(session.client_buf[:_MAX_CMD_SCAN])
 
     # Decode server_buf once outside the loop rather than once per match.
+    # Only used for tag lookups (never for offsets), so lossy "ignore"
+    # decoding is safe here; the pending path in run.py searches raw bytes.
     server_text = session.server_buf.decode("utf-8", "ignore")
 
     findings = []
@@ -242,7 +288,9 @@ def detect_stream(session, ts: float) -> list[dict]:
 
     # -----------------------------------------------------------------------
     # LOGIN
+    #   tag LOGIN userid password
     # -----------------------------------------------------------------------
+    # Track the last LOGIN match so consumption can cover all of them.
     login_last_match = None
 
     for match in _IMAP_LOGIN_RE.finditer(scan):
@@ -260,6 +308,7 @@ def detect_stream(session, ts: float) -> list[dict]:
         passwd = passwd_bytes.decode("utf-8", "ignore") if passwd_bytes is not None else ""
 
         # Guard against empty credentials — emit nothing rather than noise.
+        # (Only both-empty is dropped; e.g. LOGIN "" secret is still reported.)
         if not user and not passwd:
             logging.debug(
                 "imap: session %s: LOGIN matched but user and password both empty",
@@ -274,6 +323,8 @@ def detect_stream(session, ts: float) -> list[dict]:
             "sport":      session.sport,
             "dport":      session.dport,
             "tag":        tag,  # Retained for _try_resolve tag correlation in run.py
+                                # (unlike snmp's "_request_id" it is NOT
+                                # underscore-prefixed, so it is also emitted.)
             "creds":      f"{user}:{passwd}",
             "filter":     _make_filter(session.src, session.dst,
                                        session.sport, session.dport),
@@ -284,6 +335,8 @@ def detect_stream(session, ts: float) -> list[dict]:
 
     # -----------------------------------------------------------------------
     # AUTHENTICATE PLAIN (RFC 3501 SASL; inline form is RFC 4959 SASL-IR)
+    #   tag AUTHENTICATE PLAIN [base64]        -> credentials inline, or
+    #   S: + (continuation)   C: base64        -> credentials on the next line
     # -----------------------------------------------------------------------
     auth_match = _IMAP_AUTH_PLAIN_RE.search(scan)
     if auth_match:
@@ -304,6 +357,9 @@ def detect_stream(session, ts: float) -> list[dict]:
             result = _decode_plain(next_line.group(1)) if next_line else None
             auth_end = next_line.end() if next_line else None
 
+        # auth_end is None only when the continuation line has not arrived yet.
+        # A result of None with auth_end set means the blob did not decode
+        # (bad base64 / wrong field count); it is consumed and ignored.
         if auth_end is not None:
             if result is not None:
                 user, passwd = result
@@ -329,7 +385,8 @@ def detect_stream(session, ts: float) -> list[dict]:
             if consume_end is None or auth_end > consume_end:
                 consume_end = auth_end
 
-    # Consume everything processed by either mechanism in one operation.
+    # Consume everything processed by either mechanism in one operation
+    # (up to whichever of the LOGIN / AUTHENTICATE ends is furthest).
     # Both offsets were computed against the same immutable `scan` snapshot
     # taken at the top of this call, so they remain valid together.
     if consume_end is not None:

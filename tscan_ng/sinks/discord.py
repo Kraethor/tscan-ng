@@ -26,8 +26,11 @@ Design goals (carried over from scripts/discord_alert.py):
     to stall on a Discord outage or slow network the way a detached
     terminal viewer could, so the actual HTTP POST runs on a throwaway
     daemon thread.
-  - Never expose credentials to Discord: only `type`, the username portion
-    of `creds`, and `session_id` are sent for findings.
+  - Never expose credentials to Discord: only `type`, `outcome`, the
+    username portion of `creds` (text before the first ":"), and
+    `session_id` are sent for findings. Caveat: a creds value with no ":"
+    (e.g. an SNMP community string, whose `creds` is the community itself)
+    is sent whole, since it is entirely "the username portion".
   - Never raise back into the caller: exceptions from the network call are
     swallowed inside the background thread.
   - Never leak the webhook URL itself into logs: the URL's path *is* the
@@ -84,7 +87,7 @@ class DiscordSink:
     def __init__(self, webhook_url: str,
                  cooldown_path: str = _DEFAULT_COOLDOWN_PATH,
                  cooldown_sec: float = 300):
-        """Store webhook config. See the class docstring for Args."""
+        """Store webhook config (no I/O). See the class docstring for Args."""
         self._webhook_url = webhook_url
         self._cooldown_path = cooldown_path
         self._cooldown_sec = cooldown_sec
@@ -147,8 +150,8 @@ class DiscordSink:
 
 def _send_finding(webhook_url: str, finding: dict) -> None:
     """
-    Build and POST the Discord payload for one successful credential
-    finding. Runs on a background thread.
+    Build and POST the Discord payload for one credential finding (any
+    outcome not suppressed by DiscordSink). Runs on a background thread.
 
     Because the username comes directly from captured network traffic, it
     is attacker-controlled input. `allowed_mentions: {"parse": []}` stops a
@@ -158,7 +161,8 @@ def _send_finding(webhook_url: str, finding: dict) -> None:
     Args:
         webhook_url: Discord webhook URL.
         finding: Finding dict for one credential capture (any outcome not
-                 in DiscordSink._SUPPRESSED_OUTCOMES).
+                 in DiscordSink._SUPPRESSED_OUTCOMES). Missing keys render
+                 as "unknown".
     """
     ftype = finding.get("type", "unknown")
     username = finding.get("creds", "").split(":", 1)[0] or "unknown"
@@ -183,6 +187,10 @@ def _post(webhook_url: str, payload: dict) -> None:
     Args:
         webhook_url: Discord webhook URL.
         payload: JSON-serializable Discord webhook payload.
+
+    The HTTP response status is not checked (a 4xx/429 from Discord is
+    silently ignored), and the 5s timeout applies per connect/read phase,
+    not to the whole request.
     """
     try:
         requests.post(webhook_url, json=payload, timeout=5)

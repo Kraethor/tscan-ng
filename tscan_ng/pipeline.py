@@ -25,8 +25,14 @@ raw socket recv() -> parse_basic() -> SessionTable -> detectors ->
 JSONLSink + DiscordSink. JSONLSink already flock()s file writes (see
 sinks/jsonl.py), so N processes safely share one output file with no
 further coordination. DiscordSink (see sinks/discord.py) fires a webhook
-alert for every successful finding on a background thread, so alerting is
-always on -- it does not depend on anything reading the JSONL log.
+alert on a background thread for every finding except outcomes "pending"
+and "failed", so alerting is always on -- it does not depend on anything
+reading the JSONL log. Repeat findings are collapsed before either sink by
+_emit()'s cross-process cooldown.
+
+Entry point: `python -m tscan_ng.pipeline` loads Config() and calls main().
+Pending-finding resolution (_try_resolve) is imported from run.py, which
+now holds nothing else.
 
 The BPF filter is compiled via libpcap's pcap_open_dead() + pcap_compile()
 (see capture.py) rather than reimplementing a BPF compiler, then attached
@@ -60,16 +66,16 @@ _FINDING_COOLDOWN_DIR = "/run/tscan/finding_cooldown"
 # --- Linux AF_PACKET / PACKET_FANOUT constants ---
 # Not exposed by Python's socket module (Linux-specific, not POSIX); values
 # from linux/if_packet.h and asm-generic/socket.h.
-SOL_PACKET = 263
-PACKET_ADD_MEMBERSHIP = 1
-PACKET_MR_PROMISC = 1
-PACKET_FANOUT = 18
-PACKET_FANOUT_HASH = 0
-PACKET_FANOUT_FLAG_DEFRAG = 0x8000
-SO_ATTACH_FILTER = 26
-SO_RCVBUFFORCE = 33
-ETH_P_ALL = 0x0003
-PACKET_STATISTICS = 6
+SOL_PACKET = 263                  # setsockopt level for AF_PACKET options
+PACKET_ADD_MEMBERSHIP = 1         # option: join a membership (promisc) on an iface
+PACKET_MR_PROMISC = 1             # membership type: promiscuous mode
+PACKET_FANOUT = 18                # option: join a fanout group
+PACKET_FANOUT_HASH = 0            # fanout mode: flow-hash load balancing
+PACKET_FANOUT_FLAG_DEFRAG = 0x8000  # fanout flag: reassemble IP fragments first
+SO_ATTACH_FILTER = 26             # attach a classic BPF program to the socket
+SO_RCVBUFFORCE = 33               # set rcvbuf ignoring rmem_max (needs CAP_NET_ADMIN)
+ETH_P_ALL = 0x0003                # protocol: every EtherType
+PACKET_STATISTICS = 6             # option: read-and-clear tp_packets/tp_drops
 
 # Arbitrary but fixed group ID shared by every pipeline process so they all
 # join the same PACKET_FANOUT group. Fanout groups are scoped per network
@@ -120,6 +126,7 @@ def _attach_filter(sock: socket.socket, expr: str, snaplen: int):
     Raises:
         RuntimeError: If the dead handle can't be opened or the filter
                       fails to compile.
+        OSError:      From setsockopt() if the kernel rejects the program.
     """
     dead = pcap_open_dead(DLT_EN10MB, snaplen)
     if not dead:
@@ -174,6 +181,13 @@ def _open_fanout_socket(iface: str, group_id: int, bpf_filter: str,
 
     Returns:
         A bound, filtered, fanout-joined, promiscuous AF_PACKET socket.
+
+    Raises:
+        OSError:      If any socket call fails (e.g. missing CAP_NET_RAW /
+                      CAP_NET_ADMIN, unknown interface, group already in
+                      use with a different mode).
+        RuntimeError: If the BPF filter fails to compile (see
+                      _attach_filter).
     """
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
                          socket.htons(ETH_P_ALL))
@@ -218,8 +232,15 @@ def _emit(sink: JSONLSink, discord: DiscordSink, finding: dict,
 
     Both sinks share the same write(finding) interface, so every finding
     site in this module calls through here once instead of duplicating the
-    two calls. DiscordSink.write() is itself a further no-op unless the
-    finding is a successful credential capture and alerting is configured.
+    two calls. DiscordSink.write() is itself a further no-op if alerting is
+    unconfigured or the finding's outcome is "pending"/"failed".
+
+    Marker files (one per distinct key, named by the SHA-256 of the key so
+    arbitrary credential bytes never reach the filesystem as a name) live
+    in _FINDING_COOLDOWN_DIR and are never deleted by this code. The slot
+    is claimed before the sinks are written, so a sink write that raises
+    still consumes the cooldown window. If the marker cannot be opened,
+    claim_slot() fails open and the finding is emitted.
 
     Args:
         sink:                 The pipeline's JSONLSink.
@@ -248,7 +269,10 @@ def _maybe_run_periodic(sock: socket.socket, sessions: SessionTable, sink: JSONL
 
     Called from both the recv() timeout branch (quiet periods) and after
     every successfully processed packet, mirroring the old worker's expiry
-    timing exactly.
+    timing exactly. (It is not called for packets parse_basic() rejects or
+    that raise during processing, so it is skipped for those.) Uses
+    time.monotonic() for the interval; returns early with no work
+    otherwise.
 
     Also polls PACKET_STATISTICS for drops the kernel made before this
     process ever saw the packet (receive buffer full). This is the only way
@@ -257,7 +281,9 @@ def _maybe_run_periodic(sock: socket.socket, sessions: SessionTable, sink: JSONL
     happened at a socket send()/queue.put() this code controlled, a kernel-
     level AF_PACKET drop happens silently with nothing in the recv() path
     to observe it. PACKET_STATISTICS is a read-and-clear counter, so
-    polling it on this same timer is the only way to catch it.
+    polling it on this same timer is the only way to catch it. Only the
+    drop count is used; the packet count is discarded. Drops are logged at
+    WARNING per poll, not sent to Discord.
 
     Args:
         sock:                 The pipeline's fanout socket.
@@ -272,6 +298,9 @@ def _maybe_run_periodic(sock: socket.socket, sessions: SessionTable, sink: JSONL
     Returns:
         The new last_expiry timestamp (unchanged if the interval hasn't
         elapsed yet).
+
+    Side effects:
+        Emits no_response findings for expired sessions via _emit().
     """
     now = time.monotonic()
     if now - last_expiry < expiry_interval:
@@ -313,12 +342,25 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
     these timestamps only for correlation/expiry ordering, not forensic
     packet timing, so the small latency skew is an acceptable simplification.
 
+    Error handling: an exception while processing one packet is logged and
+    counted; 100 consecutive failures (fail_count resets on any success) or
+    an OSError from recv() ends the loop as an abnormal exit. On any loop
+    exit the session table is flushed (pending findings closed as
+    no_response), the socket closed, and -- if abnormal -- a Discord
+    notify() is sent and the process exits with status 1. Startup errors
+    (socket/filter setup) propagate as exceptions and also kill the
+    process non-zero, without a Discord alert.
+
     Args:
         pipeline_id: 0-based index, used only for logging.
         cfg:         Loaded Config object.
         group_id:    Shared PACKET_FANOUT group ID -- every pipeline
                      process must be called with the same value.
     """
+    # Root logger at DEBUG in every worker, in contrast to main()'s INFO in
+    # the parent. This also enables DEBUG output from libraries and from
+    # parsing.net (one traceback per malformed packet); sinks/discord.py
+    # separately pins urllib3 to WARNING so the webhook URL is not logged.
     logging.basicConfig(
         level=logging.DEBUG,
         format=f"%(levelname)s pipeline[{pipeline_id}] pid=%(process)d %(message)s")
@@ -330,7 +372,7 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
 
     sock = _open_fanout_socket(cfg.iface, group_id, bpf_filter, cfg.snaplen,
                                cfg.buffer_bytes)
-    sock.settimeout(1.0)
+    sock.settimeout(1.0)  # bounds how long expiry can be starved on a quiet link
 
     sink = JSONLSink(cfg.out_path or None)
     discord = DiscordSink(cfg.discord_webhook, cooldown_sec=cfg.discord_notify_cooldown)
@@ -352,7 +394,9 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
     last_expiry = time.monotonic()
     logging.info("pipeline started, iface=%s filter=%r", cfg.iface, bpf_filter)
 
-    # Consecutive failure counter — reset to 0 on every successful packet.
+    # Consecutive failure counter — reset to 0 on every successfully
+    # processed packet; hitting 100 (a persistent bug rather than one bad
+    # packet) makes this process give up instead of spinning on logged errors.
     fail_count = 0
     # Set to a reason string on abnormal exit, checked after the loop to
     # decide this process's exit code. A worker dying is only ever supposed
@@ -383,8 +427,10 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
         if not pkt:
             # Expected for non-IP or non-TCP/UDP traffic that still matched
             # the BPF filter's link-layer scope (e.g. ARP is never seen
-            # here since the filter is "tcp and (...)", but kept as a
-            # cheap guard rather than assuming the filter is infallible).
+            # here since the auto-built filter only admits tcp/udp on the
+            # configured ports, but an explicit capture.bpf_filter may let
+            # anything through, so this stays as a cheap guard rather than
+            # assuming the filter is infallible).
             continue
 
         try:
@@ -422,7 +468,8 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
     sock.close()
 
     if abnormal_exit:
-        # notify() posts on a background daemon thread; join it (briefly --
+        # notify() posts on a background daemon thread (and returns None if
+        # alerting is off or the shared cooldown already fired); join it (briefly --
         # matches the HTTP call's own 5s timeout) before exiting, since a
         # daemon thread doesn't get to finish once the process exits and
         # this is the last thing this process does.
@@ -453,6 +500,10 @@ def main(cfg: Config):
     custom SIGTERM handler, so `systemctl stop` still terminates pipeline
     processes without flushing pending sessions -- a pre-existing gap, not
     introduced by this change.
+
+    Blocks until a worker dies or the process is interrupted. Workers are
+    non-daemon processes, so they are explicitly terminated (then killed
+    after a 5s join) on the way out.
 
     Args:
         cfg: Loaded Config object.
@@ -485,7 +536,7 @@ def main(cfg: Config):
         # permanently gone. mp.connection.wait() on every process's
         # sentinel wakes up on whichever process exits first, with no
         # polling.
-        mp.connection.wait(p.sentinel for p in procs)
+        mp.connection.wait(p.sentinel for p in procs)  # blocks; returns on first exit
     except KeyboardInterrupt:
         pass  # Requested shutdown -- not a failure.
     else:

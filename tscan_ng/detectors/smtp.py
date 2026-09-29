@@ -45,6 +45,31 @@ Finding outcomes:
     server_error - Server responded with 432
     no_response  - Session expired before a server response was seen
                    (emitted by SessionTable.expire())
+
+Finding type: "smtp_creds"; extra "mechanism" is "PLAIN" or "LOGIN";
+"creds" is "user:password" (decoded from base64).
+
+Response correlation:
+    Positional, by code: the first server_buf line starting "235", "535",
+    "534" or "432" followed by a space or hyphen is taken as the answer. No
+    command tags exist in SMTP. Matched lines are consumed only when used, so
+    a stale 535/534/432 left by an earlier attempt that this module did not
+    detect (e.g. an unsupported mechanism such as CRAM-MD5 or XOAUTH2) will be
+    attributed to the next captured credential. run.py's _try_resolve()
+    repeats the same matching for pending findings.
+
+Known limitations:
+    - Only AUTH PLAIN and AUTH LOGIN are parsed. An initial response given
+      on the AUTH LOGIN line itself ("AUTH LOGIN <base64 user>") is not
+      matched by _SMTP_AUTH_LOGIN_RE.
+    - STARTTLS-protected sessions are opaque; 465 (SMTPS) is normally TLS.
+    - Only the first 4 KB of client_buf is scanned. AUTH LOGIN leaves its
+      anchor in the buffer until both credential lines arrive, so an
+      abandoned AUTH LOGIN can cause later bare-word lines (for example
+      message body text that is pure base64 alphabet) to be decoded as
+      credentials.
+    - The AUTH LOGIN path does not skip empty/undecodable credentials the way
+      the AUTH PLAIN path does (decode_b64 returns "" on bad input).
 """
 
 import logging
@@ -53,19 +78,24 @@ import base64
 from tscan_ng.detectors.common import decode_b64 as _decode_b64
 from tscan_ng.session import _make_filter
 
-# Matches SMTP AUTH PLAIN with optional inline credentials
+# Matches SMTP AUTH PLAIN with optional inline credentials, on a line of its
+# own (anchored ^...$ per line; the optional CR tolerates CRLF endings since
+# MULTILINE $ only matches before "\n").
+#   Group 1: the inline base64 blob, or the empty bytes if absent (the client
+#   then sends the blob on the next line after the server's 334).
 _SMTP_AUTH_PLAIN_RE = re.compile(
     rb"^AUTH PLAIN ?([A-Za-z0-9+/=]*)\r?$",
     re.IGNORECASE | re.MULTILINE
 )
 
-# Matches SMTP AUTH LOGIN
+# Matches SMTP AUTH LOGIN (no inline initial response) on a line of its own.
 _SMTP_AUTH_LOGIN_RE = re.compile(
     rb"^AUTH LOGIN\r?$",
     re.IGNORECASE | re.MULTILINE
 )
 
 # Matches a bare base64 line (response to a 334 challenge).
+#   Group 1: the base64 text including any trailing "=" padding.
 # SMTP verbs that are pure [A-Za-z0-9] strings (RSET, DATA, QUIT, NOOP, etc.)
 # would otherwise match; they are excluded by _SMTP_VERBS below.
 _BASE64_LINE_RE = re.compile(
@@ -80,7 +110,13 @@ _SMTP_VERBS: frozenset = frozenset({
     b"VRFY", b"EXPN", b"EHLO", b"HELO", b"STARTTLS",
 })
 
-# Matches SMTP server response codes we care about
+# Matches SMTP server response codes we care about, at the start of a line:
+#   235 = authentication successful
+#   535 = authentication credentials invalid
+#   534 = authentication mechanism too weak
+#   432 = a password transition is needed
+# The [ -] accepts both final ("235 ") and continuation ("235-") lines.
+#   Group 1: the 3-digit code.
 _SMTP_RESPONSE_RE = re.compile(
     rb"^(235|535|534|432)[ -]",
     re.MULTILINE
@@ -109,7 +145,9 @@ def _outcome(code: bytes) -> str:
         code: SMTP 3-digit response code bytes.
 
     Returns:
-        One of: success, failed, server_error, unknown.
+        One of: success, failed, server_error, unknown. ("unknown" is
+        unreachable via _SMTP_RESPONSE_RE, which only yields the four
+        codes handled here.)
     """
     if code == b"235":
         return "success"
@@ -126,12 +164,15 @@ def _decode_plain(blob: bytes) -> tuple | None:
 
     AUTH PLAIN format after base64 decode: \x00username\x00password
     or: authzid\x00username\x00password (with optional authorization id)
+    (RFC 4616: authzid NUL authcid NUL passwd). The authzid is discarded.
+    imap.py carries an identical copy of this function.
 
     Args:
         blob: Raw base64 encoded bytes.
 
     Returns:
-        (username, password) tuple, or None if decoding fails.
+        (username, password) tuple, or None if decoding fails or the decoded
+        payload does not split into two or three NUL-separated fields.
     """
     try:
         decoded = base64.b64decode(blob)
@@ -156,6 +197,9 @@ def detect_stream(session, ts: float) -> list:
 
     AUTH PLAIN: credentials may be inline or on the next line after a 334
     challenge.  The client buffer is consumed once credentials are extracted.
+    If the split-form blob line has not arrived yet, nothing is emitted or
+    consumed, so the bare "AUTH PLAIN" line stays in client_buf as an anchor
+    for the next call. A blob that fails to decode is not consumed either.
 
     AUTH LOGIN: credentials arrive across multiple client packets interleaved
     with server 334 challenges.  The client buffer is NOT consumed until both
@@ -195,6 +239,8 @@ def detect_stream(session, ts: float) -> list:
             if m.group(1).upper() not in _SMTP_VERBS
         ]
 
+        # The first bare-base64 line after AUTH LOGIN is the username, the second
+        # the password (each answers a 334 challenge from the server).
         if len(b64_matches) >= 2:
             user   = _decode_b64(b64_matches[0].group(1))
             passwd = _decode_b64(b64_matches[1].group(1))
@@ -227,6 +273,8 @@ def detect_stream(session, ts: float) -> list:
                 session.add_pending(base, ts_start=ts)
 
             # Consume AUTH LOGIN + both credential lines from client buffer.
+            # Returns immediately: AUTH PLAIN below is not examined in the
+            # same call.
             del session.client_buf[:b64_matches[1].end()]
             return findings
 
@@ -253,7 +301,9 @@ def detect_stream(session, ts: float) -> list:
 
         # Use `is not None` rather than truthiness: a valid result is always a
         # 2-tuple, but an explicit None check is more robust if _decode_plain()
-        # is ever extended to return other falsy values.
+        # is ever extended to return other falsy values. (When the inline blob
+        # exists but fails to decode, result is None and nothing is consumed,
+        # so the same line is re-examined on every subsequent packet.)
         if result is not None:
             user, passwd = result
             # Guard against empty captures — emit nothing rather than

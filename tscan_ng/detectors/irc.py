@@ -56,6 +56,20 @@ Finding extras:
     "creds" — formatted as "nick:password", or ":password" if no nick was
               given, for display consistency with every other detector
               that has an optional username component (e.g. redis_creds).
+
+Known limitations:
+    - _IDENTIFY_RE's optional-first-argument group is separated from the
+      password by a whitespace run (\\s+), which also matches a line break.
+      When the IDENTIFY line is followed in the SAME scan window by another
+      line (for example a JOIN sent in the same segment), the single-argument
+      form is misparsed: the real password is reported as the "nick" and the first word of the next
+      line as the password. When the IDENTIFY line is the last thing in the
+      buffer (typical when it is sent alone) it parses correctly.
+    - Only the first 4 KB of client_buf and 8 KB of server_buf are scanned for
+      the immediate-resolve path; client_buf is consumed only on a match.
+    - IRC over TLS (6697) is opaque and not in the default port set.
+    - No debug log is emitted for skipped empty captures (unlike most
+      detectors); logging is not imported.
 """
 
 import re
@@ -76,17 +90,32 @@ _IRC_PORTS: frozenset = frozenset({
 _MAX_SCAN_CLIENT = 4096
 _MAX_SCAN_SERVER = 8192
 
+# Matches the client's NickServ identify line (client -> server):
+#   PRIVMSG NickServ :IDENTIFY [nick] password
+#   PRIVMSG NickServ@services.host :ID [nick] password
+#   Group 1: optional first argument (the account nick) -- the optional group
+#            is greedy, so with two words it captures the first as the nick.
+#   Group 2: the password (the last word before the end of line, or the only
+#            word). [^\r\n]* then swallows any further trailing text.
+# Requires CRLF. NB: the \s+ after group 1 can also match that CRLF, see the
+# module docstring's known limitations.
 _IDENTIFY_RE = re.compile(
     rb"^PRIVMSG\s+NickServ(?:@\S+)?\s+:(?:IDENTIFY|ID)\s+(?:(\S+)\s+)?(\S+)[^\r\n]*\r\n",
     re.IGNORECASE | re.MULTILINE,
 )
 
+# Matches any server NOTICE line: ":prefix NOTICE target :text\r\n".
+#   Group 1: message prefix ("nick!user@host" or a server name),
+#   Group 2: the trailing text. The sender is filtered to NickServ in code.
 _NOTICE_RE = re.compile(
     rb"^:(\S+)\s+NOTICE\s+\S+\s+:([^\r\n]*)\r\n",
     re.IGNORECASE | re.MULTILINE,
 )
 
 # Common phrasings across widely-deployed services daemons (Atheme, Anope).
+# Matched anywhere in the NOTICE text, case-insensitively. Not exhaustive:
+# unrecognised wording (e.g. "You are now logged in as ...") is treated as
+# "no verdict yet" rather than as a failure.
 _ACCEPT_RE = re.compile(
     rb"password accepted|you are now (?:identified|recognized)|"
     rb"you are successfully identified",
@@ -101,6 +130,9 @@ _REJECT_RE = re.compile(
 def _find_identify(data: bytes):
     """
     Scan *data* for a "PRIVMSG NickServ :IDENTIFY ..." (or "ID ...") line.
+
+    Only the first matching line is returned (regex .search); later IDENTIFY
+    lines are found on subsequent calls once this one has been consumed.
 
     Args:
         data: Raw bytes from the client stream buffer (bounded to
@@ -193,6 +225,8 @@ def detect_stream(session, ts: float) -> list:
     if password is None:
         return []
 
+    # Defensive: the regex's (\S+) cannot capture an empty password, so this
+    # is currently unreachable.
     if not password:
         del session.client_buf[:req_end]
         return []
@@ -212,12 +246,15 @@ def detect_stream(session, ts: float) -> list:
                                    session.sport, session.dport),
     }
 
+    # Bounded scan of the server buffer for an immediate answer; pending
+    # findings are later resolved by run.py against the whole buffer.
     server_bytes = bytes(session.server_buf[:_MAX_SCAN_SERVER])
     outcome, rsp_end = _find_identify_response(server_bytes)
 
     del session.client_buf[:req_end]
 
     if outcome is not None:
+        # Does not call session.shift_pending_floors() (run.py's path does).
         del session.server_buf[:rsp_end]
         return [{
             **base,

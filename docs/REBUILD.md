@@ -70,14 +70,17 @@ needs an IP.
 | `/opt/tscan/tscan_ng`                      | Python source                                        |
 | `/opt/tscan/tscan_ng/config/tscan_ng.conf` | Runtime configuration (gitignored, host-specific)    |
 | `/opt/tscan/scripts`                       | Operational scripts                                  |
-| `/opt/tscan/systemd`                       | systemd unit files                                   |
+| `/opt/tscan/systemd`                       | systemd unit files, plus `tscan-monitor.network.example` (template for the capture NIC's networkd config) |
 | `/opt/tscan/logrotate`                     | logrotate config                                     |
-| `/opt/tscan/docs`                          | Documentation                                        |
+| `/opt/tscan/docs`                          | Documentation (this file, `test_reference.md`)       |
+| `/opt/tscan/requirements.txt`              | Pinned pip dependencies (`dpkt`, `orjson`, `requests`) |
 | `/opt/tscan/venv`                          | Python virtualenv                                    |
 | `/opt/tscan/.ssh`                          | GitHub deploy key (mode 700, `tscan`-owned)          |
 | `/var/log/tscan`                           | Runtime logs                                         |
-| `/run/tscan`                               | tmpfs, created by `RuntimeDirectory=tscan` on the pipeline unit. Holds the cross-process Discord operational-alert cooldown marker — not a socket (the old dispatcher's Unix socket no longer exists in the fan-out architecture). |
-| `/var/lib/tscan-healthcheck`               | Persistent state for the healthcheck timer (up/down transition marker), created via `StateDirectory=` on that unit |
+| `/run/tscan`                               | tmpfs, created by `RuntimeDirectory=tscan` on the pipeline unit. Holds the cross-process Discord operational-alert cooldown marker (`discord_notify_last`) and the per-key repeat-finding cooldown markers (`finding_cooldown/<sha256>`, see "Repeat-finding cooldown" below) — not a socket (the old dispatcher's Unix socket no longer exists in the fan-out architecture, and the `[dispatcher] socket` config key is vestigial). Contents are lost whenever the service is stopped (a full stop/start resets the cooldowns). |
+| `/var/lib/tscan-healthcheck`               | Persistent state for the healthcheck timer (`down` up/down transition marker and `discord_marker`), created via `StateDirectory=` on that unit |
+| `/etc/systemd/network/70-tscan-monitor.network` | Capture NIC networkd config (installed by hand from the `.example` template) |
+| `/etc/logrotate.d/tscan`                   | Installed by hand from `logrotate/tscan` (`update.sh` does not touch it) |
 
 ---
 
@@ -92,6 +95,10 @@ sudo apt install -y \
   libpcap0.8 \
   logrotate
 ```
+`libpcap0.8` is loaded at import time via `ctypes` (`capture.py` raises
+`RuntimeError("libpcap not found")` without it). Python 3.11 or newer is
+required (`scripts/dashboard.py` uses `datetime.UTC`, and the live host runs
+3.14).
 
 ---
 
@@ -204,7 +211,15 @@ iface = <your capture interface name>
 ```
 
 All other values have safe defaults. See the config file itself and
-`tscan_ng/config.py` for documentation of every setting.
+`tscan_ng/config.py` for documentation of every setting. Sections:
+`[capture]` (iface, snaplen, buffer_bytes, bpf_filter; `no_immediate` is a
+leftover from the libpcap capture path and is not read by any code now),
+`[dispatcher]` (workers, out; `socket` is vestigial — validated but unused),
+`[sessions]` (timeout_seconds, max_buf_bytes, expiry_interval_sec,
+pending_max_age_sec, max_sessions), `[ports]`, `[discord]` and `[dedup]`.
+The file is read once at startup; `config.py` validates it and the service
+exits with a "Invalid configuration" error (status 1) on bad values,
+including a `capture.iface` that is not present in `/sys/class/net`.
 
 ### Protocol detector ports
 
@@ -253,14 +268,37 @@ Alerting is built into `tscan-pipeline.service` itself — it does not
 depend on `watch.py` or any other viewer running. Three kinds of alert
 share the one webhook:
 
-- **Credential finding**, fired for every successful capture. Only
-  `type`, the username portion of `creds`, and `session_id` are sent — no
-  credential material or packet payloads leave the host.
+- **Credential finding**, fired for every finding whose outcome is not
+  `pending` or `failed` (`success`, `redirect`, `server_error`,
+  `no_response` and `unknown` all alert). Only `type`, the username
+  portion of `creds`, the `outcome` and `session_id` are sent — no
+  password material or packet payloads leave the host.
 - **Pipeline failure** (in-process), fired when a worker exits abnormally
   (e.g. the capture interface dropping). `notify_cooldown_sec` rate-limits
   this so a sustained outage doesn't send one alert per restart cycle.
 - **Service down / recovered** (external), fired by
   `tscan-pipeline-healthcheck.timer` — see its own section below.
+
+### Repeat-finding cooldown
+
+```ini
+[dedup]
+finding_cooldown_sec = 1800
+```
+
+Findings that share the same `(dst, dport, creds)` — the same credentials
+sent to the same service, regardless of source or protocol type — are
+emitted at most once per `finding_cooldown_sec` (default 1800 s = 30
+minutes; `0` disables the cooldown). The check happens once in
+`pipeline.py`'s `_emit()`, **upstream of both** `results.jsonl` and Discord,
+so `watch.py` and the dashboard (which read that file) are thinned out the
+same way. Distinct targets or distinct credentials are still emitted
+immediately. State is kept as marker files under `/run/tscan/finding_cooldown/`,
+so it is shared by all workers and is reset by a full service stop/start
+(not by a `Restart=on-failure` cycle). If the marker directory cannot be
+used, the check fails open (findings are logged, just not deduplicated).
+Not to be confused with `[discord] notify_cooldown_sec`, which only rate-limits
+operational (non-finding) alerts.
 
 **Important:**
 After editing `tscan_ng.conf`, the service must be restarted:
@@ -276,6 +314,13 @@ sudo mkdir -p /var/log/tscan
 sudo chown -R tscan:tscan /var/log/tscan
 sudo chmod 750 /var/log/tscan
 ```
+`750` means only `tscan` (and its group) can read the findings log, in which
+case `watch.py` and `dashboard.py` need `sudo` (or membership in the `tscan`
+group). Their documented "runs as any user" behaviour requires the
+directory to be world-searchable and the file world-readable (the live host
+uses `775` on the directory; the service creates `results.jsonl` as `644`).
+Choose according to how sensitive the captured credentials are — the JSONL
+contains them in the clear.
 
 ---
 
@@ -336,16 +381,27 @@ sudo /opt/tscan/scripts/update.sh
 The script will:
 - Stop `tscan-pipeline`
 - Pull the latest code from the repository (as `tscan`, over the deploy key)
-- Update Python dependencies if `requirements.txt` changed
+- Run `pip install --upgrade -r requirements.txt` in the venv (whenever the
+  file exists and `/opt/tscan/venv` exists; it does not check whether the
+  file changed)
 - Reinstall systemd units if they changed (`tscan-pipeline.service` and
   the healthcheck `.service`/`.timer` pair)
 - Reload systemd if needed
 - Start `tscan-pipeline` and ensure the healthcheck timer is enabled
 - Report final status
 
+It does **not** install `logrotate/tscan` or the capture-NIC networkd file;
+repeat those steps by hand if they change. The script uses `set -e`, and the
+service is stopped first, so a failure in the pull/pip/unit-copy steps leaves
+the pipeline **stopped** — fix the cause and re-run, or
+`sudo systemctl start tscan-pipeline`.
+
 **Important:**
 The update script must be run as root. It handles stop/start ordering
 automatically.
+
+`scripts/push.sh "commit message" [file ...]` (root) is the counterpart for
+sending local changes upstream; it runs every git command as `tscan`.
 
 ---
 
@@ -373,10 +429,13 @@ sudo tail -f /var/log/tscan/results.jsonl
 python3 /opt/tscan/scripts/watch.py
 ```
 
-Displays colour-coded findings in real time. Read-only — logging and
-Discord alerting already happen inside `tscan-pipeline.service`
-regardless of whether this is running. Run as any user — no root
-required.
+Displays colour-coded findings in real time. It starts at the end of the
+file, so only new findings appear, and it shows only `outcome == "success"`
+(other outcomes are in the JSONL and may still alert on Discord). Read-only —
+logging and Discord alerting already happen inside `tscan-pipeline.service`
+regardless of whether this is running. Needs only read access to
+`/var/log/tscan/results.jsonl` (see "Logging Directory" above); no root
+required on the current host.
 
 ### Live Status Dashboard
 ```bash
@@ -385,7 +444,8 @@ python3 /opt/tscan/scripts/dashboard.py
 
 Full-screen, auto-refreshing view of service state, monitor/admin
 interface health, capture throughput, recent findings, and worker/load
-info. Everything it reads (systemd unit properties, `/sys/class/net`
+info (findings count only `outcome == "success"`; the worker count shown is
+a constant in the script, not read from the config). Everything it reads (systemd unit properties, `/sys/class/net`
 statistics, the results JSONL) is world-readable, so this also runs as any
 user — no root required. Press `q` or Ctrl-C to quit.
 
@@ -399,6 +459,20 @@ useful for a quick check or piping into something else. Uses the
 NOPASSWD sudo grants for `systemctl`/`journalctl`/`ip` (see
 `/etc/sudoers.d/`) rather than requiring a root login.
 
+### Fake protocol servers (generating test traffic)
+```bash
+python3 /opt/tscan/scripts/fake_smtp.py    # TCP 2525
+python3 /opt/tscan/scripts/fake_imap.py    # TCP 1430
+python3 /opt/tscan/scripts/fake_pop3.py    # TCP 1100
+python3 /opt/tscan/scripts/fake_telnet.py  # TCP 2323
+```
+Run on a separate test host (traffic originating on the capture host
+itself never appears on its SPAN-fed capture NIC), then use the commands in
+`docs/test_reference.md` from a machine whose traffic is mirrored to the
+capture NIC. Valid credentials are `testuser` / `hunter2`. Remember the
+repeat-finding cooldown: re-sending the identical credentials to the same
+server within 30 minutes will not produce a second `results.jsonl` line.
+
 ### Health check timer
 ```bash
 sudo systemctl list-timers tscan-pipeline-healthcheck.timer --no-pager
@@ -406,7 +480,11 @@ sudo systemctl status tscan-pipeline-healthcheck.service --no-pager
 ```
 The service's last run should be `code=exited, status=0/SUCCESS` — a
 non-zero exit here means the healthcheck script itself broke, not
-necessarily that the pipeline is down.
+necessarily that the pipeline is down. The script loads the full `Config`
+(including validation), so an invalid config file makes it exit 1 as well.
+To reset its state, remove `/var/lib/tscan-healthcheck/down` (this makes it
+treat the pipeline as "up"; it will alert DOWN again on the next tick if the
+service is still not active).
 
 ---
 
@@ -464,6 +542,18 @@ sudo tcpdump -ni <capture-interface> -c 10
 - logrotate missing `su tscan tscan`
 - Fix ownership and rerun logrotate
 
+### Repeated test credentials produce no new finding / alert
+- This is the `[dedup] finding_cooldown_sec` cooldown working as designed
+  (same `dst`, `dport` and `creds` within 30 minutes). Use different
+  credentials or a different target, set `finding_cooldown_sec = 0` while
+  testing, or stop and start the service (which clears
+  `/run/tscan/finding_cooldown/`).
+
+### Findings appear in results.jsonl but not in watch.py / dashboard
+- Both viewers count/display only `outcome == "success"`. Check the line's
+  `outcome` field (e.g. `server_error`, `no_response`, `unknown`). Also
+  check they can read the file (see "Logging Directory").
+
 ### Config changes have no effect
 - The service must be restarted after editing `tscan_ng.conf`:
 ```bash
@@ -515,7 +605,10 @@ sudo systemctl restart tscan-pipeline
 - [ ] Runtime verification complete (pipeline status, NIC, output)
 - [ ] Update script tested: `sudo /opt/tscan/scripts/update.sh`
 - [ ] Discord webhook configured in `[discord]` section (optional) and a
-      test finding/failure confirmed to arrive
+      test finding/failure confirmed to arrive; `[dedup]
+      finding_cooldown_sec` reviewed (default 1800)
+- [ ] Optional: fake test servers (`scripts/fake_*.py`) exercised per
+      `docs/test_reference.md`
 - [ ] Live monitor tested: `python3 /opt/tscan/scripts/watch.py`
 - [ ] Live dashboard tested: `python3 /opt/tscan/scripts/dashboard.py`
 - [ ] Quick status snapshot tested: `bash /opt/tscan/scripts/status.sh`

@@ -1,3 +1,10 @@
+# Pinned Python dependencies for the /opt/tscan/venv virtualenv, installed by
+# scripts/update.sh and docs/REBUILD.md.
+#   dpkt      - packet parsing helpers
+#   orjson    - fast JSON serialization (tscan_ng/sinks/jsonl.py)
+#   requests  - Discord webhook HTTP client (tscan_ng/sinks/discord.py)
+# libpcap (system package libpcap0.8) is also required but is loaded via
+# ctypes, not pip.
 dpkt==1.9.8
 orjson==3.11.3
 requests==2.34.2

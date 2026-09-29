@@ -4,9 +4,35 @@
 # Runs every git operation as the tscan service user (the repo at /opt/tscan
 # is owned by tscan, not the operator running this script), so the commit
 # author and pushed history stay consistent regardless of which admin ran it.
+# The git identity and the deploy-key SSH command come from the repo's own
+# .git/config (user.name, user.email, core.sshCommand -- see docs/REBUILD.md
+# "Deploy Code"), not from any user's home directory.
 #
-# Usage: sudo /opt/tscan/scripts/push.sh "commit message" [file ...]
-#   With no file arguments, all changes (including new files) are staged.
+# Usage:
+#   sudo /opt/tscan/scripts/push.sh "commit message" [file ...]
+#
+# Arguments:
+#   commit message   required; passed verbatim to `git commit -m`.
+#   file ...         optional; paths staged with `git add -- <file>...`. Paths
+#                    are resolved by `git -C /opt/tscan`, i.e. relative to
+#                    /opt/tscan, NOT to the caller's working directory.
+#                    With no files, everything is staged with `git add -A`
+#                    (tracked changes, deletions and new untracked files;
+#                    .gitignore still excludes venv/, *.jsonl, tscan_ng.conf,
+#                    .ssh/, etc.).
+#
+# Environment: none read. APP_DIR and SERVICE_USER are set below.
+#
+# Privileges: must be root (EUID 0), because it uses `sudo -u tscan` to switch
+#   to the service user; the script itself refuses to run otherwise.
+#
+# Exit codes:
+#   0  committed and pushed.
+#   1  not root; no commit message given; or nothing staged to commit.
+#   any other non-zero: `set -e` aborts on the first failing git command
+#   (add, commit, push) and the script exits with that command's status.
+#   NB: if `commit` succeeds but `push` fails, the commit stays local;
+#   re-run `sudo -u tscan -H git -C /opt/tscan push` by hand.
 set -euo pipefail
 
 # Must be run as root so we can run git as the tscan service user.

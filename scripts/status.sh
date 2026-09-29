@@ -1,8 +1,29 @@
 #!/usr/bin/env bash
 # scripts/status.sh - Quick "what's running right now" snapshot for tscan-ng.
 #
-# Read-only. Uses the NOPASSWD sudo grants for systemctl/journalctl/ip
-# (see /etc/sudoers.d), so no root login is needed to run this.
+# Read-only. Prints, in order: `systemctl status` of the pipeline service
+# (first 12 lines), of the healthcheck timer (first 6 lines), the capture
+# interface's link state, the number of processes matching the pipeline's
+# main command line, and the last 15 journal lines of the pipeline unit.
+#
+# Usage:  bash /opt/tscan/scripts/status.sh      (no arguments)
+#
+# Environment: none read. Unit names and the capture interface name are
+#   hard-coded below (IFACE must be edited if the NIC changes).
+#
+# Privileges: runs as the invoking (non-root) user and calls
+#   `sudo systemctl`, `sudo ip` and `sudo journalctl`, which rely on the
+#   NOPASSWD grants in /etc/sudoers.d for exactly those binaries. No root
+#   login needed, but it will prompt for a password if the grants are absent.
+#   (Inference: `systemctl status` and `ip link show` do not require root by
+#   themselves; sudo matters mainly for journalctl on a user outside the
+#   adm/systemd-journal groups.)
+#
+# Exit codes: deliberately NOT `set -e` -- a stopped service or missing
+#   interface must not abort the snapshot, so individual command failures are
+#   ignored. The exit status is that of the final journalctl command
+#   (0 normally). Because of `| head`, pipeline exit statuses are not
+#   meaningful here even with pipefail.
 set -uo pipefail
 
 PIPELINE="tscan-pipeline.service"
@@ -24,6 +45,12 @@ sudo ip -brief link show "${IFACE}" 2>/dev/null || echo "  ${IFACE} not found"
 echo
 
 bold "== worker processes =="
+# Counts processes whose full command line matches "tscan_ng.pipeline", i.e.
+# the main process (`python -m tscan_ng.pipeline`). The worker children
+# are started by multiprocessing's forkserver (the default start method on
+# Python 3.14) and their command lines contain "tscan_ng/pipeline.py", which
+# this pattern does not match, so on a healthy host this prints 1 -- use
+# `systemctl status` (CGroup section) to see the workers.
 count=$(pgrep -cf "tscan_ng\.pipeline")
 if [[ "${count}" -gt 0 ]]; then
   echo "  ${count} process(es) (1 main + forkserver workers)"

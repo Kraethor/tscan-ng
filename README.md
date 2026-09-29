@@ -6,10 +6,15 @@ monitoring via SPAN / mirror ports.
 ## Repository layout
 - `tscan_ng/` – Python capture pipeline, detectors, and output sinks
 - `scripts/` – operational scripts (live viewer, dashboard, status snapshot,
-  health check, deploy/update/push)
-- `systemd/` – systemd service/timer units
+  health check, deploy/update/push) and the fake protocol servers used for
+  manual testing; see "Scripts" below
+- `systemd/` – systemd service/timer units, plus a template
+  systemd-networkd config for the capture NIC
 - `logrotate/` – log rotation configuration
-- `docs/` – rebuild and deployment documentation
+- `docs/` – rebuild and deployment documentation (`REBUILD.md`) and the
+  manual protocol test reference (`test_reference.md`)
+- `requirements.txt` – pinned Python dependencies (`dpkt`, `orjson`,
+  `requests`); libpcap (`libpcap0.8`) is a system package, not a pip one
 
 ## Architecture
 
@@ -25,7 +30,13 @@ Every finding is written to a shared JSONL file (`tscan_ng/sinks/jsonl.py`,
 `flock()`-safe for concurrent writers) and, for any finding whose outcome
 isn't "pending" or "failed" (see `DiscordSink._SUPPRESSED_OUTCOMES`), to a
 Discord webhook (`tscan_ng/sinks/discord.py`) — both fire from inside the
-pipeline itself, independent of whether anything is watching. A worker that dies abnormally (e.g. the capture interface going
+pipeline itself, independent of whether anything is watching. Both sinks sit
+behind one shared repeat-finding cooldown in `pipeline.py`'s `_emit()`: a
+finding with the same `(dst, dport, creds)` as one already emitted within
+`[dedup] finding_cooldown_sec` (default 1800 s) is dropped before *either*
+sink sees it, so a scanner replaying the same credentials at the same
+service produces one log line and one alert per window, not one per packet.
+A worker that dies abnormally (e.g. the capture interface going
 down) exits non-zero so systemd's `Restart=on-failure` actually restarts
 the service, and fires its own Discord alert. A separate
 `tscan-pipeline-healthcheck` timer polls the service's status every 2
@@ -39,8 +50,8 @@ failure). See "Alerting & health monitoring" below.
 |----------|------------------------------|------------------------------------------|
 | HTTP     | Basic Auth header scan      | 80, 3128, 8000, 8008, 8080, 8081, 8888  |
 | FTP      | USER/PASS command scan      | 21, 2121                                |
-| SMTP     | AUTH credential scan        | 25, 465, 587, 2525                      |
-| IMAP     | LOGIN command scan          | 143, 993, 1430                          |
+| SMTP     | AUTH PLAIN / AUTH LOGIN scan | 25, 465, 587, 2525                      |
+| IMAP     | LOGIN and AUTHENTICATE PLAIN scan | 143, 993, 1430                    |
 | POP3     | USER/PASS command scan      | 110, 995, 1100                          |
 | Telnet   | Login/Password prompt scan  | 23, 2323                                |
 | LDAP       | Simple-bind BindRequest     | 389, 3268                               |
@@ -65,7 +76,8 @@ protocol-correlation details and the resulting alerting tradeoff (a
 captured hash is equally crackable whether or not that specific logon
 attempt succeeded, but a failed SMB logon still maps to outcome="failed"
 and so still won't alert, for consistency with every other detector —
-only outcome="failed" and outcome="pending" are suppressed).
+only outcome="failed" and outcome="pending" are suppressed; a non-success,
+non-failed SMB status maps to "server_error", which does alert).
 
 SNMP is the other exception, in the other direction: it's the first and
 only UDP-carried detector (every other protocol here is TCP), and its
@@ -81,8 +93,12 @@ host-specific and may hold a Discord webhook secret). The minimum required
 setting is `capture.iface`. All other values have safe defaults; see the
 config file itself and `tscan_ng/config.py` for full documentation of
 every setting, including `[capture]` (interface, snaplen, buffer size),
-`[dispatcher]` (worker count, output path), and `[sessions]` (timeouts,
-buffer/session limits).
+`[dispatcher]` (worker count, output path), `[sessions]` (timeouts,
+buffer/session limits), `[discord]` (webhook, operational-alert cooldown) and
+`[dedup]` (repeat-finding cooldown). The config file is read once at startup,
+so restart the service after editing it. Note that `[dispatcher] socket` is a
+leftover from the retired dispatcher architecture: it is still validated by
+`config.py` (must be an absolute path) but nothing opens it any more.
 
 Port lists for each protocol detector are configured under `[ports]` and
 can be extended without touching source code:
@@ -119,16 +135,28 @@ not in any viewer, so there is nothing to remember to turn on. Add a
 discord_webhook = https://discord.com/api/webhooks/...
 
 # Minimum seconds between operational alerts (pipeline_worker exiting
-# abnormally). Credential-finding alerts are never rate-limited.
+# abnormally). Does NOT apply to credential findings -- see [dedup].
 notify_cooldown_sec = 300
+
+[dedup]
+# Minimum seconds between findings sharing the same (dst, dport, creds).
+# Applied once in pipeline.py's _emit(), i.e. BEFORE both results.jsonl and
+# Discord, so it also thins out what watch.py and the dashboard show.
+# 0 disables it (every finding is emitted). Default 1800 (30 minutes).
+finding_cooldown_sec = 1800
 ```
 
 Leave `discord_webhook` blank or omit the section to disable alerting
 entirely. Three kinds of alert share the one webhook:
 
-- **Credential finding** — fired for every successful capture. Only the
-  finding `type`, the username portion of `creds`, and `session_id` are
-  sent; no passwords or packet payloads leave the host.
+- **Credential finding** — fired for every finding whose outcome is not
+  `pending` or `failed` (so `success`, `redirect`, `server_error`,
+  `no_response` and `unknown` all alert — e.g. an HTTP Basic request answered
+  with a 403 usually means the credentials were accepted). Only the finding
+  `type`, the username portion of `creds`, the `outcome` and `session_id` are
+  sent; no passwords or packet payloads leave the host. Repeats of the same
+  `(dst, dport, creds)` within `[dedup] finding_cooldown_sec` are suppressed
+  before this point (see Architecture).
 - **Pipeline failure** (in-process) — fired when a worker process exits
   abnormally (e.g. the capture interface going down). Rate-limited by
   `notify_cooldown_sec` so a sustained outage sends one alert per cooldown
@@ -144,11 +172,15 @@ entirely. Three kinds of alert share the one webhook:
 Three read-only tools:
 
 - `scripts/watch.py` — tails the results file and displays colour-coded
-  credential findings in real time. Reads only the world-readable results
-  JSONL; no elevated privileges needed.
+  credential findings in real time. Shows only new findings with
+  `outcome == "success"` (other outcomes are in the JSONL and may still
+  alert on Discord, but are not displayed). Reads only the results JSONL; no
+  elevated privileges needed as long as that file is readable by your user.
 - `scripts/dashboard.py` — live full-screen status dashboard (service
   state, monitor/admin interface health, capture throughput, recent
-  findings, worker/load info), refreshing once a second. Everything it
+  findings — again counting only `outcome == "success"` — and worker/load
+  info), refreshing once a second. Interface names and the worker count are
+  constants at the top of the script, not read from the config. Everything it
   reads (systemd unit properties, `/sys/class/net` statistics, the results
   JSONL) is world-readable too — no elevated privileges needed here either.
 - `scripts/status.sh` — a quick, non-interactive snapshot of the same
@@ -168,11 +200,53 @@ python3 /opt/tscan/scripts/dashboard.py
 bash /opt/tscan/scripts/status.sh
 ```
 
+## Scripts
+
+| Script | Run as | Purpose |
+|--------|--------|---------|
+| `scripts/watch.py [file]` | any user | Live coloured viewer of successful findings (see above) |
+| `scripts/dashboard.py` | any user | Full-screen curses status dashboard (see above) |
+| `scripts/status.sh` | any user with the NOPASSWD sudo grants | One-shot text status snapshot |
+| `scripts/pipeline_healthcheck.py` | `tscan`, via `tscan-pipeline-healthcheck.service` | Out-of-process up/down check; alerts on Discord on each transition |
+| `scripts/update.sh` | root | Stop service, `git pull --ff-only`, pip install, reinstall changed systemd units, restart. Does **not** install `logrotate/tscan` or the networkd file |
+| `scripts/push.sh "msg" [file ...]` | root | Stage, commit and push as the `tscan` user |
+| `scripts/fake_smtp.py`, `fake_imap.py`, `fake_pop3.py`, `fake_telnet.py` | any non-root user, on a test host | Cleartext fake servers on TCP 2525 / 1430 / 1100 / 2323 that accept `testuser` / `hunter2` and reject everything else; used to generate traffic for the detectors (see `docs/test_reference.md`) |
+
+Each script has a header documenting its arguments, environment, required
+privileges and exit codes.
+
+## systemd, logrotate and networking
+
+- `systemd/tscan-pipeline.service` — the pipeline (`Restart=on-failure`,
+  `RestartSec=5`, `StartLimitIntervalSec=0`, ambient `CAP_NET_RAW` +
+  `CAP_NET_ADMIN`, `MemoryHigh=6G` / `MemoryMax=8G` / `MemorySwapMax=512M`,
+  `RuntimeDirectory=tscan`).
+- `systemd/tscan-pipeline-healthcheck.service` / `.timer` — oneshot check run
+  every 2 minutes (`OnBootSec=2min`, `OnUnitActiveSec=2min`); state lives in
+  `/var/lib/tscan-healthcheck` (`StateDirectory=`).
+- `logrotate/tscan` — daily, keep 14, compressed, `copytruncate` and
+  `su tscan tscan` (both required; see the comments in the file).
+- `systemd/tscan-monitor.network.example` — template
+  systemd-networkd match for the capture NIC. Without a `.network` file
+  matching its MAC, nothing brings that NIC up after boot or USB
+  re-enumeration and the pipeline crash-loops. The live host uses
+  `/etc/systemd/network/70-tscan-monitor.network`.
+- Runtime scratch: `/run/tscan/` (created by `RuntimeDirectory=tscan`) holds
+  the Discord operational-alert cooldown marker and, under
+  `/run/tscan/finding_cooldown/`, one marker file per `(dst, dport, creds)`
+  key for the finding cooldown. The directory is emptied when the service
+  stops, so the finding cooldown resets on every full stop/start (it survives
+  `Restart=on-failure` cycles).
+
 ## Deployment
 See `docs/REBUILD.md` for full rebuild instructions. `scripts/push.sh
 "commit message" [file ...]` stages, commits, and pushes local changes as
 the `tscan` service user (the repo at `/opt/tscan` is owned by `tscan`, not
-whichever admin is running the script).
+whichever admin is running the script). Never run bare `git` as another
+user in `/opt/tscan`: it leaves root/operator-owned objects that the
+`tscan` user can no longer write.
+
+Testing detectors by hand: see `docs/test_reference.md`.
 
 ## Notes
 - Designed to run with a non-login service account

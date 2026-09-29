@@ -12,6 +12,8 @@ Platform notes:
   - fcntl.flock() is Linux/Unix only. This module is not portable to Windows.
   - flock() behaviour is undefined on NFS mounts. The output file must reside
     on a local filesystem (the default /var/log/tscan/ is always local).
+  - Stdout mode (path=None) takes no lock; concurrent processes writing
+    lines larger than PIPE_BUF to a shared pipe could interleave.
   - The file is opened with buffering=0 (unbuffered) so that flock boundaries
     coincide with kernel write boundaries, preventing interleaved lines.
 """
@@ -31,6 +33,11 @@ class JSONLSink:
 
     Args:
         path: Filesystem path to the output file, or None to write to stdout.
+
+    The file handle is opened once and never closed or reopened; log
+    rotation must therefore be copytruncate-style (as /etc/logrotate.d/tscan
+    is), since a rename-style rotation would leave writers appending to the
+    rotated file.
     """
 
     def __init__(self, path: str | None):
@@ -42,6 +49,9 @@ class JSONLSink:
 
         Args:
             path: Output file path, or None for stdout.
+
+        Raises:
+            OSError: If the file cannot be opened for append.
         """
         self._fd = None
         if path:
@@ -60,6 +70,10 @@ class JSONLSink:
 
         Args:
             obj: Dictionary to serialize. Must be orjson-serializable.
+
+        Raises:
+            TypeError: (orjson.JSONEncodeError) if obj is not serializable.
+            OSError: On write failure (e.g. disk full).
         """
         line = json.dumps(obj) + b"\n"
         if self._fd:

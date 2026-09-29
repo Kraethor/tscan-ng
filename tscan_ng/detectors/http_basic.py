@@ -45,7 +45,10 @@ Finding outcomes:
                    means the credentials *were* accepted and something else
                    (ACL, WAF, path rule) blocked the request, so this is not
                    noise — see _outcome()'s docstring.
-    pending      - Credentials seen, no server response yet in this packet
+    pending      - Not emitted by this module: a credential with no response
+                   yet is parked with session.add_pending() and reported
+                   later as success/failed/... or no_response. (The word
+                   only appears in DiscordSink's suppression list.)
     no_response  - Session expired before a server response was seen
                    (emitted by SessionTable.expire())
 
@@ -63,6 +66,36 @@ Note on 304:
     304. So 304 is as strong evidence of valid credentials as 2xx, and is
     classified as "success" rather than lumped in with ordinary 3xx redirects
     (301/302/303/307/308), which carry no such guarantee about auth validity.
+
+Credentials extracted:
+    The base64 token of any "Authorization: Basic <token>" header, decoded
+    (common.decode_b64) to "user:password" and emitted verbatim as "creds".
+    The header search is a substring match, so "Proxy-Authorization: Basic"
+    (sent to a proxy such as Squid on 3128) is captured too; a proxy rejects
+    those with 407, which _outcome() reports as "unknown". Also recorded:
+    "host" (Host header), "method" and "uri" (request line). Tokens that fail
+    to decode, or decode to just ":" / nothing, are dropped.
+
+Request framing:
+    A request is delimited only by the first blank line (CRLF CRLF). Request
+    bodies are NOT skipped: a POST body remains in client_buf and is treated as
+    the start of the next request's header block.
+
+Response correlation:
+    The first "HTTP/x.y NNN" status line in server_buf is used, regardless of
+    which request it answers, and it is consumed only when matched to a
+    credential. Responses to requests without Authorization (for example the
+    401 challenge a browser receives before it retries with credentials) are
+    never consumed, so a following credentialed request can be paired with
+    that stale response. Keep-alive/pipelined ordering is otherwise assumed.
+    run.py's _try_resolve() repeats the same matching for pending findings.
+
+Known limitations:
+    - HTTPS is opaque; only cleartext HTTP on the configured ports is seen.
+    - A header block longer than _MAX_HEADER_SCAN, or a large body with no
+      CRLF CRLF in it, prevents progress: nothing is consumed until enough
+      data arrives to find a boundary inside the scan window.
+    - Digest, NTLM and Bearer authentication are not handled.
 """
 
 import logging
@@ -86,18 +119,27 @@ _HTTP_PORTS: frozenset = frozenset({
 # Maximum bytes to scan for an HTTP header boundary (\r\n\r\n) per call.
 # 16 KB is well above any realistic HTTP request header. Capping the scan
 # here bounds per-packet CPU to O(1) rather than O(n) over buffer lifetime.
+# (The scan window is _MAX_HEADER_SCAN + 4 bytes so a boundary that ends
+# exactly at the limit is still found.)
 _MAX_HEADER_SCAN = 16384
 
-# Matches the HTTP request line e.g. "GET /path HTTP/1.1"
+# Matches the HTTP request line e.g. "GET /path HTTP/1.1".
+#   Group 1: method (upper-case letters only), Group 2: request target.
+# Requires CRLF line ends. Unanchored-by-position: MULTILINE ^ lets it match
+# on any line, so it is searched on the already-isolated header block.
 _REQUEST_LINE_RE = re.compile(rb"^([A-Z]+)\s+(\S+)\s+HTTP/\d+\.\d+\r\n", re.MULTILINE)
 
-# Matches the HTTP response status line e.g. "HTTP/1.1 200 OK"
+# Matches the HTTP response status line e.g. "HTTP/1.1 200 OK".
+#   Group 1: 3-digit status code, Group 2: reason phrase (may be empty; the
+#   lazy (.*?) stops at the first CRLF).
 _RESPONSE_LINE_RE = re.compile(rb"^HTTP/\d+\.\d+\s+(\d{3})\s+(.*?)\r\n", re.MULTILINE)
 
-# Matches Authorization: Basic <token> header
+# Matches Authorization: Basic <token> header (also matches inside
+# "Proxy-Authorization:" since there is no line anchor).
+#   Group 1: the still-base64-encoded token (non-whitespace run).
 _AUTH_HEADER_RE = re.compile(rb"Authorization:\s*Basic\s+(\S+)", re.IGNORECASE)
 
-# Matches Host: header
+# Matches Host: header. Group 1: host[:port] token.
 _HOST_HEADER_RE = re.compile(rb"Host:\s*(\S+)", re.IGNORECASE)
 
 
@@ -137,6 +179,10 @@ def _parse_response(server_buf: bytearray) -> tuple[int, str, int] | None:
     """
     Extract the HTTP status code, text, and byte end-offset from the server buffer.
 
+    Finds the FIRST status line anywhere in the buffer (not necessarily the
+    one answering the current request). Also imported by run.py's
+    _try_resolve(). Copies the whole buffer to bytes on each call.
+
     Args:
         server_buf: Reassembled server-direction byte stream.
 
@@ -161,8 +207,10 @@ def detect_stream(session, ts: float) -> list[dict]:
 
     Emits a finding immediately if a server response is available, or
     registers a pending finding on the session for later resolution when the
-    response arrives. Consumes matched requests from the client buffer to
-    avoid re-detection on subsequent packets.
+    response arrives. Consumes every scanned request header block (with or
+    without credentials) from the client buffer to avoid re-detection on
+    subsequent packets. A matched response line is consumed from server_buf
+    without calling session.shift_pending_floors() (run.py's path does).
 
     The scan is bounded to _MAX_HEADER_SCAN bytes per call to prevent O(n²)
     CPU usage at high line speed. The client buffer is consumed before
@@ -201,7 +249,8 @@ def detect_stream(session, ts: float) -> list[dict]:
         headers = bytes(session.client_buf[:consume])
         del session.client_buf[:consume]
 
-        # Skip requests with no Basic Auth credentials
+        # Skip requests with no Basic Auth credentials (their header block has
+        # already been consumed above).
         auth_match = _AUTH_HEADER_RE.search(headers)
         if not auth_match:
             continue
