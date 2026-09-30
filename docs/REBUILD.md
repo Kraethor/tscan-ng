@@ -274,9 +274,12 @@ share the one webhook:
 
 - **Credential finding**, fired for every finding whose outcome is not
   `pending` or `failed` (`success`, `redirect`, `server_error`,
-  `no_response` and `unknown` all alert). Only `type`, the username
-  portion of `creds`, the `outcome` and `session_id` are sent — no
-  password material or packet payloads leave the host.
+  `no_response` and `unknown` all alert), except an SNMP `no_response`
+  (unanswered internet scans of UDP 161 are logged but not alerted). Only
+  `type`, the username portion of `creds`, the `outcome` and `session_id` are
+  sent — no password material or packet payloads leave the host. SNMP findings
+  have no username part (the community string is the secret), so their alerts
+  show a placeholder instead of the community string.
 - **Pipeline failure** (in-process), fired when a worker exits abnormally
   (e.g. the capture interface dropping). `notify_cooldown_sec` rate-limits
   this so a sustained outage doesn't send one alert per restart cycle.
@@ -417,7 +420,19 @@ sending local changes upstream; it runs every git command as `tscan`.
 sudo systemctl status tscan-pipeline --no-pager
 ```
 Should show `active (running)` with `workers`-many `pipeline_worker`
-child processes under the main PID.
+child processes under the main PID. Workers are started with the `spawn`
+method, so their command lines read `python -c 'from multiprocessing.spawn
+import spawn_main ...'`. A stop or restart should take about a second: each
+worker flushes its pending sessions on SIGTERM (see "Common Failure Modes").
+
+### Unit tests
+Run from `/opt/tscan` with the project venv (it has `dpkt`; the
+tests need no network, root or config file):
+```bash
+PYTHONDONTWRITEBYTECODE=1 venv/bin/python -m unittest discover -s tests -t . -v
+```
+All tests should pass before deploying a code change. `PYTHONDONTWRITEBYTECODE=1`
+is needed because `__pycache__` is not writable for the operator account.
 
 ### Capture NIC
 ```bash
@@ -525,6 +540,16 @@ service is still not active).
 ```bash
 sudo tcpdump -ni <capture-interface> -c 10
 ```
+
+### `systemctl stop`/`restart` takes a long time, or workers are killed
+- Normal is about a second. The journal line `pipeline: pid=N did not exit
+  cleanly, killing` means a worker ignored SIGTERM for 5 s. Two causes were
+  fixed in the code and should not recur: the stop flag must be lock-free
+  (`threading.Event` deadlocks when a second SIGTERM lands inside `set()`), and
+  the workers must be started with `spawn` (Python 3.14's default `forkserver`
+  deadlocks the parent's exit, which showed up as a stop hanging for the full
+  90 s `TimeoutStopSec`). If it reappears after a Python upgrade, check
+  `pipeline.main()` still passes `mp.get_context("spawn")`.
 
 ### Pipeline restarts continuously (crash-loop)
 - This is now the *expected*, self-healing behavior when the capture

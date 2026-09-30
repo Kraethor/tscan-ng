@@ -48,6 +48,12 @@ minutes from outside the Python process entirely, as a second layer that
 also catches failures the in-process code can't see (OOM-kill, startup
 failure). See "Alerting & health monitoring" below.
 
+Workers are started with `multiprocessing`'s `spawn` method (pinned in
+`pipeline.main()`). On `systemctl stop`/`restart` (SIGTERM) each worker stops
+its capture loop, flushes its sessions — credentials seen but not yet answered
+are written as `no_response` instead of being lost — and exits; a stop or
+restart normally takes about a second.
+
 ## Detectors
 
 | Protocol | Detection method            | Default ports                          |
@@ -160,9 +166,12 @@ entirely. Three kinds of alert share the one webhook:
 - **Credential finding** — fired for every finding whose outcome is not
   `pending` or `failed` (so `success`, `redirect`, `server_error`,
   `no_response` and `unknown` all alert — e.g. an HTTP Basic request answered
-  with a 403 usually means the credentials were accepted). Only the finding
-  `type`, the username portion of `creds`, the `outcome` and `session_id` are
-  sent; no passwords or packet payloads leave the host. Repeats of the same
+  with a 403 usually means the credentials were accepted), except an SNMP
+  `no_response` (unanswered internet scans of UDP 161 — logged, not alerted).
+  Only the finding `type`, the username portion of `creds`, the `outcome` and
+  `session_id` are sent; no passwords or packet payloads leave the host. SNMP
+  findings have no username part (the community string is the secret), so
+  their alerts show a placeholder instead of the community string. Repeats of the same
   `(dst, dport, creds, outcome)` within `[dedup] finding_cooldown_sec` are suppressed
   before this point (see Architecture).
 - **Pipeline failure** (in-process) — fired when a worker process exits
