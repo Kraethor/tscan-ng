@@ -50,8 +50,11 @@ that enumerates the protocols; missing one causes a silent failure):
     7. scripts/watch.py: a colour/label entry (and display branch) for the new
        finding type; docs (README.md, docs/REBUILD.md, docs/test_reference.md)
        and tests.
-    Also consider session._SERVER_PORTS (direction normalisation) if the
-    server speaks first, and whether DiscordSink._SUPPRESSED_OUTCOMES gives the
+    Also add cfg.<proto>_ports to the union in Config.server_ports
+    (config.py): it tells SessionTable which side of a flow is the server when
+    a flow is first seen from the server side; without it such flows are
+    stored with client/server swapped. And check whether
+    DiscordSink._SUPPRESSED_OUTCOMES (and _SUPPRESSED_TYPE_OUTCOMES) give the
     new outcome values the alerting behaviour you want.
 """
 
