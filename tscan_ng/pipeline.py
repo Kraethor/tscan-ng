@@ -215,6 +215,28 @@ def _open_fanout_socket(iface: str, group_id: int, bpf_filter: str,
     return sock
 
 
+def _stamp_resolved(finding: dict, ts: float) -> dict:
+    """
+    Return a copy of a pending-then-resolved *finding* with a "ts" field.
+
+    Immediate findings get "ts" (the packet time) from the call sites below,
+    and http_basic's resolution sets it itself, but run.py's _try_resolve()
+    returns every other detector's resolved finding without one, so those
+    records had no top-level timestamp (TODO.md #17). "ts" is set to the
+    finding's own ts_start (when the credentials were seen), consistent with
+    immediate findings; *ts* (the current packet time) is only the fallback
+    if ts_start is missing. An existing "ts" is left as is.
+
+    Args:
+        finding: Resolved finding dict from _try_resolve().
+        ts:      Unix timestamp of the packet that resolved it.
+
+    Returns:
+        New dict; the input is not modified.
+    """
+    return {"ts": finding.get("ts_start", ts), **finding}
+
+
 def _emit(sink: JSONLSink, discord: DiscordSink, finding: dict,
           finding_cooldown_sec: float = 0) -> None:
     """
@@ -463,7 +485,8 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
                 for p in session.pending:
                     resolved = _try_resolve(p, session, ts)
                     if resolved:
-                        _emit(sink, discord, resolved, finding_cooldown_sec)
+                        _emit(sink, discord, _stamp_resolved(resolved, ts),
+                              finding_cooldown_sec)
                     else:
                         still_pending.append(p)
                 session.pending = still_pending

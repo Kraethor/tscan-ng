@@ -66,6 +66,7 @@ def _try_resolve(p, session, ts: float) -> dict | None:
     Note the returned dicts are not uniform: only the http_basic branch
     sets "ts" (and "status_text"); the other branches leave "ts" to
     whatever the detector's original finding carried, which is nothing.
+    The caller (pipeline.py) adds it via _stamp_resolved().
 
     Args:
         p:       PendingFinding object from the session.
