@@ -22,13 +22,13 @@ class WorkerStopHandlerTests(unittest.TestCase):
         saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
         self.addCleanup(lambda: [signal.signal(s, h) for s, h in saved.items()])
 
-    def test_sigterm_sets_stop_event_without_killing_process(self):
+    def test_sigterm_sets_stop_flag_without_killing_process(self):
         stop = pipeline._install_worker_stop_handlers()
         self.assertFalse(stop.is_set())
         os.kill(os.getpid(), signal.SIGTERM)
         self.assertTrue(stop.is_set())
 
-    def test_sigint_sets_stop_event_too(self):
+    def test_sigint_sets_stop_flag_too(self):
         stop = pipeline._install_worker_stop_handlers()
         os.kill(os.getpid(), signal.SIGINT)      # would raise KeyboardInterrupt by default
         self.assertTrue(stop.is_set())
@@ -38,6 +38,53 @@ class WorkerStopHandlerTests(unittest.TestCase):
         os.kill(os.getpid(), signal.SIGTERM)
         os.kill(os.getpid(), signal.SIGTERM)
         self.assertTrue(stop.is_set())
+
+
+_STRESS_CHILD = r"""
+import sys
+sys.path.insert(0, "/opt/tscan")
+from tscan_ng import pipeline
+stop = pipeline._install_worker_stop_handlers()
+print("ready", flush=True)
+# Keep calling set() so signals routinely land while it is executing; the
+# handler then re-enters set() from inside set().
+for _ in range(400000):
+    stop.set()
+print("done", flush=True)
+"""
+
+
+class ReentrantHandlerTests(unittest.TestCase):
+    def test_signal_arriving_inside_stop_set_does_not_deadlock(self):
+        """
+        systemd and main() both send SIGTERM to each worker, so a second
+        signal can interrupt the first handler's stop.set(). With a
+        threading.Event (non-reentrant internal lock) the nested handler
+        blocked forever -- seen in production as workers that had to be
+        SIGKILLed after 5 s. The stop flag must be reentrancy-safe.
+        """
+        import subprocess, sys, threading, time
+        child = subprocess.Popen([sys.executable, "-c", _STRESS_CHILD],
+                                 stdout=subprocess.PIPE, text=True)
+        seen = []
+        reader = threading.Thread(
+            target=lambda: [seen.append(l.strip()) for l in child.stdout], daemon=True)
+        reader.start()
+        try:
+            deadline = time.monotonic() + 30
+            while "ready" not in seen and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertIn("ready", seen)
+            # Hammer the child with SIGTERM until it reports it finished.
+            while "done" not in seen and time.monotonic() < deadline:
+                child.send_signal(signal.SIGTERM)
+                time.sleep(0.0002)
+            self.assertIn("done", seen, "child deadlocked in its signal handler")
+            child.wait(timeout=10)
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
 
 
 class MainShutdownHandlerTests(unittest.TestCase):

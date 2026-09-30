@@ -41,7 +41,7 @@ is identical whether it ends up driving a pcap handle or a Linux socket
 filter, so no translation is needed.
 """
 
-import ctypes, hashlib, logging, multiprocessing as mp, multiprocessing.connection, os, signal, socket, struct, sys, threading, time
+import ctypes, hashlib, logging, multiprocessing as mp, multiprocessing.connection, os, signal, socket, struct, sys, time
 from tscan_ng.config import Config
 from tscan_ng.parsing.net import parse_basic, DLT_EN10MB
 from tscan_ng.detectors import STREAM_DETECTORS, configure_all
@@ -221,22 +221,51 @@ def _open_fanout_socket(iface: str, group_id: int, bpf_filter: str,
 _shutdown_requested = False
 
 
-def _install_worker_stop_handlers() -> threading.Event:
+class _StopFlag:
+    """
+    A stop flag that is safe to set from a signal handler.
+
+    Deliberately NOT a threading.Event: Event.set() takes a non-reentrant
+    lock, and each worker receives SIGTERM twice in quick succession (once
+    from systemd, once from main()'s terminate()). If the second signal
+    lands while the first handler is inside Event.set() -- holding that
+    lock -- the nested handler blocks forever on it. That left 1-2 of the
+    12 workers hung on most restarts until main() SIGKILLed them after 5 s
+    (stack dumps showed _handler -> Event.set -> _handler -> Event.set).
+    A plain attribute assignment needs no lock and is atomic in CPython.
+    """
+
+    __slots__ = ("_flag",)
+
+    def __init__(self):
+        self._flag = False
+
+    def set(self) -> None:
+        """Mark the flag set (lock-free; reentrancy-safe)."""
+        self._flag = True
+
+    def is_set(self) -> bool:
+        """True once set() has been called."""
+        return self._flag
+
+
+def _install_worker_stop_handlers() -> _StopFlag:
     """
     Make SIGTERM and SIGINT stop a worker's capture loop instead of killing it.
 
     `systemctl stop` sends SIGTERM to every process in the unit's cgroup.
     Python's default action terminates the process on the spot, so pending
     sessions were never flushed and any credential seen but not yet answered
-    was lost (TODO.md #21). The handler only sets an Event; the capture loop
+    was lost (TODO.md #21). The handler only sets a flag (a lock-free
+    _StopFlag, see its docstring for why not threading.Event); the capture loop
     checks it at the top of every iteration (recv() has a 1 s timeout, so the
     loop notices within about a second), then falls through to its normal
     flush_all() and socket close.
 
     Returns:
-        The Event that is set once a stop signal has been received.
+        The _StopFlag that is set once a stop signal has been received.
     """
-    stop = threading.Event()
+    stop = _StopFlag()
 
     def _handler(signum, frame):
         stop.set()
