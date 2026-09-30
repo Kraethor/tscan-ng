@@ -493,6 +493,26 @@ class Config:
         """
         return float(self._getint("dedup", "finding_cooldown_sec", fallback=1800))
 
+    @property
+    def server_ports(self) -> frozenset:
+        """
+        Union of every detector's configured ports (TCP and UDP): the set of
+        ports on which the other end of a flow is the server.
+
+        Used by session.SessionTable to decide which side of a flow is the
+        client when the first packet seen came from the server (capture
+        started mid-flow, or the server spoke first). Derived from [ports]
+        rather than hardcoded so every detector's ports, and any non-default
+        configured port, are covered (TODO.md #12).
+        """
+        ports = set()
+        for port_set in (self.http_ports, self.ftp_ports, self.smtp_ports,
+                         self.imap_ports, self.pop3_ports, self.telnet_ports,
+                         self.ldap_ports, self.redis_ports, self.smb_ports,
+                         self.snmp_ports, self.irc_ports, self.postgres_ports):
+            ports.update(port_set)
+        return frozenset(ports)
+
     def _validate(self):
         """
         Validate configuration values and raise ValueError for any that

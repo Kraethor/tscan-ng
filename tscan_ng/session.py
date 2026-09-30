@@ -45,10 +45,11 @@ from dataclasses import dataclass, field
 # When a packet arrives whose *source* port is in this set and whose
 # *destination* port is not, we treat the packet as server->client and
 # store the session from the client's perspective by swapping src/dst.
-# This is a hardcoded list, independent of the [ports] config section: ports
-# of the other detectors (LDAP, Redis, SMB, IRC, PostgreSQL, ...) and any
-# non-default configured ports are absent, so for those a flow first seen
-# mid-stream from the server side is stored with client/server swapped.
+# This hardcoded list is only the DEFAULT for SessionTable(); the pipeline
+# passes Config.server_ports (the union of every detector's configured
+# [ports]) instead, so LDAP, Redis, SMB, SNMP, IRC, PostgreSQL and any
+# non-default configured port are covered too. Callers that use the default
+# get this older, partial list (TODO.md #12).
 _SERVER_PORTS: frozenset = frozenset({
     21,    # FTP control
     22,    # SSH
@@ -70,7 +71,7 @@ _SERVER_PORTS: frozenset = frozenset({
 })
 
 
-def _normalize_direction(pkt: dict) -> dict:
+def _normalize_direction(pkt: dict, server_ports: frozenset = _SERVER_PORTS) -> dict:
     """
     Return a copy of pkt with src/dst/sport/dport normalised to client perspective.
 
@@ -79,13 +80,16 @@ def _normalize_direction(pkt: dict) -> dict:
     are swapped so that the client is always represented as the source.
 
     Args:
-        pkt: Normalized packet dict from parsing.net.parse_basic.
+        pkt:          Normalized packet dict from parsing.net.parse_basic.
+        server_ports: Ports treated as "server side" (default: the module's
+                      partial _SERVER_PORTS; the pipeline passes
+                      Config.server_ports).
 
     Returns:
         pkt (the same object, not a copy) unchanged if already client-perspective, or a new dict with
         src/dst and sport/dport swapped if direction was inverted.
     """
-    if pkt["sport"] in _SERVER_PORTS and pkt["dport"] not in _SERVER_PORTS:
+    if pkt["sport"] in server_ports and pkt["dport"] not in server_ports:
         return {
             **pkt,
             "src":   pkt["dst"],
@@ -406,11 +410,15 @@ class SessionTable:
                            once. Bounds total memory against a burst of many
                            concurrent flows, independent of per-session
                            buffer limits (see _evict_one).
+        _server_ports:     Ports treated as the server side when orienting a
+                           new flow from its first packet (see
+                           _normalize_direction).
     """
 
     def __init__(self, max_buf: int = 4 * 1024 * 1024,
                  timeout: float = 60.0, pending_max_age: float = 45.0,
-                 max_sessions: int = 2048):
+                 max_sessions: int = 2048,
+                 server_ports: frozenset | None = None):
         """
         Initialize an empty session table.
 
@@ -423,12 +431,18 @@ class SessionTable:
                              server_buf trim floor it was holding open.
             max_sessions:    Maximum number of concurrent sessions tracked
                              at once, independent of max_buf/timeout.
+            server_ports:    Ports on which the far end is the server, used
+                             to orient a flow first seen from the server
+                             side. None uses the partial module default
+                             _SERVER_PORTS; the pipeline passes
+                             Config.server_ports.
         """
         self._sessions: dict = {}
         self._max_buf = max_buf
         self._timeout = timeout
         self._pending_max_age = pending_max_age
         self._max_sessions = max_sessions
+        self._server_ports = _SERVER_PORTS if server_ports is None else server_ports
 
     def _make_key(self, src: str, dst: str, sport: int, dport: int) -> tuple:
         """
@@ -481,7 +495,7 @@ class SessionTable:
         if key not in self._sessions:
             if len(self._sessions) >= self._max_sessions:
                 evicted = self._evict_one()
-            norm = _normalize_direction(pkt)
+            norm = _normalize_direction(pkt, self._server_ports)
             self._sessions[key] = Session(
                 src=norm["src"],
                 dst=norm["dst"],

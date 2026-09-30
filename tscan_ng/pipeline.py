@@ -430,6 +430,7 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
         timeout=cfg.session_timeout,
         pending_max_age=cfg.pending_max_age,
         max_sessions=cfg.max_sessions,
+        server_ports=cfg.server_ports,
     )
     last_expiry = time.monotonic()
     logging.info("pipeline started, iface=%s filter=%r", cfg.iface, bpf_filter)
