@@ -287,13 +287,14 @@ share the one webhook:
 finding_cooldown_sec = 1800
 ```
 
-Findings that share the same `(dst, dport, creds)` — the same credentials
-sent to the same service, regardless of source or protocol type — are
-emitted at most once per `finding_cooldown_sec` (default 1800 s = 30
+Findings that share the same `(dst, dport, creds, outcome)` — the same credentials
+sent to the same service with the same result, regardless of source or protocol
+type — are emitted at most once per `finding_cooldown_sec` (default 1800 s = 30
 minutes; `0` disables the cooldown). The check happens once in
 `pipeline.py`'s `_emit()`, **upstream of both** `results.jsonl` and Discord,
 so `watch.py` and the dashboard (which read that file) are thinned out the
-same way. Distinct targets or distinct credentials are still emitted
+same way. Distinct targets, distinct credentials or a different outcome (for example a
+`success` after an earlier `failed` with the same credentials) are still emitted
 immediately. State is kept as marker files under `/run/tscan/finding_cooldown/`,
 so it is shared by all workers and is reset by a full service stop/start
 (not by a `Restart=on-failure` cycle). If the marker directory cannot be

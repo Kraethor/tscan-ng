@@ -8,7 +8,7 @@ across all of them has to live on disk. Two callers share this:
   - sinks/discord.py's notify(): one marker file, rate-limiting operational
     alerts (e.g. pipeline_worker exiting) so a sustained outage doesn't send
     one Discord message per RestartSec cycle.
-  - pipeline.py's _emit(): one marker file per (dst, dport, creds) key,
+  - pipeline.py's _emit(): one marker file per (dst, dport, creds, outcome) key,
     gating whether a finding gets written to JSONLSink/DiscordSink at all,
     so a spammer replaying the same bad credentials at the same service
     doesn't turn into one log line (and one Discord message) per attempt.

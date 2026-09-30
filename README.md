@@ -36,7 +36,7 @@ an SNMP `no_response` (unanswered internet scans of UDP 161; see
 Discord webhook (`tscan_ng/sinks/discord.py`) — both fire from inside the
 pipeline itself, independent of whether anything is watching. Both sinks sit
 behind one shared repeat-finding cooldown in `pipeline.py`'s `_emit()`: a
-finding with the same `(dst, dport, creds)` as one already emitted within
+finding with the same `(dst, dport, creds, outcome)` as one already emitted within
 `[dedup] finding_cooldown_sec` (default 1800 s) is dropped before *either*
 sink sees it, so a scanner replaying the same credentials at the same
 service produces one log line and one alert per window, not one per packet.
@@ -146,7 +146,7 @@ discord_webhook = https://discord.com/api/webhooks/...
 notify_cooldown_sec = 300
 
 [dedup]
-# Minimum seconds between findings sharing the same (dst, dport, creds).
+# Minimum seconds between findings sharing the same (dst, dport, creds, outcome).
 # Applied once in pipeline.py's _emit(), i.e. BEFORE both results.jsonl and
 # Discord, so it also thins out what watch.py and the dashboard show.
 # 0 disables it (every finding is emitted). Default 1800 (30 minutes).
@@ -162,7 +162,7 @@ entirely. Three kinds of alert share the one webhook:
   with a 403 usually means the credentials were accepted). Only the finding
   `type`, the username portion of `creds`, the `outcome` and `session_id` are
   sent; no passwords or packet payloads leave the host. Repeats of the same
-  `(dst, dport, creds)` within `[dedup] finding_cooldown_sec` are suppressed
+  `(dst, dport, creds, outcome)` within `[dedup] finding_cooldown_sec` are suppressed
   before this point (see Architecture).
 - **Pipeline failure** (in-process) — fired when a worker process exits
   abnormally (e.g. the capture interface going down). Rate-limited by
@@ -240,7 +240,7 @@ privileges and exit codes.
   `/etc/systemd/network/70-tscan-monitor.network`.
 - Runtime scratch: `/run/tscan/` (created by `RuntimeDirectory=tscan`) holds
   the Discord operational-alert cooldown marker and, under
-  `/run/tscan/finding_cooldown/`, one marker file per `(dst, dport, creds)`
+  `/run/tscan/finding_cooldown/`, one marker file per `(dst, dport, creds, outcome)`
   key for the finding cooldown. The directory is emptied when the service
   stops, so the finding cooldown resets on every full stop/start (it survives
   `Restart=on-failure` cycles).

@@ -55,7 +55,7 @@ from tscan_ng.capture import (
     PCAP_NETMASK_UNKNOWN, _err, _build_port_filter,
 )
 
-# Marker directory for _emit()'s per-(dst, dport, creds) finding cooldown --
+# Marker directory for _emit()'s per-(dst, dport, creds, outcome) finding cooldown --
 # one marker file per key, same cross-process reasoning as DiscordSink's own
 # notify() cooldown (see sinks/cooldown.py): all cfg.workers pipeline_worker
 # processes must agree on whether a given key was already emitted recently,
@@ -225,10 +225,14 @@ def _emit(sink: JSONLSink, discord: DiscordSink, finding: dict,
     inside each sink -- so a spammer replaying the same bad credentials at
     the same service produces at most one results.jsonl line *and* at most
     one Discord alert per finding_cooldown_sec window, instead of the two
-    sinks disagreeing about what counts as a repeat. The cooldown key
-    deliberately excludes "type" and "src": the same attacker (or botnet)
-    replaying the same credentials at the same service from many source
-    ports/IPs is exactly the noise this is meant to collapse.
+    sinks disagreeing about what counts as a repeat. The cooldown key is
+    (dst, dport, creds, outcome). It deliberately excludes "type" and "src":
+    the same attacker (or botnet) replaying the same credentials at the same
+    service from many source ports/IPs is exactly the noise this is meant to
+    collapse. It includes "outcome" so that a "failed" or "no_response"
+    finding does not suppress a later "success" with the same credentials --
+    a change of outcome is new information (TODO.md #10); each distinct
+    outcome is still limited to one emission per window.
 
     Both sinks share the same write(finding) interface, so every finding
     site in this module calls through here once instead of duplicating the
@@ -237,27 +241,41 @@ def _emit(sink: JSONLSink, discord: DiscordSink, finding: dict,
 
     Marker files (one per distinct key, named by the SHA-256 of the key so
     arbitrary credential bytes never reach the filesystem as a name) live
-    in _FINDING_COOLDOWN_DIR and are never deleted by this code. The slot
-    is claimed before the sinks are written, so a sink write that raises
-    still consumes the cooldown window. If the marker cannot be opened,
-    claim_slot() fails open and the finding is emitted.
+    in _FINDING_COOLDOWN_DIR and are only deleted by this code when a sink
+    write raises. The slot is claimed before the sinks are written (so
+    concurrent workers cannot both emit the same finding); if a sink write
+    raises, the marker is removed again so the failed finding does not
+    consume the window, and the exception propagates. If the marker cannot
+    be opened, claim_slot() fails open and the finding is emitted.
 
     Args:
         sink:                 The pipeline's JSONLSink.
         discord:              The pipeline's DiscordSink.
         finding:              Finding dict to write/alert on.
         finding_cooldown_sec: Minimum seconds between emissions sharing the
-            same (dst, dport, creds) key. 0 disables the cooldown (every
+            same (dst, dport, creds, outcome) key. 0 disables the cooldown (every
             finding is emitted) -- see Config.finding_cooldown.
     """
+    marker_path = None
     if finding_cooldown_sec > 0:
-        key = f"{finding.get('dst', '')}:{finding.get('dport', '')}:{finding.get('creds', '')}"
+        key = (f"{finding.get('dst', '')}:{finding.get('dport', '')}:"
+               f"{finding.get('creds', '')}:{finding.get('outcome', '')}")
         marker_path = os.path.join(
             _FINDING_COOLDOWN_DIR, hashlib.sha256(key.encode()).hexdigest())
         if not claim_slot(marker_path, finding_cooldown_sec):
             return
-    sink.write(finding)
-    discord.write(finding)
+    try:
+        sink.write(finding)
+        discord.write(finding)
+    except Exception:
+        # The finding was not recorded: give the slot back so the next
+        # occurrence is not suppressed for a whole window (TODO.md #10).
+        if marker_path:
+            try:
+                os.unlink(marker_path)
+            except OSError:
+                pass
+        raise
 
 
 def _maybe_run_periodic(sock: socket.socket, sessions: SessionTable, sink: JSONLSink,

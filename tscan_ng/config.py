@@ -479,8 +479,8 @@ class Config:
     def finding_cooldown(self) -> float:
         """
         Minimum seconds between findings that share the same
-        (dst, dport, creds) key -- i.e. the same credentials submitted to
-        the same service -- before pipeline.py's _emit() will write another
+        (dst, dport, creds, outcome) key -- i.e. the same credentials
+        submitted to the same service with the same result -- before pipeline.py's _emit() will write another
         one to *any* sink (JSONLSink and DiscordSink alike). 0 disables the
         cooldown (every finding is emitted).
 

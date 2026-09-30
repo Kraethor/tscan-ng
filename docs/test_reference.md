@@ -25,7 +25,7 @@ Where to look for results:
 - Discord (if configured) — every outcome except `pending` and `failed`, and except `no_response` on `snmp_creds` findings (unanswered SNMP probes are logged but not alerted).
 
 **Repeat-finding cooldown:** a finding with the same destination IP, destination
-port and credentials as one already emitted within the last
+port, credentials and outcome as one already emitted within the last
 `[dedup] finding_cooldown_sec` (default 1800 s = 30 min) is dropped before it
 reaches either the JSONL file or Discord. When re-running a test with the
 same `user:pass` against the same server and nothing new shows up, that is
