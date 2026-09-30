@@ -110,6 +110,9 @@ Correlation caveats:
 import struct
 from tscan_ng.session import _make_filter
 
+# Finding types this detector emits; tscan_ng.resolve maps each to resolve().
+FINDING_TYPES = ("smb_creds",)
+
 # Well-known SMB ports.
 _SMB_PORTS: frozenset = frozenset({
     445,  # SMB direct-TCP transport
@@ -422,8 +425,8 @@ def detect_stream(session, ts: float) -> list:
         ts:      Unix timestamp of the current packet.
 
     Returns:
-        List of resolved finding dicts. A pending finding is registered on
-        the session if the final SESSION_SETUP response has not yet arrived.
+        Always an empty list; findings are registered on the session as
+        pending and emitted by tscan_ng.resolve once resolved.
     """
     if session.dport not in _SMB_PORTS and session.sport not in _SMB_PORTS:
         return []
@@ -468,26 +471,26 @@ def detect_stream(session, ts: float) -> list:
                                     session.sport, session.dport),
     }
 
-    # The final response may already be in server_buf (it is fetched over the
-    # whole buffer here, not just the bounded scan window).
-    server_bytes = bytes(session.server_buf)
-    status, rsp_end = _find_final_status(server_bytes)
-
     del session.client_buf[:req_end]
+    session.add_pending(base, ts_start=ts)
+    return []
 
-    if status is not None:
-        # Final response already in server_buf — resolve immediately. This
-        # also consumes the earlier CHALLENGE (everything up to rsp_end); it
-        # does not call session.shift_pending_floors() (run.py's path does).
-        del session.server_buf[:rsp_end]
-        return [{
-            **base,
-            "ts_start": ts,
-            "ts_end":   session.last_ts,
-            "status":   str(status),
-            "outcome":  _outcome(status),
-        }]
-    else:
-        # Server has not sent the final response yet — register as pending.
-        session.add_pending(base, ts_start=ts)
-        return []
+
+def resolve(p, session):
+    """
+    Match a pending NTLM SESSION_SETUP against its final response (see tscan_ng.resolve).
+
+    Consumes server_buf up to the end of that response, which includes the
+    earlier CHALLENGE.
+
+    Args:
+        p:       PendingFinding for a smb_creds finding.
+        session: Session whose server_buf is searched.
+
+    Returns:
+        ({"status", "outcome"}, bytes to consume) or None if no reply yet.
+    """
+    status, rsp_end = _find_final_status(bytes(session.server_buf))
+    if status is None:
+        return None
+    return {"status": str(status), "outcome": _outcome(status)}, rsp_end

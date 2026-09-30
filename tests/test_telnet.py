@@ -13,7 +13,7 @@ Run from /opt/tscan:
 import unittest
 
 from tscan_ng.session import Session
-from tscan_ng.run import _try_resolve
+from tscan_ng import resolve as resolve_mod
 from tscan_ng.detectors import telnet
 
 TS = 1000.0
@@ -28,13 +28,14 @@ def make_session() -> Session:
 
 
 def resolve(session: Session) -> list:
-    """Run _try_resolve over pending findings like pipeline.py does."""
-    done, still = [], []
-    for p in session.pending:
-        r = _try_resolve(p, session, TS + 1)
-        (done if r else still).append(r or p)
-    session.pending = still
-    return done
+    """Resolve pending findings against what is buffered now."""
+    return resolve_mod.resolve_pending(session, TS + 1)
+
+
+def detect(session: Session, ts: float = TS) -> list:
+    """What pipeline.py emits for one packet: run the detector, then resolve."""
+    telnet.detect_stream(session, ts)
+    return resolve_mod.resolve_pending(session, ts)
 
 
 class TelnetOutcomeTests(unittest.TestCase):
@@ -42,7 +43,7 @@ class TelnetOutcomeTests(unittest.TestCase):
         s = make_session()
         s.server_buf.extend(BANNER + PROMPTS)
         s.client_buf.extend(b"admin\r\nwrongpass\r\n")
-        self.assertEqual(telnet.detect_stream(s, TS), [])      # no verdict yet
+        self.assertEqual(detect(s, TS), [])      # no verdict yet
         self.assertEqual(len(s.pending), 1)
         s.server_buf.extend(b"\r\nLogin incorrect\r\n")
         self.assertEqual([f["outcome"] for f in resolve(s)], ["failed"])
@@ -51,7 +52,7 @@ class TelnetOutcomeTests(unittest.TestCase):
         s = make_session()
         s.server_buf.extend(BANNER + PROMPTS)
         s.client_buf.extend(b"admin\r\nhunter2\r\n")
-        self.assertEqual(telnet.detect_stream(s, TS), [])
+        self.assertEqual(detect(s, TS), [])
         s.server_buf.extend(b"\r\nLast login: Mon Sep 28 from 10.0.0.2\r\n")
         self.assertEqual([f["outcome"] for f in resolve(s)], ["success"])
 
@@ -59,7 +60,7 @@ class TelnetOutcomeTests(unittest.TestCase):
         s = make_session()
         s.server_buf.extend(BANNER + PROMPTS + b"\r\nLast login: Mon\r\n")
         s.client_buf.extend(b"admin\r\nhunter2\r\n")
-        out = telnet.detect_stream(s, TS)
+        out = detect(s, TS)
         self.assertEqual([(f["creds"], f["outcome"]) for f in out],
                          [("admin:hunter2", "success")])
 
@@ -68,13 +69,13 @@ class TelnetOutcomeTests(unittest.TestCase):
         # attempt 1 fails
         s.server_buf.extend(PROMPTS)
         s.client_buf.extend(b"admin\r\nbad\r\n")
-        telnet.detect_stream(s, TS)
+        detect(s, TS)
         s.server_buf.extend(b"\r\nLogin incorrect\r\n\r\n")
         self.assertEqual([f["outcome"] for f in resolve(s)], ["failed"])
         # attempt 2 succeeds: must not be poisoned by attempt 1's failure text
         s.server_buf.extend(PROMPTS)
         s.client_buf.extend(b"admin\r\ngood\r\n")
-        self.assertEqual(telnet.detect_stream(s, TS + 2), [])
+        self.assertEqual(detect(s, TS + 2), [])
         s.server_buf.extend(b"\r\nLast login: Mon\r\n")
         done = resolve(s)
         self.assertEqual([(f["creds"], f["outcome"]) for f in done],
@@ -84,7 +85,7 @@ class TelnetOutcomeTests(unittest.TestCase):
         s = make_session()
         s.server_buf.extend(PROMPTS)
         s.client_buf.extend(b"admin\r\nbad\r\n")
-        telnet.detect_stream(s, TS)
+        detect(s, TS)
         s.server_buf.extend(b"\r\nLogin incorrect\r\n")
         resolve(s)
         self.assertNotIn(b"Login incorrect", bytes(s.server_buf))

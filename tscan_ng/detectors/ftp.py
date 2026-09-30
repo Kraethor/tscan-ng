@@ -45,8 +45,9 @@ Response correlation:
     answer to the PASS. Lines are not consumed unless they are matched, so an
     earlier unrelated 530/421 (e.g. 530 "Please login with USER and PASS" sent
     for a pre-login command) will be attributed to the next credential.
-    The same matching is repeated in run.py's _try_resolve() for findings
-    that were parked as pending.
+    The matching lives in resolve() below. detect_stream() only parks the
+    credentials with session.add_pending(); tscan_ng.resolve calls resolve()
+    for them, on the same packet if the reply is already buffered.
 
 Known limitations:
     - USER/PASS lines are matched without requiring the terminating CRLF, so a
@@ -62,6 +63,9 @@ Known limitations:
 import logging
 import re
 from tscan_ng.session import _make_filter
+
+# Finding types this detector emits; tscan_ng.resolve maps each to resolve().
+FINDING_TYPES = ("ftp_creds", "ftp_anonymous")
 
 # Well-known and commonly-used FTP control ports.
 # Sessions whose dport or sport is in this set are scanned for credentials.
@@ -136,12 +140,9 @@ def detect_stream(session, ts: float) -> list:
     Handles anonymous FTP logins by flagging them with type
     "ftp_anonymous" instead of "ftp_creds".
 
-    Registers a pending finding if no server response is available yet,
-    and consumes the matched commands from the client buffer to avoid
-    re-detection on subsequent packets. When a response is already present it
-    is also consumed from server_buf (up to and including the matched line).
-    Unlike run.py's _try_resolve(), this immediate-resolve path does not call
-    session.shift_pending_floors() after deleting from server_buf.
+    Registers every credential as a pending finding (resolve() below matches
+    the server's reply) and consumes the matched commands from the client
+    buffer to avoid re-detection on subsequent packets.
 
     The scan is bounded to _MAX_CMD_SCAN bytes so that a large client
     buffer does not cause O(n) work on every arriving packet.
@@ -151,8 +152,8 @@ def detect_stream(session, ts: float) -> list:
         ts:      Unix timestamp of the current packet.
 
     Returns:
-        List of resolved finding dicts. Pending findings are registered on
-        the session and not returned until resolved.
+        Always an empty list; findings are registered on the session as
+        pending and emitted by tscan_ng.resolve once resolved.
     """
     # Skip sessions that are not on a known FTP control port.
     # Neither dport nor sport in _FTP_PORTS means this is definitely not FTP.
@@ -201,24 +202,31 @@ def detect_stream(session, ts: float) -> list:
                                    session.sport, session.dport),
     }
 
-    findings = []
-    server_bytes = bytes(session.server_buf)
-    response = _FTP_RESPONSE_RE.search(server_bytes)
-
-    if response:
-        code = response.group(1)
-        findings.append({
-            **base,
-            "ts_start": ts,
-            "ts_end":   session.last_ts,
-            "status":   code.decode("utf-8", "ignore"),
-            "outcome":  _outcome(code),
-        })
-        del session.server_buf[:response.end()]
-    else:
-        session.add_pending(base, ts_start=ts)
+    session.add_pending(base, ts_start=ts)
 
     # Consume USER and PASS from client buffer
     del session.client_buf[:pass_match.end()]
 
-    return findings
+    return []
+
+
+def resolve(p, session):
+    """
+    Match a pending FTP login against the server's reply (see tscan_ng.resolve).
+
+    Takes the first 230/530/421 line in server_buf (see "Response
+    correlation" in the module docstring for why that can be a stale line).
+
+    Args:
+        p:       PendingFinding for an ftp_creds / ftp_anonymous finding.
+        session: Session whose server_buf is searched.
+
+    Returns:
+        ({"status", "outcome"}, bytes to consume) or None if no reply yet.
+    """
+    response = _FTP_RESPONSE_RE.search(bytes(session.server_buf))
+    if not response:
+        return None
+    code = response.group(1)
+    return ({"status": code.decode("utf-8", "ignore"), "outcome": _outcome(code)},
+            response.end())

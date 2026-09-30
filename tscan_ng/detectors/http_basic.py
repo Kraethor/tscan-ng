@@ -81,13 +81,12 @@ Response correlation:
     request header block consumed from client_buf is numbered per session
     (Session.http_req_seen), whether or not it carries credentials; a
     credentialed request remembers its number as "_rsp_index". Its response is
-    the status line at that position in the server stream: take_response()
-    finds the Nth "HTTP/x.y NNN" line (allowing for lines already removed,
-    Session.http_rsp_gone), deletes everything up to and including it, and
-    shifts the pending floors. So the 401 a browser receives for its first,
+    the status line at that position in the server stream: resolve() finds
+    the Nth "HTTP/x.y NNN" line (allowing for lines already removed,
+    Session.http_rsp_gone) and tscan_ng.resolve deletes everything up to and
+    including it. So the 401 a browser receives for its first,
     credential-less request is skipped and the retry is paired with its own
-    response (TODO.md #2). run.py's _try_resolve() calls the same function
-    for pending findings. Assumes in-order responses (no reordering from
+    response (TODO.md #2). Assumes in-order responses (no reordering from
     multi-connection races; SPAN loss shifts the pairing) and no interim
     "100 Continue" responses.
 
@@ -103,6 +102,9 @@ import logging
 import re
 from tscan_ng.detectors.common import decode_b64
 from tscan_ng.session import _make_filter
+
+# Finding types this detector emits; tscan_ng.resolve maps each to resolve().
+FINDING_TYPES = ("http_basic",)
 
 # Well-known and commonly-used HTTP/proxy ports.
 # Sessions whose dport or sport is in this set are scanned for Basic Auth.
@@ -176,52 +178,46 @@ def _outcome(status: int) -> str:
     return "unknown"
 
 
-def take_response(session, rsp_index: int | None = None):
+def resolve(p, session):
     """
-    Extract, and consume, the HTTP response for one request on *session*.
+    Match a pending Basic-auth request against its own response (see tscan_ng.resolve).
 
     Responses arrive in request order, so request number k (see
-    Session.http_req_seen) is answered by the k-th status line of the server
-    stream. Status lines already deleted from the front of server_buf are
-    tracked in Session.http_rsp_gone, so the wanted line is at position
-    (rsp_index - http_rsp_gone) among the status lines still buffered. Also
-    imported by run.py's _try_resolve(). Copies the whole buffer to bytes on
-    each call.
+    Session.http_req_seen, recorded as the finding's "_rsp_index") is
+    answered by the k-th status line of the server stream. Status lines
+    already deleted from the front of server_buf are counted in
+    Session.http_rsp_gone, so the wanted line is at position
+    (_rsp_index - http_rsp_gone) among the status lines still buffered.
 
-    On success everything up to and including the matched status line is
-    deleted from server_buf (which discards earlier, unrelated responses such
-    as a 401 challenge), http_rsp_gone is advanced past every status line
-    removed, and the pending findings' floors are shifted.
+    On a match, http_rsp_gone is advanced past every status line that
+    tscan_ng.resolve is about to delete (the wanted one and any earlier,
+    unrelated ones such as a 401 challenge). A finding whose response was
+    already consumed or trimmed away (index below http_rsp_gone) never
+    matches and stays pending until it expires. Copies the whole buffer to
+    bytes on each call.
 
     Args:
-        session:   Session whose server_buf is searched.
-        rsp_index: Zero-based number of the request whose response is wanted.
-                   None means "the first buffered status line" (legacy
-                   behaviour, for findings without a recorded index).
+        p:       PendingFinding for an http_basic finding. A missing
+                 "_rsp_index" means "the first buffered status line".
+        session: Session whose server_buf is searched.
 
     Returns:
-        Tuple of (status_code, status_text, end_offset) if that response is
-        buffered, otherwise None. end_offset is the number of bytes just
-        removed from the front of server_buf. None is also returned if the
-        response was already consumed or trimmed away (index below
-        http_rsp_gone); the finding then stays pending until it expires.
+        ({"status", "status_text", "outcome"}, bytes to consume) or None if
+        that response is not buffered yet.
     """
+    rsp_index = p.finding.get("_rsp_index")
     want = 0 if rsp_index is None else rsp_index - session.http_rsp_gone
     if want < 0:
         return None
-    match = None
-    for n, m in enumerate(_RESPONSE_LINE_RE.finditer(bytes(session.server_buf))):
+    for n, match in enumerate(_RESPONSE_LINE_RE.finditer(bytes(session.server_buf))):
         if n == want:
-            match = m
-            break
-    if match is None:
-        return None
-    end = match.end()
-    del session.server_buf[:end]
-    session.shift_pending_floors(end)
-    session.http_rsp_gone += want + 1
-    return (int(match.group(1)),
-            match.group(2).decode("utf-8", "ignore").strip(), end)
+            session.http_rsp_gone += want + 1
+            status = int(match.group(1))
+            return ({"status": status,
+                     "status_text": match.group(2).decode("utf-8", "ignore").strip(),
+                     "outcome": _outcome(status)},
+                    match.end())
+    return None
 
 
 def detect_stream(session, ts: float) -> list[dict]:
@@ -229,16 +225,12 @@ def detect_stream(session, ts: float) -> list[dict]:
     Stream-aware HTTP Basic Auth detector.
 
     Scans the session's client buffer for complete HTTP requests containing
-    an Authorization: Basic header. For each request found, attempts to
-    correlate with a server response already present in the server buffer.
-
-    Emits a finding immediately if a server response is available, or
-    registers a pending finding on the session for later resolution when the
-    response arrives. Consumes every scanned request header block (with or
-    without credentials) from the client buffer to avoid re-detection on
+    an Authorization: Basic header, and registers each one as a pending
+    finding (resolve() pairs it with its response, on the same packet if it
+    is already buffered). Consumes every scanned request header block (with
+    or without credentials) from the client buffer to avoid re-detection on
     subsequent packets. Each request block is numbered (Session.http_req_seen)
-    and paired with its own response by take_response(), which also consumes
-    the response and shifts the pending floors.
+    so resolve() can pick its own response.
 
     The scan is bounded to _MAX_HEADER_SCAN bytes per call to prevent O(n²)
     CPU usage at high line speed. The client buffer is consumed before
@@ -250,15 +242,14 @@ def detect_stream(session, ts: float) -> list[dict]:
         ts:      Unix timestamp of the current packet.
 
     Returns:
-        List of resolved finding dicts. Pending findings are registered on
-        the session and not returned until resolved.
+        Always an empty list; findings are registered on the session as
+        pending and emitted by tscan_ng.resolve once resolved.
     """
     # Skip sessions that are not on a known HTTP/proxy port.
     # Neither dport nor sport in _HTTP_PORTS means this is definitely not HTTP.
     if session.dport not in _HTTP_PORTS and session.sport not in _HTTP_PORTS:
         return []
 
-    findings = []
 
     while True:
         # Limit the scan to _MAX_HEADER_SCAN bytes to keep per-packet work
@@ -336,22 +327,8 @@ def detect_stream(session, ts: float) -> list[dict]:
                                        session.sport, session.dport),
         }
 
-        # Attempt to correlate with this request's response if already buffered
-        response = take_response(session, rsp_index)
-        if response:
-            status, status_text, _rsp_end = response
-            findings.append({
-                **base,
-                "ts_start":    ts,
-                "ts_end":      session.last_ts,
-                "status":      status,
-                "status_text": status_text,
-                "outcome":     _outcome(status),
-            })
-        else:
-            # No server response yet -- register as pending for later
-            # resolution. "_rsp_index" (underscore fields are stripped by
-            # run.py's _try_resolve) tells it which response to wait for.
-            session.add_pending({**base, "_rsp_index": rsp_index}, ts_start=ts)
+        # "_rsp_index" (underscore fields are stripped before output) tells
+        # resolve() which response belongs to this request.
+        session.add_pending({**base, "_rsp_index": rsp_index}, ts_start=ts)
 
-    return findings
+    return []

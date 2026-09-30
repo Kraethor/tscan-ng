@@ -60,6 +60,9 @@ Known limitations:
 import logging
 from tscan_ng.session import _make_filter
 
+# Finding types this detector emits; tscan_ng.resolve maps each to resolve().
+FINDING_TYPES = ("ldap_creds",)
+
 # Well-known cleartext LDAP ports.
 # Sessions whose dport or sport is in this set are scanned for credentials.
 _LDAP_PORTS: frozenset = frozenset({
@@ -267,8 +270,7 @@ def _find_bind_response(data: bytes):
         }
 
     The messageID is parsed but NOT compared with the request's; the first
-    BindResponse in the buffer wins. Also imported by run.py's
-    _try_resolve(). The result code is taken from the first byte of the
+    BindResponse in the buffer wins. Called by resolve(). The result code is taken from the first byte of the
     ENUMERATED value only.
 
     Args:
@@ -353,9 +355,8 @@ def detect_stream(session, ts: float) -> list:
     Only simple-bind (password as plaintext in the [0] CHOICE) is detected.
     SASL, anonymous, and TLS-wrapped sessions are out of scope. A non-empty DN
     with an empty password (unauthenticated bind) is consumed and ignored.
-    The matched BindResponse is deleted from server_buf on immediate
-    resolution without a session.shift_pending_floors() call (run.py's path
-    does call it).
+    Every simple bind is registered as pending; resolve() matches the
+    BindResponse (on the same packet if it is already buffered).
 
     The scan is bounded to _MAX_SCAN bytes per call to keep per-packet CPU
     cost O(1) regardless of buffer depth.
@@ -365,8 +366,8 @@ def detect_stream(session, ts: float) -> list:
         ts:      Unix timestamp of the current packet.
 
     Returns:
-        List of resolved finding dicts. A pending finding is registered on
-        the session if the BindResponse has not yet arrived.
+        Always an empty list; findings are registered on the session as
+        pending and emitted by tscan_ng.resolve once resolved.
     """
     # Gate: only inspect sessions on known LDAP ports.
     if session.dport not in _LDAP_PORTS and session.sport not in _LDAP_PORTS:
@@ -402,23 +403,26 @@ def detect_stream(session, ts: float) -> list:
                                    session.sport, session.dport),
     }
 
-    server_bytes = bytes(session.server_buf)
-    result_code, rsp_end = _find_bind_response(server_bytes)
+    session.add_pending(base, ts_start=ts)
+    del session.client_buf[:req_end]
+    return []
 
-    if result_code is not None:
-        # BindResponse already in server_buf — resolve immediately.
-        outcome = _outcome(result_code)
-        del session.server_buf[:rsp_end]
-        del session.client_buf[:req_end]
-        return [{
-            **base,
-            "ts_start": ts,
-            "ts_end":   session.last_ts,
-            "status":   str(result_code),
-            "outcome":  outcome,
-        }]
-    else:
-        # Server has not responded yet — register as pending.
-        session.add_pending(base, ts_start=ts)
-        del session.client_buf[:req_end]
-        return []
+
+def resolve(p, session):
+    """
+    Match a pending LDAP simple bind against its BindResponse (see tscan_ng.resolve).
+
+    Takes the first BindResponse in server_buf; the messageID is not compared
+    (see _find_bind_response).
+
+    Args:
+        p:       PendingFinding for a ldap_creds finding.
+        session: Session whose server_buf is searched.
+
+    Returns:
+        ({"status", "outcome"}, bytes to consume) or None if no reply yet.
+    """
+    result_code, rsp_end = _find_bind_response(bytes(session.server_buf))
+    if result_code is None:
+        return None
+    return {"status": str(result_code), "outcome": _outcome(result_code)}, rsp_end

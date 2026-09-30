@@ -70,6 +70,9 @@ import re
 import logging
 from tscan_ng.session import _make_filter
 
+# Finding types this detector emits; tscan_ng.resolve maps each to resolve().
+FINDING_TYPES = ("telnet_creds",)
+
 # Standard and common alternate Telnet ports.
 # Sessions where neither endpoint is in this set are skipped immediately.
 _TELNET_PORTS: frozenset = frozenset({
@@ -238,14 +241,14 @@ def _find_outcome(server_bytes: bytes, start: int = 0):
 
     Only the bytes from *start* onward are considered, so text the server
     sent before the password was typed (banners, earlier attempts) cannot
-    decide the outcome. Also imported by run.py's _try_resolve() for pending
-    findings (which passes the finding's server_buf_floor as *start*).
+    decide the outcome. Called by resolve() with the pending finding's
+    server_buf_floor, which detect_stream() sets to the end of the password
+    prompt.
 
     Args:
         server_bytes: Reassembled server-direction byte stream.
         start:        Offset in server_bytes where the response to the
-                      password can begin (the end of the password prompt, or
-                      the pending finding's floor).
+                      password can begin (the pending finding's floor).
 
     Returns:
         (outcome, end_offset): outcome is 'success' or 'failed' and
@@ -273,9 +276,10 @@ def detect_stream(session, ts: float) -> list:
     (IAC-stripped) client buffer as username and password. Sessions where
     either buffer is empty are skipped.
 
-    Emits a finding immediately if an outcome is already visible in the
-    server buffer, or registers a pending finding for later resolution
-    when the outcome arrives. Consumes the inspected portion of client_buf
+    Registers a pending finding whose floor is the end of the password
+    prompt, so resolve() only judges text sent after it (on the same packet
+    if the outcome is already buffered). Consumes the inspected portion of
+    client_buf
     (the whole scanned window, including anything typed after the password)
     to prevent re-detection on subsequent packets.
 
@@ -284,8 +288,8 @@ def detect_stream(session, ts: float) -> list:
         ts:      Unix timestamp of the current packet.
 
     Returns:
-        List of resolved finding dicts. Pending findings are registered on
-        the session and not returned until resolved.
+        Always an empty list; findings are registered on the session as
+        pending and emitted by tscan_ng.resolve once resolved.
     """
     # Gate: only scan sessions on known Telnet ports.
     if session.dport not in _TELNET_PORTS and session.sport not in _TELNET_PORTS:
@@ -343,22 +347,29 @@ def detect_stream(session, ts: float) -> list:
                                    session.sport, session.dport),
     }
 
-    # "status" mirrors "outcome" (there is no protocol status code to report).
-    # Only text after the password prompt can answer the password; the matched
-    # response is consumed so the next attempt starts clean.
-    full_server = bytes(session.server_buf)
-    result, rsp_end = _find_outcome(full_server, pass_prompt.end())
-    if result:
-        del session.server_buf[:rsp_end]
-        session.shift_pending_floors(rsp_end)
-        return [{
-            **base,
-            "ts_start": ts,
-            "ts_end":   session.last_ts,
-            "status":   result,
-            "outcome":  result,
-        }]
-
-    # Outcome not yet visible — register as pending for later resolution.
-    session.add_pending(base, ts_start=ts)
+    # Only text after the password prompt can answer the password, so that
+    # is the floor resolve() searches from.
+    session.add_pending(base, ts_start=ts, floor=pass_prompt.end())
     return []
+
+
+def resolve(p, session):
+    """
+    Match a pending Telnet login against the server's text (see tscan_ng.resolve).
+
+    Searches server_buf from the finding's floor (the end of the password
+    prompt) with _find_outcome(); the matched text is consumed so a retry on
+    the same connection is judged on its own response. "status" mirrors
+    "outcome" (there is no protocol status code to report).
+
+    Args:
+        p:       PendingFinding for a telnet_creds finding.
+        session: Session whose server_buf is searched.
+
+    Returns:
+        ({"status", "outcome"}, bytes to consume) or None if undecided yet.
+    """
+    result, rsp_end = _find_outcome(bytes(session.server_buf), p.server_buf_floor)
+    if not result:
+        return None
+    return {"status": result, "outcome": result}, rsp_end

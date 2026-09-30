@@ -112,6 +112,9 @@ Known limitations:
 
 from tscan_ng.session import _make_filter
 
+# Finding types this detector emits; tscan_ng.resolve maps each to resolve().
+FINDING_TYPES = ("snmp_creds",)
+
 # SNMP agent port. 162 (traps) deliberately excluded -- see module docstring.
 _SNMP_PORTS: frozenset = frozenset({161})
 
@@ -290,8 +293,8 @@ def _find_snmp_response(data: bytes, request_id: int):
     Scan *data* for a Response-PDU (GetResponse) matching *request_id*.
 
     Same scanning approach as _find_snmp_request(). Responses with a different
-    request-id are skipped by their full length (and not consumed). Also
-    imported by run.py's _try_resolve().
+    request-id are skipped by their full length (and not consumed). Called by
+    resolve().
 
     Args:
         data:       Raw bytes from the server stream buffer.
@@ -377,18 +380,18 @@ def detect_stream(session, ts: float) -> list:
     Scans session.client_buf for a request PDU and correlates it with a
     Response-PDU (matched by request-id) in session.server_buf. Both
     buffers are consumed up to the end of the matched message on
-    resolution to prevent re-detection. The client request is consumed even
-    when no response has arrived yet (a pending finding carrying the private
-    "_request_id" is registered instead); the server response is deleted
-    without a session.shift_pending_floors() call (run.py's path does call it).
+    resolution to prevent re-detection. The client request is consumed when
+    matched and a pending finding carrying the private "_request_id" is
+    registered; resolve() matches the Response-PDU with that request-id (on
+    the same packet if it is already buffered).
 
     Args:
         session: Session object from session.SessionTable.
         ts:      Unix timestamp of the current packet.
 
     Returns:
-        List of resolved finding dicts. A pending finding is registered on
-        the session if no matching response has arrived yet.
+        Always an empty list; findings are registered on the session as
+        pending and emitted by tscan_ng.resolve once resolved.
     """
     if session.dport not in _SNMP_PORTS and session.sport not in _SNMP_PORTS:
         return []
@@ -419,25 +422,27 @@ def detect_stream(session, ts: float) -> list:
                                    session.sport, session.dport),
     }
 
-    server_bytes = bytes(session.server_buf)
-    error_status, rsp_end = _find_snmp_response(server_bytes, request_id)
-
     del session.client_buf[:req_end]
+    # _request_id is private (stripped before output by tscan_ng.resolve and
+    # session._close_finding, like every other "_"-prefixed field) -- needed
+    # only to match this finding against the right Response-PDU.
+    session.add_pending({**base, "_request_id": request_id}, ts_start=ts)
+    return []
 
-    if error_status is not None:
-        del session.server_buf[:rsp_end]
-        return [{
-            **base,
-            "ts_start": ts,
-            "ts_end":   session.last_ts,
-            "status":   str(error_status),
-            "outcome":  _outcome(error_status),
-        }]
-    else:
-        # _request_id is private (stripped before output by
-        # run.py._try_resolve / session._close_finding, matching every
-        # other "_"-prefixed field in this codebase) -- needed only to
-        # match this pending finding against the right Response-PDU if one
-        # arrives later.
-        session.add_pending({**base, "_request_id": request_id}, ts_start=ts)
-        return []
+
+def resolve(p, session):
+    """
+    Match a pending SNMP request against the Response-PDU with its request-id (see tscan_ng.resolve).
+
+    Args:
+        p:       PendingFinding for a snmp_creds finding.
+        session: Session whose server_buf is searched.
+
+    Returns:
+        ({"status", "outcome"}, bytes to consume) or None if no reply yet.
+    """
+    error_status, rsp_end = _find_snmp_response(bytes(session.server_buf),
+                                                p.finding.get("_request_id"))
+    if error_status is None:
+        return None
+    return {"status": str(error_status), "outcome": _outcome(error_status)}, rsp_end

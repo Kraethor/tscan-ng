@@ -17,6 +17,7 @@ import tempfile
 import unittest
 
 from tscan_ng.config import Config
+from tscan_ng.resolve import resolve_pending
 from tscan_ng.session import SessionTable
 from tscan_ng.detectors import postgres
 from tests.test_detectors import (pg_startup, pg_password, PG_AUTH_CLEARTEXT,
@@ -89,7 +90,8 @@ class DirectionTests(unittest.TestCase):
         session, _ = table.add_packet(pkt(True, 5432, PG_AUTH_CLEARTEXT), 1.0)
         table.add_packet(pkt(False, 5432, PG_STARTUP_P + pg_password(b"s3cret")), 2.0)
         table.add_packet(pkt(True, 5432, PG_AUTH_OK), 3.0)
-        found = postgres.detect_stream(session, 3.0)
+        postgres.detect_stream(session, 3.0)
+        found = resolve_pending(session, 3.0)
         self.assertEqual([f["creds"] for f in found], ["postgres:s3cret"])
 
 

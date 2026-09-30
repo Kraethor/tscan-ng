@@ -1,6 +1,6 @@
 """
 Tests for the "ts" field on findings resolved from a pending state
-(TODO.md #17). run.py's _try_resolve() returns most findings without "ts";
+(TODO.md #17). resolve.try_resolve() returns findings without "ts";
 pipeline._stamp_resolved() must add it (the request time, ts_start) without
 overriding a "ts" that is already present.
 
@@ -11,7 +11,7 @@ Run from /opt/tscan:
 import unittest
 
 from tscan_ng import pipeline
-from tscan_ng.run import _try_resolve
+from tscan_ng.resolve import try_resolve
 from tscan_ng.session import Session
 from tscan_ng.detectors import ftp
 
@@ -27,10 +27,10 @@ class ResolvedTsTests(unittest.TestCase):
         self.assertEqual(ftp.detect_stream(s, T_REQUEST), [])   # no reply yet: pending
         self.assertEqual(len(s.pending), 1)
         s.server_buf.extend(b"230 Login successful.\r\n")
-        return _try_resolve(s.pending[0], s, T_RESPONSE)
+        return try_resolve(s.pending[0], s, T_RESPONSE)
 
     def test_resolved_pending_lacks_ts_before_stamping(self):
-        """Documents the source of the bug: _try_resolve does not add ts for ftp."""
+        """Documents the source of the bug: try_resolve does not add ts for ftp."""
         self.assertNotIn("ts", self._resolved_ftp())
 
     def test_stamp_adds_request_time(self):

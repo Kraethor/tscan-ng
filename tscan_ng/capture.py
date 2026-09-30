@@ -15,8 +15,8 @@ This module used to also hold a complete standalone capture process
 via libpcap and forwarding each packet -- prefixed with a fixed-size header
 -- to a dispatcher process over a Unix datagram socket) plus a `python -m
 tscan_ng.capture` entry point, paired with tscan-capture.service. That was
-half of the original two-process design (see tscan_ng/run.py's module
-docstring for the dispatcher/worker half); pipeline.py's fan-out processes
+half of the original two-process design (the dispatcher/worker half lived
+in tscan_ng/run.py, since removed); pipeline.py's fan-out processes
 superseded it, and the standalone capture code was removed as dead weight
 once nothing still ran it -- see git history if it's ever needed for
 reference.

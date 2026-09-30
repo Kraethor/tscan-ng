@@ -38,8 +38,7 @@ Response correlation:
     "+OK" (success) or begins with "-" (failure) is taken as the AUTH reply.
     Other replies to earlier commands (e.g. "+OK" to CLIENT SETNAME/SELECT, or
     "-NOAUTH ..." to a command sent before AUTH) will be attributed to the
-    AUTH if they precede it in server_buf. Matching is repeated in run.py's
-    _try_resolve() for pending findings.
+    AUTH if they precede it in server_buf. The matching lives in resolve().
 
 Known limitations:
     - "HELLO <ver> AUTH <user> <pass>" (the RESP3 handshake, whose reply is
@@ -54,6 +53,9 @@ Known limitations:
 import logging
 import re
 from tscan_ng.session import _make_filter
+
+# Finding types this detector emits; tscan_ng.resolve maps each to resolve().
+FINDING_TYPES = ("redis_creds",)
 
 # Well-known cleartext Redis ports.
 _REDIS_PORTS: frozenset = frozenset({
@@ -213,8 +215,7 @@ def _find_auth_response(data: bytes):
     response found is returned, as it corresponds to the earliest unconsumed
     AUTH command after detect_stream has consumed matched client data.
     Lines are split on CRLF only; other reply types ('+PONG', ':1', bulk
-    replies) are skipped line by line. Also imported by run.py's
-    _try_resolve().
+    replies) are skipped line by line. Called by resolve().
 
     Args:
         data: Raw bytes from the server stream buffer.
@@ -246,7 +247,7 @@ def _outcome(status: str) -> str:
 
     This is a thin passthrough — _find_auth_response already returns a
     canonical outcome string.  The function exists for symmetry with other
-    detector modules and for use in run.py _try_resolve().
+    detector modules.
 
     Args:
         status: Outcome string from _find_auth_response ("success" or "failed").
@@ -265,9 +266,9 @@ def detect_stream(session, ts: float) -> list:
     and correlates it with the server response in session.server_buf.  Both
     buffers are consumed up to the end of the matched exchange on resolution
     to prevent re-detection on subsequent AUTH commands in the same connection.
-    The client command is consumed even when the response is not yet known (a
-    pending finding is registered instead); the server line is consumed
-    without a session.shift_pending_floors() call (run.py's path does call it).
+    The client command is consumed when matched and a pending finding is
+    registered; resolve() matches the reply (on the same packet if it is
+    already buffered).
 
     The scan is bounded to _MAX_SCAN bytes per call to keep per-packet CPU
     cost O(1) regardless of buffer depth.
@@ -277,8 +278,8 @@ def detect_stream(session, ts: float) -> list:
         ts:      Unix timestamp of the current packet.
 
     Returns:
-        List of resolved finding dicts. A pending finding is registered on
-        the session if the server response has not yet arrived.
+        Always an empty list; findings are registered on the session as
+        pending and emitted by tscan_ng.resolve once resolved.
     """
     # Gate: only inspect sessions on known Redis ports.
     if session.dport not in _REDIS_PORTS and session.sport not in _REDIS_PORTS:
@@ -317,22 +318,23 @@ def detect_stream(session, ts: float) -> list:
                                    session.sport, session.dport),
     }
 
-    server_bytes = bytes(session.server_buf)
-    outcome, rsp_end = _find_auth_response(server_bytes)
+    session.add_pending(base, ts_start=ts)
+    del session.client_buf[:cmd_end]
+    return []
 
-    if outcome is not None:
-        # Server response already in server_buf — resolve immediately.
-        del session.server_buf[:rsp_end]
-        del session.client_buf[:cmd_end]
-        return [{
-            **base,
-            "ts_start": ts,
-            "ts_end":   session.last_ts,
-            "status":   outcome,
-            "outcome":  outcome,
-        }]
-    else:
-        # Server has not responded yet — register as pending.
-        session.add_pending(base, ts_start=ts)
-        del session.client_buf[:cmd_end]
-        return []
+
+def resolve(p, session):
+    """
+    Match a pending Redis AUTH against the server's reply (see tscan_ng.resolve).
+
+    Args:
+        p:       PendingFinding for a redis_creds finding.
+        session: Session whose server_buf is searched.
+
+    Returns:
+        ({"status", "outcome"}, bytes to consume) or None if no reply yet.
+    """
+    outcome, rsp_end = _find_auth_response(bytes(session.server_buf))
+    if outcome is None:
+        return None
+    return {"status": outcome, "outcome": outcome}, rsp_end

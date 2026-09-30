@@ -58,8 +58,8 @@ Finding extras:
               that has an optional username component (e.g. redis_creds).
 
 Known limitations:
-    - Only the first 4 KB of client_buf and 8 KB of server_buf are scanned for
-      the immediate-resolve path; client_buf is consumed only on a match.
+    - Only the first 4 KB of client_buf is scanned; it is consumed only on
+      a match.
     - IRC over TLS (6697) is opaque and not in the default port set.
     - No debug log is emitted for skipped empty captures (unlike most
       detectors); logging is not imported.
@@ -67,6 +67,9 @@ Known limitations:
 
 import re
 from tscan_ng.session import _make_filter
+
+# Finding types this detector emits; tscan_ng.resolve maps each to resolve().
+FINDING_TYPES = ("irc_creds",)
 
 # Common plaintext (non-TLS) IRC ports.
 _IRC_PORTS: frozenset = frozenset({
@@ -76,12 +79,11 @@ _IRC_PORTS: frozenset = frozenset({
     6669,
 })
 
-# Maximum bytes of each buffer to scan per call. An IDENTIFY line and a
-# NickServ NOTICE reply are each a single short line; well-behaved IRC
-# clients also send NICK/USER/CAP lines first, so a generous-but-bounded
-# window keeps this robust to a bit of preceding chatter.
+# Maximum bytes of client_buf to scan per call. An IDENTIFY line is a single
+# short line; well-behaved IRC clients also send NICK/USER/CAP lines first,
+# so a generous-but-bounded window keeps this robust to a bit of preceding
+# chatter. (resolve() searches all of server_buf for NickServ's reply.)
 _MAX_SCAN_CLIENT = 4096
-_MAX_SCAN_SERVER = 8192
 
 # Matches the client's NickServ identify line (client -> server):
 #   PRIVMSG NickServ :IDENTIFY [nick] password
@@ -183,7 +185,7 @@ def _outcome(status: str) -> str:
 
     This is a thin passthrough -- _find_identify_response already returns
     a canonical outcome string. The function exists for symmetry with
-    other detector modules and for use in run.py's _try_resolve().
+    other detector modules.
 
     Args:
         status: Outcome string from _find_identify_response.
@@ -208,8 +210,8 @@ def detect_stream(session, ts: float) -> list:
         ts:      Unix timestamp of the current packet.
 
     Returns:
-        List of resolved finding dicts. A pending finding is registered on
-        the session if NickServ has not replied yet.
+        Always an empty list; findings are registered on the session as
+        pending and emitted by tscan_ng.resolve once resolved.
     """
     if session.dport not in _IRC_PORTS and session.sport not in _IRC_PORTS:
         return []
@@ -241,23 +243,23 @@ def detect_stream(session, ts: float) -> list:
                                    session.sport, session.dport),
     }
 
-    # Bounded scan of the server buffer for an immediate answer; pending
-    # findings are later resolved by run.py against the whole buffer.
-    server_bytes = bytes(session.server_buf[:_MAX_SCAN_SERVER])
-    outcome, rsp_end = _find_identify_response(server_bytes)
-
     del session.client_buf[:req_end]
+    session.add_pending(base, ts_start=ts)
+    return []
 
-    if outcome is not None:
-        # Does not call session.shift_pending_floors() (run.py's path does).
-        del session.server_buf[:rsp_end]
-        return [{
-            **base,
-            "ts_start": ts,
-            "ts_end":   session.last_ts,
-            "status":   outcome,
-            "outcome":  _outcome(outcome),
-        }]
-    else:
-        session.add_pending(base, ts_start=ts)
-        return []
+
+def resolve(p, session):
+    """
+    Match a pending NickServ IDENTIFY against NickServ's NOTICE (see tscan_ng.resolve).
+
+    Args:
+        p:       PendingFinding for a irc_creds finding.
+        session: Session whose server_buf is searched.
+
+    Returns:
+        ({"status", "outcome"}, bytes to consume) or None if no reply yet.
+    """
+    outcome, rsp_end = _find_identify_response(bytes(session.server_buf))
+    if outcome is None:
+        return None
+    return {"status": outcome, "outcome": _outcome(outcome)}, rsp_end

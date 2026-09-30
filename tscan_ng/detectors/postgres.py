@@ -82,6 +82,9 @@ Known limitations:
 import struct
 from tscan_ng.session import _make_filter
 
+# Finding types this detector emits; tscan_ng.resolve maps each to resolve().
+FINDING_TYPES = ("postgres_creds",)
+
 # PostgreSQL default port.
 _POSTGRES_PORTS: frozenset = frozenset({5432})
 
@@ -294,8 +297,7 @@ def _find_auth_outcome(data: bytes):
     earlier AuthenticationCleartextPassword) are skipped. The first 'E'
     candidate with a complete, plausible length (>= 4) is taken as an
     ErrorResponse. A candidate whose declared length runs past the buffered
-    data stops the scan (treated as truncated). Also imported by run.py's
-    _try_resolve().
+    data stops the scan (treated as truncated). Called by resolve().
 
     Args:
         data: Raw bytes from the server stream buffer.
@@ -357,18 +359,17 @@ def detect_stream(session, ts: float) -> list:
     The server's cleartext-password request is NOT consumed (only the final
     AuthenticationOk/ErrorResponse and everything before it is, on
     resolution), and the client's StartupMessage is not consumed either
-    (only up to the end of the PasswordMessage). On immediate resolution
-    server_buf is trimmed without a session.shift_pending_floors() call
-    (run.py's path does call it). An empty password is consumed and ignored.
+    (only up to the end of the PasswordMessage). Every password is
+    registered as pending; resolve() matches the outcome (on the same packet
+    if it is already buffered). An empty password is consumed and ignored.
 
     Args:
         session: Session object from session.SessionTable.
         ts:      Unix timestamp of the current packet.
 
     Returns:
-        List of resolved finding dicts. A pending finding is registered on
-        the session if the final AuthenticationOk/ErrorResponse has not yet
-        arrived.
+        Always an empty list; findings are registered on the session as
+        pending and emitted by tscan_ng.resolve once resolved.
     """
     if session.dport not in _POSTGRES_PORTS and session.sport not in _POSTGRES_PORTS:
         return []
@@ -404,23 +405,26 @@ def detect_stream(session, ts: float) -> list:
                                    session.sport, session.dport),
     }
 
-    # The outcome search runs over the whole server_buf (not the 4 KB window),
-    # since AuthenticationOk/ErrorResponse follow the cleartext request.
-    server_bytes_full = bytes(session.server_buf)
-    outcome, status, rsp_end = _find_auth_outcome(server_bytes_full)
-
     del session.client_buf[:req_end]
+    session.add_pending(base, ts_start=ts)
+    return []
 
-    if outcome is not None:
-        # Removes everything up to and including the final auth message.
-        del session.server_buf[:rsp_end]
-        return [{
-            **base,
-            "ts_start": ts,
-            "ts_end":   session.last_ts,
-            "status":   status,
-            "outcome":  outcome,
-        }]
-    else:
-        session.add_pending(base, ts_start=ts)
-        return []
+
+def resolve(p, session):
+    """
+    Match a pending PostgreSQL password against AuthenticationOk/ErrorResponse (see tscan_ng.resolve).
+
+    Consumes server_buf up to the end of that message, which includes the
+    earlier cleartext-password request.
+
+    Args:
+        p:       PendingFinding for a postgres_creds finding.
+        session: Session whose server_buf is searched.
+
+    Returns:
+        ({"status", "outcome"}, bytes to consume) or None if no reply yet.
+    """
+    outcome, status, rsp_end = _find_auth_outcome(bytes(session.server_buf))
+    if outcome is None:
+        return None
+    return {"status": status, "outcome": outcome}, rsp_end

@@ -39,8 +39,7 @@ Finding outcomes:
 Finding type: "imap_creds"
 Finding extras:
     "tag"       - the client's command tag (e.g. "a001"). Used to pair the
-                  request with its tagged server response, in both
-                  detect_stream() and run.py's _try_resolve().
+                  request with its tagged server response in resolve().
     "mechanism" - "AUTHENTICATE_PLAIN" for SASL PLAIN; absent for LOGIN.
     "creds"     - "user:password".
 
@@ -48,9 +47,8 @@ Response correlation (tag-based, unlike FTP/POP3/SMTP):
     server_buf is searched for the first "<tag> OK|NO|BAD " line whose tag
     equals the request's tag (case-insensitive). Because of this, unrelated
     untagged ("* ...") or differently-tagged responses cannot be mistaken for
-    the answer. The immediate-resolve path in detect_stream() does not consume
-    the matched line from server_buf; run.py's _try_resolve() (pending path)
-    does.
+    the answer. resolve() consumes server_buf up to and including the
+    matched line, so a reused tag cannot match a stale response.
 
 Known limitations:
     - LOGIN arguments given as IMAP literals ("LOGIN {5}<CRLF>alice ...") are
@@ -70,6 +68,9 @@ import base64
 import logging
 import re
 from tscan_ng.session import _make_filter
+
+# Finding types this detector emits; tscan_ng.resolve maps each to resolve().
+FINDING_TYPES = ("imap_creds",)
 
 # Well-known IMAP ports.
 # Sessions whose dport or sport is in this set are scanned for credentials.
@@ -133,24 +134,17 @@ _BASE64_LINE_RE = re.compile(
     re.MULTILINE
 )
 
-# Matches a tagged server response (string regex — used by detect_stream
-# when server_buf has already been decoded to str). The trailing \s+ means the
-# status must be followed by at least one whitespace character (a bare "a1 OK"
-# with nothing after it, or split at the segment boundary, is not matched).
+# Matches a tagged server response, on raw bytes so match.end() is a byte
+# offset for consuming server_buf (a decoded string's character offsets
+# would mis-align if server_buf holds multi-byte UTF-8 or undecodable bytes).
+# The trailing \s+ means the status must be followed by at least one
+# whitespace character (a bare "a1 OK" with nothing after it, or split at
+# the segment boundary, is not matched).
 #   Group 1: tag, Group 2: OK / NO / BAD.
 #   a001 OK [CAPABILITY ...] Welcome
 #   a001 NO [AUTHENTICATIONFAILED] Invalid credentials
 #   a001 BAD Command unknown
 _IMAP_RESPONSE_RE = re.compile(
-    r'^(\S+)\s+(OK|NO|BAD)\s+',
-    re.IGNORECASE | re.MULTILINE
-)
-
-# Bytes version of the same pattern — used by run.py _try_resolve to obtain
-# a byte-aligned end offset for slicing server_buf directly.  Searching the
-# decoded string and using the character offset would mis-align the slice if
-# server_buf contains multi-byte UTF-8 sequences or bytes dropped by "ignore".
-_IMAP_RESPONSE_BYTES_RE = re.compile(
     rb'^(\S+)\s+(OK|NO|BAD)\s+',
     re.IGNORECASE | re.MULTILINE
 )
@@ -215,14 +209,11 @@ def detect_stream(session, ts: float) -> list[dict]:
     Scans the session's client buffer for IMAP LOGIN commands and for
     AUTHENTICATE PLAIN exchanges (inline SASL-IR or split across the
     server's "+" continuation). For each one found, records the command
-    tag and attempts to correlate with a tagged server response already
-    present in the server buffer.
-
-    Emits a finding immediately if a matching tagged response is available,
-    or registers a pending finding on the session for later resolution
-    (run.py's _try_resolve handles both mechanisms identically, since
-    resolution only depends on the "tag" field matching an eventual
-    tagged OK/NO/BAD response — see run.py). LOGIN is scanned with finditer,
+    tag and registers a pending finding; resolve() below pairs it with the
+    tagged server response (on the same packet if it is already buffered).
+    Both mechanisms resolve identically, since resolution only depends on
+    the "tag" field matching a tagged OK/NO/BAD response. LOGIN is scanned
+    with finditer,
     so several LOGIN commands in one buffer each produce a finding;
     AUTHENTICATE PLAIN uses search, so only the first such command per call
     is handled.
@@ -244,8 +235,8 @@ def detect_stream(session, ts: float) -> list[dict]:
         ts:      Unix timestamp of the current packet.
 
     Returns:
-        List of resolved finding dicts. Pending findings are registered on
-        the session and not returned until resolved.
+        Always an empty list; findings are registered on the session as
+        pending and emitted by tscan_ng.resolve once resolved.
     """
     # Skip sessions that are not on a known IMAP port.
     if session.dport not in _IMAP_PORTS and session.sport not in _IMAP_PORTS:
@@ -257,34 +248,7 @@ def detect_stream(session, ts: float) -> list[dict]:
     # end, so offsets computed against it stay valid for both mechanisms.
     scan = bytes(session.client_buf[:_MAX_CMD_SCAN])
 
-    # Decode server_buf once outside the loop rather than once per match.
-    # Only used for tag lookups (never for offsets), so lossy "ignore"
-    # decoding is safe here; the pending path in run.py searches raw bytes.
-    server_text = session.server_buf.decode("utf-8", "ignore")
-
-    findings = []
     consume_end = None  # Furthest offset into `scan` consumed by either mechanism.
-
-    def _resolve_or_pend(base: dict):
-        """Emit a finding immediately if the tagged response is already in
-        server_buf, otherwise register it as pending. Shared by both LOGIN
-        and AUTHENTICATE PLAIN below since resolution is identical."""
-        tag = base["tag"]
-        response = None
-        for resp_match in _IMAP_RESPONSE_RE.finditer(server_text):
-            if resp_match.group(1).upper() == tag.upper():
-                response = resp_match.group(2)
-                break
-        if response:
-            findings.append({
-                **base,
-                "ts_start": ts,
-                "ts_end":   session.last_ts,
-                "status":   response.upper(),
-                "outcome":  _outcome(response),
-            })
-        else:
-            session.add_pending(base, ts_start=ts)
 
     # -----------------------------------------------------------------------
     # LOGIN
@@ -315,20 +279,20 @@ def detect_stream(session, ts: float) -> list[dict]:
                 session.session_id)
             continue
 
-        _resolve_or_pend({
+        session.add_pending({
             "type":       "imap_creds",
             "session_id": session.session_id,
             "src":        session.src,
             "dst":        session.dst,
             "sport":      session.sport,
             "dport":      session.dport,
-            "tag":        tag,  # Retained for _try_resolve tag correlation in run.py
+            "tag":        tag,  # Pairs the request with its response in resolve()
                                 # (unlike snmp's "_request_id" it is NOT
                                 # underscore-prefixed, so it is also emitted.)
             "creds":      f"{user}:{passwd}",
             "filter":     _make_filter(session.src, session.dst,
                                        session.sport, session.dport),
-        })
+        }, ts_start=ts)
 
     if login_last_match is not None:
         consume_end = login_last_match.end()
@@ -364,7 +328,7 @@ def detect_stream(session, ts: float) -> list[dict]:
             if result is not None:
                 user, passwd = result
                 if user or passwd:
-                    _resolve_or_pend({
+                    session.add_pending({
                         "type":       "imap_creds",
                         "mechanism":  "AUTHENTICATE_PLAIN",
                         "session_id": session.session_id,
@@ -376,7 +340,7 @@ def detect_stream(session, ts: float) -> list[dict]:
                         "creds":      f"{user}:{passwd}",
                         "filter":     _make_filter(session.src, session.dst,
                                                    session.sport, session.dport),
-                    })
+                    }, ts_start=ts)
                 else:
                     logging.debug(
                         "imap: session %s: AUTHENTICATE PLAIN decoded empty credentials",
@@ -392,4 +356,27 @@ def detect_stream(session, ts: float) -> list[dict]:
     if consume_end is not None:
         del session.client_buf[:consume_end]
 
-    return findings
+    return []
+
+
+def resolve(p, session):
+    """
+    Match a pending IMAP login against its tagged reply (see tscan_ng.resolve).
+
+    Looks for the first "<tag> OK|NO|BAD " line in server_buf whose tag
+    equals the finding's "tag" (case-insensitive); untagged and differently
+    tagged lines are skipped.
+
+    Args:
+        p:       PendingFinding for an imap_creds finding.
+        session: Session whose server_buf is searched.
+
+    Returns:
+        ({"status", "outcome"}, bytes to consume) or None if no reply yet.
+    """
+    tag = p.finding.get("tag", "").upper().encode("utf-8", "ignore")
+    for match in _IMAP_RESPONSE_RE.finditer(bytes(session.server_buf)):
+        if match.group(1).upper() == tag:
+            status = match.group(2).upper().decode("utf-8", "ignore")
+            return {"status": status, "outcome": _outcome(status)}, match.end()
+    return None

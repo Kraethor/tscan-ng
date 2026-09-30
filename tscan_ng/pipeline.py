@@ -31,8 +31,9 @@ reading the JSONL log. Repeat findings are collapsed before either sink by
 _emit()'s cross-process cooldown.
 
 Entry point: `python -m tscan_ng.pipeline` loads Config() and calls main().
-Pending-finding resolution (_try_resolve) is imported from run.py, which
-now holds nothing else.
+Detectors only park credentials as pending findings; resolve.py's
+resolve_pending() matches them with their server responses, right after
+the detectors on every packet (TODO.md #56).
 
 The BPF filter is compiled via libpcap's pcap_open_dead() + pcap_compile()
 (see capture.py) rather than reimplementing a BPF compiler, then attached
@@ -49,7 +50,7 @@ from tscan_ng.sinks.jsonl import JSONLSink
 from tscan_ng.sinks.discord import DiscordSink
 from tscan_ng.sinks.cooldown import claim_slot
 from tscan_ng.session import SessionTable
-from tscan_ng.run import _try_resolve
+from tscan_ng.resolve import resolve_pending
 from tscan_ng.capture import (
     pcap_open_dead, bpf_program, pcap_compile, pcap_freecode, pcap_close,
     PCAP_NETMASK_UNKNOWN, _err, _build_port_filter,
@@ -299,16 +300,14 @@ def _stamp_resolved(finding: dict, ts: float) -> dict:
     """
     Return a copy of a pending-then-resolved *finding* with a "ts" field.
 
-    Immediate findings get "ts" (the packet time) from the call sites below,
-    and http_basic's resolution sets it itself, but run.py's _try_resolve()
-    returns every other detector's resolved finding without one, so those
-    records had no top-level timestamp (TODO.md #17). "ts" is set to the
-    finding's own ts_start (when the credentials were seen), consistent with
-    immediate findings; *ts* (the current packet time) is only the fallback
-    if ts_start is missing. An existing "ts" is left as is.
+    resolve.resolve_pending() returns findings without one; without this
+    those records had no top-level timestamp (TODO.md #17). "ts" is set to
+    the finding's own ts_start (when the credentials were seen); *ts* (the
+    current packet time) is only the fallback if ts_start is missing. An
+    existing "ts" is left as is.
 
     Args:
-        finding: Resolved finding dict from _try_resolve().
+        finding: Resolved finding dict from resolve.resolve_pending().
         ts:      Unix timestamp of the packet that resolved it.
 
     Returns:
@@ -443,7 +442,8 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
 
     Architecturally identical to run.py's old worker_main() -- same
     SessionTable usage, same detector loop, same pending-finding
-    resolution via _try_resolve(), same expiry-on-timeout pattern -- the
+    resolution (now resolve.resolve_pending()), same expiry-on-timeout
+    pattern -- the
     only thing that changes is where packets come from: a socket this
     process owns and reads directly, instead of a multiprocessing.Queue
     fed by a separate dispatcher process. Every packet this process
@@ -562,19 +562,16 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
             session, closed = sessions.add_packet(pkt, ts)
             for f in closed:
                 _emit(sink, discord, {"ts": f["ts_start"], **f}, finding_cooldown_sec)
+            # Detectors park credentials as pending (they return nothing
+            # today; the loop keeps the interface open); resolve_pending()
+            # then matches any reply already buffered, on this same packet.
             for det in STREAM_DETECTORS:
                 for f in det(session, ts):
                     _emit(sink, discord, {"ts": ts, **f}, finding_cooldown_sec)
             if session.pending:
-                still_pending = []
-                for p in session.pending:
-                    resolved = _try_resolve(p, session, ts)
-                    if resolved:
-                        _emit(sink, discord, _stamp_resolved(resolved, ts),
-                              finding_cooldown_sec)
-                    else:
-                        still_pending.append(p)
-                session.pending = still_pending
+                for resolved in resolve_pending(session, ts):
+                    _emit(sink, discord, _stamp_resolved(resolved, ts),
+                          finding_cooldown_sec)
             last_expiry = _maybe_run_periodic(
                 sock, sessions, sink, discord, pipeline_id, last_expiry, cfg.expiry_interval,
                 finding_cooldown_sec)

@@ -1,15 +1,22 @@
 """
 detectors/__init__.py - Detector registry for tscan-ng.
 
-Exports STREAM_DETECTORS, the list of detector functions consumed by each
-pipeline_worker() process in pipeline.py, the deployed tscan-pipeline.service
-path. Every protocol here needs stream reassembly to correlate a credential
+Exports DETECTOR_MODULES (one module per protocol) and STREAM_DETECTORS,
+their detect_stream functions, consumed by each pipeline_worker() process in
+pipeline.py, the deployed tscan-pipeline.service path. tscan_ng.resolve
+builds its resolver registry from DETECTOR_MODULES. Every protocol here needs stream reassembly to correlate a credential
 with its server response (see e.g. detectors/ftp.py's module docstring), so
 all 12 are stream-aware; there is no per-packet detector mechanism.
 
-To add a new detector: implement detect_stream(session, ts) and append it
-to STREAM_DETECTORS. Required signature:
-    def detect_stream(session: Session, ts: float) -> list[dict]
+Each detector module provides:
+    FINDING_TYPES = ("<proto>_creds", ...)       # types it emits
+    def detect_stream(session, ts) -> list        # finds credentials; always []
+    def resolve(p, session) -> tuple | None       # matches the server's reply
+detect_stream() never judges the outcome: it parks each credential with
+session.add_pending() and consumes the client bytes it used. resolve()
+returns ({"status", "outcome", ...}, bytes_to_consume) once the reply is
+in server_buf, else None; tscan_ng.resolve consumes the bytes and shifts
+the other pending findings' floors. It must not modify server_buf itself.
 
 Call configure_all(cfg) once in each worker process after loading Config to
 apply the port sets from the config file to every protocol detector.
@@ -19,24 +26,21 @@ How detectors are driven (pipeline.py pipeline_worker(), per captured packet):
        client_buf/server_buf and returns the Session.
     2. Every function in STREAM_DETECTORS is called with (session, ts), in list
        order. Order has no functional significance: each detector gates on its
-       own port set, so at most one does real work for a given flow. Returned
-       findings are already resolved and are emitted immediately.
-    3. Unresolved credentials are parked with session.add_pending(); then every
-       entry in session.pending is offered to run.py's _try_resolve(), which
-       dispatches on the finding's "type" and re-runs that protocol's
-       response parser against server_buf. So each protocol's response logic
-       lives in TWO places (the detector's immediate-resolve path and
-       _try_resolve) and must be kept in sync.
+       own port set, so at most one does real work for a given flow.
+       Credentials are parked with session.add_pending().
+    3. tscan_ng.resolve.resolve_pending() offers every pending finding to the
+       resolve() of the module that emitted its "type". A reply that is
+       already buffered is therefore matched on the same packet. Each
+       protocol's response parsing lives only in its resolve() (TODO.md #56).
 
 Registration checklist for a NEW detector (every place in the current tree
 that enumerates the protocols; missing one causes a silent failure):
     1. detectors/<proto>.py: module-level `_<PROTO>_PORTS` frozenset (the
-       name configure_all() overwrites), `detect_stream(session, ts)`, an
-       `_outcome()` mapper, and a `_find_*_response()` helper that returns an
-       end offset into server_buf so the response can be consumed.
-    2. This file: import the module, append <proto>.detect_stream to
-       STREAM_DETECTORS, and add a `<proto>._<PROTO>_PORTS = cfg.<proto>_ports`
-       line to configure_all().
+       name configure_all() overwrites), FINDING_TYPES, `detect_stream(session,
+       ts)` and `resolve(p, session)` as described above.
+    2. This file: import the module, append it to DETECTOR_MODULES, and add a
+       `<proto>._<PROTO>_PORTS = cfg.<proto>_ports` line to configure_all().
+       tests/test_resolve.py checks every module has a resolver.
     3. config.py: a `<proto>_ports` property (with default fallback), the
        [ports] example in the module docstring, and the two places that list
        every protocol (the ports summary tuple list and __repr__).
@@ -44,10 +48,7 @@ that enumerates the protocols; missing one causes a silent failure):
     5. capture.py _build_port_filter(): add cfg.<proto>_ports to the TCP port
        union (or, for a UDP protocol, to the udp clause). Without this the
        BPF filter drops the traffic before it reaches any detector.
-    6. run.py: import the response parser and add an `elif finding_type ==
-       "<proto>_creds"` branch to _try_resolve(); otherwise pending findings
-       never resolve and can only end as "no_response".
-    7. scripts/watch.py: a colour/label entry (and display branch) for the new
+    6. scripts/watch.py: a colour/label entry (and display branch) for the new
        finding type; docs (README.md, docs/REBUILD.md, docs/test_reference.md)
        and tests.
     Also add cfg.<proto>_ports to the union in Config.server_ports
@@ -62,20 +63,11 @@ from tscan_ng.detectors import (
     http_basic, ftp, pop3, imap, smtp, telnet, ldap, redis, smb, snmp, irc, postgres,
 )
 
-STREAM_DETECTORS = [
-    http_basic.detect_stream,
-    imap.detect_stream,
-    ftp.detect_stream,
-    smtp.detect_stream,
-    pop3.detect_stream,
-    telnet.detect_stream,
-    ldap.detect_stream,
-    redis.detect_stream,
-    smb.detect_stream,
-    snmp.detect_stream,
-    irc.detect_stream,
-    postgres.detect_stream,
+DETECTOR_MODULES = [
+    http_basic, imap, ftp, smtp, pop3, telnet, ldap, redis, smb, snmp, irc, postgres,
 ]
+
+STREAM_DETECTORS = [mod.detect_stream for mod in DETECTOR_MODULES]
 
 
 def configure_all(cfg) -> None:

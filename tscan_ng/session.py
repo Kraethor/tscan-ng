@@ -158,7 +158,8 @@ def _close_finding(p: "PendingFinding", last_ts: float) -> dict:
 def _make_filter(src: str, dst: str, sport: int, dport: int) -> str:
     """
     Build a Wireshark/tcpdump display filter string for this flow.
-    (No caller in the tscan_ng package uses it; kept for tooling.)
+    Every detector stores it as the finding's "filter" field. It always says
+    "tcp port", which is wrong for SNMP (UDP); see TODO.md #28.
 
     The resulting filter can be used directly with tcpdump -r or as a
     Wireshark display filter to isolate this session in a full pcap
@@ -299,21 +300,28 @@ class Session:
         else:
             self.server_buf.extend(payload)
 
-    def add_pending(self, finding: dict, ts_start: float):
+    def add_pending(self, finding: dict, ts_start: float, floor: int | None = None):
         """
         Register a credential finding as pending server response correlation.
 
-        Records the current server_buf length as this finding's floor (see
-        PendingFinding.server_buf_floor) so a later buffer trim knows not to
-        discard bytes this finding's response may still need.
+        Every detector reports credentials this way; tscan_ng.resolve then
+        matches the response (possibly on the same packet, if it is already
+        buffered).
+
+        Records this finding's floor (see PendingFinding.server_buf_floor) so
+        a later buffer trim knows not to discard bytes its response may still
+        need. By default the floor is the current server_buf length; a
+        detector that knows the response can only follow an earlier point
+        (telnet: the password prompt) passes that offset instead.
 
         Args:
             finding:  Partial finding dict from a stream detector.
             ts_start: Unix timestamp when the credentials were observed.
+            floor:    Optional server_buf offset to use as the floor.
         """
         self.pending.append(PendingFinding(
             finding=finding, ts_start=ts_start,
-            server_buf_floor=len(self.server_buf)))
+            server_buf_floor=len(self.server_buf) if floor is None else floor))
 
     def shift_pending_floors(self, consumed: int):
         """

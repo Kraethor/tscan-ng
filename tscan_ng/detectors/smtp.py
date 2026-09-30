@@ -55,8 +55,8 @@ Response correlation:
     command tags exist in SMTP. Matched lines are consumed only when used, so
     a stale 535/534/432 left by an earlier attempt that this module did not
     detect (e.g. an unsupported mechanism such as CRAM-MD5 or XOAUTH2) will be
-    attributed to the next captured credential. run.py's _try_resolve()
-    repeats the same matching for pending findings.
+    attributed to the next captured credential. The matching lives in
+    resolve() below; detect_stream() only parks credentials as pending.
 
 Known limitations:
     - Only AUTH PLAIN and AUTH LOGIN are parsed. An initial response given
@@ -77,6 +77,9 @@ import re
 import base64
 from tscan_ng.detectors.common import decode_b64 as _decode_b64
 from tscan_ng.session import _make_filter
+
+# Finding types this detector emits; tscan_ng.resolve maps each to resolve().
+FINDING_TYPES = ("smtp_creds",)
 
 # Matches SMTP AUTH PLAIN with optional inline credentials, on a line of its
 # own (anchored ^...$ per line; the optional CR tolerates CRLF endings since
@@ -204,17 +207,17 @@ def detect_stream(session, ts: float) -> list:
     AUTH LOGIN: credentials arrive across multiple client packets interleaved
     with server 334 challenges.  The client buffer is NOT consumed until both
     base64 lines are present, keeping AUTH LOGIN as a stable anchor for
-    successive calls.  Once complete, a pending finding is registered (or
-    resolved immediately if the 235 response is already in server_buf), and
-    the consumed portion of client_buf is removed.
+    successive calls.  Once complete, a pending finding is registered
+    (resolve() matches the reply, on the same packet if it is already
+    buffered), and the consumed portion of client_buf is removed.
 
     Args:
         session: Session object from session.SessionTable.
         ts:      Unix timestamp of the current packet.
 
     Returns:
-        List of resolved finding dicts. Pending findings are registered on
-        the session and not returned until resolved.
+        Always an empty list; findings are registered on the session as
+        pending and emitted by tscan_ng.resolve once resolved.
     """
     # Skip sessions that are not on a known SMTP port.
     if session.sport not in _SMTP_PORTS and session.dport not in _SMTP_PORTS:
@@ -222,9 +225,6 @@ def detect_stream(session, ts: float) -> list:
 
     # Cap the scan to _MAX_CMD_SCAN bytes to bound per-packet CPU cost.
     client_bytes = bytes(session.client_buf[:_MAX_CMD_SCAN])
-    server_bytes = bytes(session.server_buf)
-
-    findings = []
 
     # -----------------------------------------------------------------------
     # AUTH LOGIN
@@ -258,25 +258,13 @@ def detect_stream(session, ts: float) -> list:
                                            session.sport, session.dport),
             }
 
-            response = _SMTP_RESPONSE_RE.search(server_bytes)
-            if response:
-                code = response.group(1)
-                findings.append({
-                    **base,
-                    "ts_start": ts,
-                    "ts_end":   session.last_ts,
-                    "status":   code.decode("utf-8", "ignore"),
-                    "outcome":  _outcome(code),
-                })
-                del session.server_buf[:response.end()]
-            else:
-                session.add_pending(base, ts_start=ts)
+            session.add_pending(base, ts_start=ts)
 
             # Consume AUTH LOGIN + both credential lines from client buffer.
             # Returns immediately: AUTH PLAIN below is not examined in the
             # same call.
             del session.client_buf[:b64_matches[1].end()]
-            return findings
+            return []
 
         # Fewer than 2 credential lines present — leave the buffer intact so
         # AUTH LOGIN remains an anchor for the next packet.  Fall through to
@@ -313,7 +301,7 @@ def detect_stream(session, ts: float) -> list:
                     "smtp: session %s: AUTH PLAIN decoded empty credentials",
                     session.session_id)
                 del session.client_buf[:end]
-                return findings
+                return []
             base = {
                 "type":       "smtp_creds",
                 "mechanism":  "PLAIN",
@@ -327,20 +315,30 @@ def detect_stream(session, ts: float) -> list:
                                            session.sport, session.dport),
             }
 
-            response = _SMTP_RESPONSE_RE.search(server_bytes)
-            if response:
-                code = response.group(1)
-                findings.append({
-                    **base,
-                    "ts_start": ts,
-                    "ts_end":   session.last_ts,
-                    "status":   code.decode("utf-8", "ignore"),
-                    "outcome":  _outcome(code),
-                })
-                del session.server_buf[:response.end()]
-            else:
-                session.add_pending(base, ts_start=ts)
+            session.add_pending(base, ts_start=ts)
 
             del session.client_buf[:end]
 
-    return findings
+    return []
+
+
+def resolve(p, session):
+    """
+    Match a pending SMTP AUTH against the server's reply (see tscan_ng.resolve).
+
+    Takes the first 235/535/534/432 line in server_buf (see "Response
+    correlation" in the module docstring for why that can be a stale line).
+
+    Args:
+        p:       PendingFinding for an smtp_creds finding.
+        session: Session whose server_buf is searched.
+
+    Returns:
+        ({"status", "outcome"}, bytes to consume) or None if no reply yet.
+    """
+    response = _SMTP_RESPONSE_RE.search(bytes(session.server_buf))
+    if not response:
+        return None
+    code = response.group(1)
+    return ({"status": code.decode("utf-8", "ignore"), "outcome": _outcome(code)},
+            response.end())

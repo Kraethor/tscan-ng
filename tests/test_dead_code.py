@@ -14,6 +14,7 @@ import unittest
 from tscan_ng.config import Config
 from tscan_ng.detectors import http_basic
 from tscan_ng.detectors.common import decode_b64
+from tscan_ng.resolve import resolve_pending
 from tscan_ng.session import Session
 
 
@@ -53,7 +54,8 @@ class DecodeB64Tests(unittest.TestCase):
         s.client_buf.extend(b"GET / HTTP/1.1\r\nHost: x\r\n"
                             b"Authorization: Basic dXNlcjpwYXNzMQ\r\n\r\n")
         s.server_buf.extend(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-        out = http_basic.detect_stream(s, 1000.0)
+        http_basic.detect_stream(s, 1000.0)
+        out = resolve_pending(s, 1000.0)
         self.assertEqual([f["creds"] for f in out], ["user:pass1"])
 
 

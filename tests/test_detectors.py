@@ -4,8 +4,8 @@ Regression tests for detector parsing bugs (TODO.md #1 postgres, #2 http_basic,
 
 Each test drives a detector the same way pipeline.py does: bytes are appended
 to a Session's client_buf/server_buf and detect_stream() is called after each
-step; pending findings are then resolved with run._try_resolve(). No network,
-no root and no config file are needed.
+step, followed by tscan_ng.resolve.resolve_pending() (see detect()). No
+network, no root and no config file are needed.
 
 Run from /opt/tscan:
     PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -t . -v
@@ -15,7 +15,7 @@ import struct
 import unittest
 
 from tscan_ng.session import Session
-from tscan_ng.run import _try_resolve
+from tscan_ng import resolve
 from tscan_ng.detectors import postgres, http_basic, irc
 
 TS = 1000.0
@@ -29,13 +29,14 @@ def make_session(dport: int) -> Session:
 
 
 def resolve_pending(session: Session) -> list:
-    """Run _try_resolve over every pending finding, as pipeline.py does."""
-    done, still = [], []
-    for p in session.pending:
-        r = _try_resolve(p, session, TS + 1)
-        (done if r else still).append(r or p)
-    session.pending = still
-    return done
+    """Resolve pending findings against what is buffered now."""
+    return resolve.resolve_pending(session, TS + 1)
+
+
+def detect(module, session: Session, ts: float = TS) -> list:
+    """What pipeline.py emits for one packet: run the detector, then resolve."""
+    module.detect_stream(session, ts)
+    return resolve.resolve_pending(session, ts)
 
 
 # --------------------------------------------------------------------------
@@ -64,7 +65,7 @@ class PostgresTests(unittest.TestCase):
         s = make_session(5432)
         s.client_buf.extend(PG_STARTUP_P + pg_password(b"s3cret"))
         s.server_buf.extend(PG_AUTH_CLEARTEXT + PG_AUTH_OK)
-        out = postgres.detect_stream(s, TS)
+        out = detect(postgres, s, TS)
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["creds"], "postgres:s3cret")
         self.assertEqual(out[0]["outcome"], "success")
@@ -73,7 +74,7 @@ class PostgresTests(unittest.TestCase):
         s = make_session(5432)
         s.client_buf.extend(pg_startup(b"user\x00bob\x00") + pg_password(b"pw"))
         s.server_buf.extend(PG_AUTH_CLEARTEXT + PG_AUTH_OK)
-        out = postgres.detect_stream(s, TS)
+        out = detect(postgres, s, TS)
         self.assertEqual([f["creds"] for f in out], ["bob:pw"])
 
     def test_ssl_request_before_startup(self):
@@ -81,7 +82,7 @@ class PostgresTests(unittest.TestCase):
         ssl_request = struct.pack(">II", 8, 80877103)
         s.client_buf.extend(ssl_request + PG_STARTUP_P + pg_password(b"pw2"))
         s.server_buf.extend(PG_AUTH_CLEARTEXT + PG_AUTH_OK)
-        out = postgres.detect_stream(s, TS)
+        out = detect(postgres, s, TS)
         self.assertEqual([f["creds"] for f in out], ["postgres:pw2"])
 
     def test_truncated_password_message_waits_then_completes(self):
@@ -89,16 +90,16 @@ class PostgresTests(unittest.TestCase):
         msg = pg_password(b"longerpassword")
         s.client_buf.extend(PG_STARTUP_P + msg[:8])
         s.server_buf.extend(PG_AUTH_CLEARTEXT + PG_AUTH_OK)
-        self.assertEqual(postgres.detect_stream(s, TS), [])
+        self.assertEqual(detect(postgres, s, TS), [])
         s.client_buf.extend(msg[8:])
-        out = postgres.detect_stream(s, TS)
+        out = detect(postgres, s, TS)
         self.assertEqual([f["creds"] for f in out], ["postgres:longerpassword"])
 
     def test_pending_then_resolved(self):
         s = make_session(5432)
         s.client_buf.extend(PG_STARTUP_P + pg_password(b"pw"))
         s.server_buf.extend(PG_AUTH_CLEARTEXT)
-        self.assertEqual(postgres.detect_stream(s, TS), [])
+        self.assertEqual(detect(postgres, s, TS), [])
         self.assertEqual(len(s.pending), 1)
         s.server_buf.extend(PG_AUTH_OK)
         done = resolve_pending(s)
@@ -121,12 +122,12 @@ class HttpBasicTests(unittest.TestCase):
         """no-auth request -> 401 -> retry with credentials -> 200."""
         s = make_session(80)
         s.client_buf.extend(REQ_NOAUTH)
-        self.assertEqual(http_basic.detect_stream(s, TS), [])
+        self.assertEqual(detect(http_basic, s, TS), [])
         s.server_buf.extend(RSP_401)
-        self.assertEqual(http_basic.detect_stream(s, TS), [])
+        self.assertEqual(detect(http_basic, s, TS), [])
         s.client_buf.extend(REQ_AUTH)
         # The 200 has not arrived: must NOT resolve against the stale 401.
-        self.assertEqual(http_basic.detect_stream(s, TS), [])
+        self.assertEqual(detect(http_basic, s, TS), [])
         self.assertEqual(len(s.pending), 1)
         s.server_buf.extend(RSP_200)
         done = resolve_pending(s)
@@ -139,7 +140,7 @@ class HttpBasicTests(unittest.TestCase):
         s = make_session(80)
         s.client_buf.extend(REQ_NOAUTH + REQ_AUTH)
         s.server_buf.extend(RSP_401 + RSP_200)
-        out = http_basic.detect_stream(s, TS)
+        out = detect(http_basic, s, TS)
         self.assertEqual([(f["status"], f["outcome"]) for f in out],
                          [(200, "success")])
         self.assertNotIn("_rsp_index", out[0])
@@ -147,7 +148,7 @@ class HttpBasicTests(unittest.TestCase):
     def test_responses_arrive_after_both_requests(self):
         s = make_session(80)
         s.client_buf.extend(REQ_NOAUTH + REQ_AUTH)
-        self.assertEqual(http_basic.detect_stream(s, TS), [])
+        self.assertEqual(detect(http_basic, s, TS), [])
         s.server_buf.extend(RSP_401)
         self.assertEqual(resolve_pending(s), [])   # 401 belongs to request 0
         s.server_buf.extend(RSP_200)
@@ -158,7 +159,7 @@ class HttpBasicTests(unittest.TestCase):
         s = make_session(80)
         s.client_buf.extend(REQ_AUTH)
         s.server_buf.extend(RSP_401)
-        out = http_basic.detect_stream(s, TS)
+        out = detect(http_basic, s, TS)
         self.assertEqual([(f["status"], f["outcome"]) for f in out],
                          [(401, "failed")])
 
@@ -166,10 +167,10 @@ class HttpBasicTests(unittest.TestCase):
         s = make_session(80)
         s.client_buf.extend(REQ_AUTH)
         s.server_buf.extend(RSP_401)
-        first = http_basic.detect_stream(s, TS)
+        first = detect(http_basic, s, TS)
         s.client_buf.extend(REQ_AUTH)
         s.server_buf.extend(RSP_200)
-        second = http_basic.detect_stream(s, TS)
+        second = detect(http_basic, s, TS)
         self.assertEqual([f["outcome"] for f in first], ["failed"])
         self.assertEqual([f["outcome"] for f in second], ["success"])
 
@@ -182,7 +183,7 @@ class IrcTests(unittest.TestCase):
     def _run(self, client: bytes):
         s = make_session(6667)
         s.client_buf.extend(client)
-        return s, irc.detect_stream(s, TS)
+        return s, detect(irc, s, TS)
 
     def test_single_arg_identify_followed_by_join(self):
         s, out = self._run(b"PRIVMSG NickServ :IDENTIFY hunter2\r\nJOIN #chan\r\n")
@@ -204,7 +205,7 @@ class IrcTests(unittest.TestCase):
         s.client_buf.extend(b"PRIVMSG NickServ :ID hunter2\r\nJOIN #x\r\n")
         s.server_buf.extend(
             b":NickServ!NickServ@svc NOTICE me :Password accepted - you are now recognized.\r\n")
-        out = irc.detect_stream(s, TS)
+        out = detect(irc, s, TS)
         self.assertEqual([(f["creds"], f["outcome"]) for f in out],
                          [(":hunter2", "success")])
 

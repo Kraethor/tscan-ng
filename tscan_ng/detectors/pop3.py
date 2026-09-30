@@ -38,8 +38,8 @@ Credentials extracted:
 Response correlation (positional, not tagged -- POP3 has no command tags):
     Server lines beginning "+OK" or "-ERR" are collected in order from
     server_buf. The greeting banner is assumed to be the first one, the USER
-    reply the second and the PASS reply the third. Rules applied (identically
-    in run.py's _try_resolve()):
+    reply the second and the PASS reply the third. Rules applied by resolve()
+    below:
       - any "-ERR" anywhere in server_buf resolves immediately as failed;
       - otherwise, once three responses are present, the third decides;
       - otherwise the finding is parked as pending.
@@ -64,6 +64,9 @@ Known limitations:
 import logging
 import re
 from tscan_ng.session import _make_filter
+
+# Finding types this detector emits; tscan_ng.resolve maps each to resolve().
+FINDING_TYPES = ("pop3_creds",)
 
 # Well-known POP3 ports.
 # Sessions whose dport or sport is in this set are scanned for credentials.
@@ -127,11 +130,9 @@ def detect_stream(session, ts: float) -> list:
     session.server_buf for +OK / -ERR responses.  Session direction is
     always normalised to the client perspective by the session layer.
 
-    Registers a pending finding if no server response is available yet,
-    and consumes the matched commands from the client buffer to avoid
-    re-detection on subsequent packets. On resolution, server_buf is consumed
-    up to the end of the deciding response line; unlike run.py's
-    _try_resolve(), this path does not call session.shift_pending_floors().
+    Registers every credential as a pending finding (resolve() below matches
+    the server's reply) and consumes the matched commands from the client
+    buffer to avoid re-detection on subsequent packets.
 
     The scan is bounded to _MAX_CMD_SCAN bytes per call to keep per-packet
     work O(1) regardless of buffer lifetime.
@@ -141,8 +142,8 @@ def detect_stream(session, ts: float) -> list:
         ts:      Unix timestamp of the current packet.
 
     Returns:
-        List of resolved finding dicts. Pending findings are registered on
-        the session and not returned until resolved.
+        Always an empty list; findings are registered on the session as
+        pending and emitted by tscan_ng.resolve once resolved.
     """
     # Skip sessions that are not on a known POP3 port.
     if session.dport not in _POP3_PORTS and session.sport not in _POP3_PORTS:
@@ -184,51 +185,38 @@ def detect_stream(session, ts: float) -> list:
                                    session.sport, session.dport),
     }
 
-    findings = []
-    server_bytes = bytes(session.server_buf)
+    session.add_pending(base, ts_start=ts)
+    del session.client_buf[:pass_match.end()]
+    return []
 
-    # POP3 session response sequence (normal):
-    #   responses[0] - server greeting banner (+OK)
-    #   responses[1] - reply to USER (+OK or -ERR)
-    #   responses[2] - reply to PASS (+OK or -ERR)   <- we want this one
-    #
-    # We require all three to be present before resolving, because two
-    # +OK responses are ambiguous (banner + USER reply, still waiting for
-    # PASS reply).  A -ERR at any position is an unambiguous failure
-    # and can be resolved immediately.
-    responses = list(_POP3_RESPONSE_RE.finditer(server_bytes))
 
-    # Find the first -ERR if any — treated as an unambiguous authentication
-    # failure. (It is not strictly unambiguous: an -ERR to CAPA/STAT etc. also
-    # matches. Kept identical to run.py._try_resolve.)
-    err_response = next((r for r in responses if r.group(1).upper() == b"-ERR"), None)
-    if err_response:
-        code = err_response.group(1)
-        findings.append({
-            **base,
-            "ts_start": ts,
-            "ts_end":   session.last_ts,
-            "status":   code.decode("utf-8", "ignore"),
-            "outcome":  "failed",
-        })
-        del session.server_buf[:err_response.end()]
-        del session.client_buf[:pass_match.end()]
-    elif len(responses) >= 3:
-        # banner + USER reply + PASS reply — take the third as PASS result
-        pass_response = responses[2]
-        code = pass_response.group(1)
-        findings.append({
-            **base,
-            "ts_start": ts,
-            "ts_end":   session.last_ts,
-            "status":   code.decode("utf-8", "ignore"),
-            "outcome":  _outcome(code),
-        })
-        del session.server_buf[:pass_response.end()]
-        del session.client_buf[:pass_match.end()]
-    else:
-        # Not enough server data yet — register as pending
-        session.add_pending(base, ts_start=ts)
-        del session.client_buf[:pass_match.end()]
+def resolve(p, session):
+    """
+    Match a pending POP3 login against the server's replies (see tscan_ng.resolve).
 
-    return findings
+    POP3 session response sequence (normal):
+        responses[0] - server greeting banner (+OK)
+        responses[1] - reply to USER (+OK or -ERR)
+        responses[2] - reply to PASS (+OK or -ERR)   <- the one wanted
+
+    All three must be present before a success is declared, because two +OK
+    lines are ambiguous (banner + USER reply, PASS reply still to come). The
+    first -ERR anywhere is taken as the failure straight away. (It is not
+    strictly unambiguous: an -ERR to CAPA/STAT etc. also matches.)
+
+    Args:
+        p:       PendingFinding for a pop3_creds finding.
+        session: Session whose server_buf is searched.
+
+    Returns:
+        ({"status", "outcome"}, bytes to consume) or None if undecided yet.
+    """
+    responses = list(_POP3_RESPONSE_RE.finditer(bytes(session.server_buf)))
+    decisive = next((r for r in responses if r.group(1).upper() == b"-ERR"), None)
+    if decisive is None and len(responses) >= 3:
+        decisive = responses[2]
+    if decisive is None:
+        return None
+    code = decisive.group(1)
+    return ({"status": code.decode("utf-8", "ignore"), "outcome": _outcome(code)},
+            decisive.end())
