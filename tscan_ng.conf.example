@@ -1,0 +1,121 @@
+# tscan-ng example configuration -- contains NO secrets.
+# Deploy: copy to tscan_ng/config/tscan_ng.conf (gitignored), set iface and
+# discord_webhook, restrict permissions (see docs/REBUILD.md). Never commit the live file.
+
+# tscan-ng runtime configuration
+# Deploy to /opt/tscan/tscan_ng/config/tscan_ng.conf
+# Owned and readable by the tscan service account only.
+# After editing, restart the service:
+#   sudo systemctl restart tscan-pipeline
+
+[capture]
+# Network interface to capture from (SPAN/mirror destination)
+iface               = enx00242788e34c
+
+# Maximum bytes captured per packet
+snaplen             = 65535
+
+# Kernel socket receive buffer size in bytes, per pipeline process
+# (SO_RCVBUFFORCE). Code default is 256MB (268435456); see config.py.
+buffer_bytes        = 268435456
+
+# Legacy libpcap setting, parsed but unused by the current AF_PACKET
+# pipeline -- has no effect either way.
+no_immediate        = true
+
+# Advanced: explicit BPF filter override (tcpdump/pcap-filter syntax).
+# Unset (default) auto-builds a filter from every detector's configured
+# ports in [ports] below. Set to an empty string to disable filtering
+# entirely (capture everything -- useful for troubleshooting).
+# bpf_filter          = tcp and (port 21 or port 25)
+
+[dispatcher]
+# Number of pipeline processes, i.e. PACKET_FANOUT members (default: CPU count)
+workers             = 12
+
+# Legacy (old capture -> dispatcher design): unused by the current pipeline,
+# but still validated at startup (must be set and an absolute path).
+socket              = /run/tscan/tscan.sock
+
+# JSONL output file
+out                 = /var/log/tscan/results.jsonl
+
+[sessions]
+# Seconds of inactivity before a session is expired
+timeout_seconds     = 60
+
+# Maximum bytes buffered per direction per session (code default is 4MiB,
+# 4194304; this file sets 1MiB)
+max_buf_bytes       = 1048576
+
+# How often (seconds) each worker runs the session expiry sweep
+expiry_interval_sec = 30
+
+# Maximum age (seconds) of an unresolved pending finding (credentials seen,
+# no server response yet) before it is force-closed as no_response. Default: 45
+# pending_max_age_sec = 45
+
+# Maximum concurrent sessions tracked per worker before the oldest is
+# evicted to make room. Second, independent layer of memory protection
+# alongside max_buf_bytes -- see config.py's max_sessions docstring. Default: 2048
+# max_sessions        = 2048
+
+[ports]
+# Comma-separated port numbers for each protocol detector. An http = ...
+# line is also supported (defaults to 80, 8080, 8000, 8008, 8081, 8888, 3128).
+# A list that is empty or has no valid numbers falls back to the default;
+# it cannot be used to disable a detector.
+# Sessions whose src or dst port is not in the list are skipped by that detector.
+# Add non-standard ports here without touching source code.
+# All of these are TCP ports except snmp, which is UDP (see capture.py's
+# _build_port_filter -- snmp_ports feeds a separate BPF "udp and (...)"
+# clause rather than joining the TCP port union).
+http     = 80, 8080, 8000, 8008, 8081, 8888, 3128
+ftp      = 21, 2121
+smtp     = 25, 465, 587, 2525
+imap     = 143, 993, 1430
+pop3     = 110, 995, 1100
+telnet   = 23, 2323
+ldap     = 389, 3268
+redis    = 6379, 6380
+smb      = 445, 139
+snmp     = 161
+irc      = 6667, 6666, 6668, 6669
+postgres = 5432
+
+
+[discord]
+# -------------------------------------------------------------------
+# Discord Alerting
+# -------------------------------------------------------------------
+# Optional Discord webhook used for credential alerts (every finding except
+# outcomes "pending" and "failed") and operational alerts (worker exits).
+#
+# SECURITY NOTE:
+# This webhook grants message posting access to the configured
+# Discord channel. Treat it like a secret — do not commit it to git.
+#
+# Leave blank to disable Discord notifications.
+#
+# Example:
+# discord_webhook = https://discord.com/api/webhooks/...
+
+# Minimum seconds between operational alerts (pipeline_worker exiting
+# abnormally, e.g. capture interface down) -- NOT credential findings,
+# which use [dedup] finding_cooldown_sec below instead. Prevents a
+# sustained outage from sending one Discord message per RestartSec cycle
+# for as long as it lasts.
+notify_cooldown_sec = 300
+
+
+[dedup]
+# -------------------------------------------------------------------
+# Repeat-finding suppression
+# -------------------------------------------------------------------
+# Minimum seconds between findings for the same credentials submitted to
+# the same target service (same dst IP + port). Applies before EVERY
+# sink -- results.jsonl and Discord alike -- so a spammer/scanner
+# replaying the same user:pass at the same service only produces one log
+# line and one alert per window; a different target or different
+# credentials still gets logged/alerted immediately. 1800 = 30 minutes.
+finding_cooldown_sec = 1800

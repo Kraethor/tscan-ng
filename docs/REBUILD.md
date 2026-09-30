@@ -204,7 +204,8 @@ tails the results JSONL by path), so there is no longer a reason to make
 it world-readable. The file may still contain a Discord webhook URL, which
 should be treated as a secret.
 
-Edit `/opt/tscan/tscan_ng/config/tscan_ng.conf` and set at minimum:
+Create it from the tracked template (`cp /opt/tscan/tscan_ng.conf.example /opt/tscan/tscan_ng/config/tscan_ng.conf`,
+then fix ownership/mode as above) and set at minimum:
 ```ini
 [capture]
 iface = <your capture interface name>

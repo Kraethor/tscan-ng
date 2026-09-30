@@ -89,7 +89,8 @@ just gets silently dropped by the agent rather than answered. See
 ## Configuration
 
 Runtime settings live in `tscan_ng/config/tscan_ng.conf` (gitignored — it's
-host-specific and may hold a Discord webhook secret). The minimum required
+host-specific and may hold a Discord webhook secret); start from the tracked,
+secret-free template `tscan_ng.conf.example`. The minimum required
 setting is `capture.iface`. All other values have safe defaults; see the
 config file itself and `tscan_ng/config.py` for full documentation of
 every setting, including `[capture]` (interface, snaplen, buffer size),
