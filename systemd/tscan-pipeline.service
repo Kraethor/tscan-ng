@@ -29,6 +29,20 @@ SyslogIdentifier=tscan-pipeline
 # memory to dedupe through.
 RuntimeDirectory=tscan
 
+# /var/log/tscan holds results.jsonl, which contains captured credentials in
+# the clear (TODO.md #6). systemd creates the directory if it is missing,
+# makes it owned by tscan:tscan and resets it to 0750 on every start, so
+# only tscan and members of the tscan group (thoward, for watch.py and
+# dashboard.py) can reach the files. UMask=0027 makes files the service
+# creates 0640 (results.jsonl when it is first created, cooldown markers);
+# logrotate's copytruncate/compress copy that mode onto rotated files.
+# LogsDirectory also makes this path writable under ProtectSystem=strict
+# below, so a non-default [output] out outside /var/log/tscan needs a
+# ReadWritePaths= line here.
+LogsDirectory=tscan
+LogsDirectoryMode=0750
+UMask=0027
+
 # Replaces tscan-capture.service + tscan-dispatcher.service: each pipeline
 # process now does its own raw AF_PACKET capture directly (joined to a
 # shared PACKET_FANOUT_HASH group), so it needs the capture capabilities
@@ -39,6 +53,49 @@ RuntimeDirectory=tscan
 # worker flush its pending sessions before exiting.
 AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+
+# Sandboxing (TODO.md #7). This process parses hostile network traffic with
+# raw-socket capabilities, so limit what a compromise could do with it.
+#   - The whole filesystem is read-only except the LogsDirectory and
+#     RuntimeDirectory above. That matters because tscan owns /opt/tscan:
+#     without it a compromised worker could rewrite the code that runs at the
+#     next restart. Python silently skips writing __pycache__ there.
+#   - The deploy key in /opt/tscan/.ssh is hidden; the pipeline never needs it.
+#   - NoNewPrivileges does not affect the ambient capabilities above; they
+#     are granted before exec and still survive the spawn workers' exec.
+#   - AF_PACKET is capture; INET/INET6 are the Discord webhook and DNS;
+#     UNIX is multiprocessing, journald and systemd-resolved; NETLINK is
+#     getaddrinfo(). Anything else fails with EAFNOSUPPORT.
+#   - The syscall filter returns EPERM rather than killing the process, so a
+#     missed call shows up as an exception in the journal.
+# Deliberately NOT set: PrivateUsers (capabilities would then only apply
+# inside a user namespace, not to the host's network), PrivateNetwork /
+# IPAddressDeny (capture and Discord need the host network) and
+# MemoryDenyWriteExecute (can break ctypes, which compiles the BPF filter
+# through libpcap). Check with: systemd-analyze security tscan-pipeline
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+InaccessiblePaths=-/opt/tscan/.ssh
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_PACKET AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
 
 # Combined memory budget for capture+session-tracking+detection across all
 # pipeline processes. Previously split across tscan-capture.service's 256M

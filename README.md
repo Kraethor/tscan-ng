@@ -191,15 +191,19 @@ Three read-only tools:
 - `scripts/watch.py` — tails the results file and displays colour-coded
   credential findings in real time. Shows only new findings with
   `outcome == "success"` (other outcomes are in the JSONL and may still
-  alert on Discord, but are not displayed). Reads only the results JSONL; no
-  elevated privileges needed as long as that file is readable by your user.
+  alert on Discord, but are not displayed). Reads only the results JSONL, so
+  it needs membership in the `tscan` group (or `sudo`): `/var/log/tscan` is
+  `0750`. Control characters in captured fields (an attacker can put ANSI
+  escapes in a password or URL) are shown as `\xNN` escapes rather than
+  sent to your terminal.
 - `scripts/dashboard.py` — live full-screen status dashboard (service
   state, monitor/admin interface health, capture throughput, recent
   findings — again counting only `outcome == "success"` — and worker/load
   info), refreshing once a second. Interface names and the worker count are
   constants at the top of the script, not read from the config. Everything it
-  reads (systemd unit properties, `/sys/class/net` statistics, the results
-  JSONL) is world-readable too — no elevated privileges needed here either.
+  reads (systemd unit properties, `/sys/class/net` statistics) is
+  world-readable except the results JSONL, which needs `tscan` group
+  membership like `watch.py`; without it the findings panel stays at zero.
 - `scripts/status.sh` — a quick, non-interactive snapshot of the same
   service/interface/log state for a single glance or piping elsewhere.
   Unlike the two above, this one does run `systemctl`/`journalctl`/`ip` via
@@ -221,7 +225,7 @@ bash /opt/tscan/scripts/status.sh
 
 | Script | Run as | Purpose |
 |--------|--------|---------|
-| `scripts/watch.py [file]` | any user | Live coloured viewer of successful findings (see above) |
+| `scripts/watch.py [file]` | `tscan` group | Live coloured viewer of successful findings (see above) |
 | `scripts/dashboard.py` | any user | Full-screen curses status dashboard (see above) |
 | `scripts/status.sh` | any user with the NOPASSWD sudo grants | One-shot text status snapshot |
 | `scripts/pipeline_healthcheck.py` | `tscan`, via `tscan-pipeline-healthcheck.service` | Out-of-process up/down check; alerts on Discord on each transition |

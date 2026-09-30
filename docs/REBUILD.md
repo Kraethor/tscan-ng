@@ -317,18 +317,21 @@ sudo systemctl restart tscan-pipeline
 ---
 
 ## Logging Directory
+No manual step is needed: `tscan-pipeline.service` sets
+`LogsDirectory=tscan` with `LogsDirectoryMode=0750` and `UMask=0027`, so on
+every start systemd creates `/var/log/tscan` if missing, makes it
+`tscan:tscan` and resets it to `0750`, and files the service creates are
+`0640`. The JSONL holds captured credentials in the clear, so only `tscan`
+and members of the `tscan` group may read it; `watch.py` and `dashboard.py`
+therefore need `tscan` group membership (`thoward` has it) or `sudo`.
+
+Files that already exist keep their mode (`results.jsonl` is never
+recreated, because logrotate uses copytruncate), and logrotate copies that
+mode onto the rotated `.gz` files. When migrating a host whose files were
+created before this policy, fix them once:
 ```bash
-sudo mkdir -p /var/log/tscan
-sudo chown -R tscan:tscan /var/log/tscan
-sudo chmod 750 /var/log/tscan
+sudo chmod 640 /var/log/tscan/results.jsonl*
 ```
-`750` means only `tscan` (and its group) can read the findings log, in which
-case `watch.py` and `dashboard.py` need `sudo` (or membership in the `tscan`
-group). Their documented "runs as any user" behaviour requires the
-directory to be world-searchable and the file world-readable (the live host
-uses `775` on the directory; the service creates `results.jsonl` as `644`).
-Choose according to how sensitive the captured credentials are — the JSONL
-contains them in the clear.
 
 ---
 
@@ -358,6 +361,18 @@ rather than exhausting systemd's default start-limit and landing
 permanently in `failed`. `tscan-pipeline-healthcheck.timer` runs every 2
 minutes and is the independent, out-of-process check that this doesn't
 silently stop working.
+
+The pipeline unit is sandboxed (`ProtectSystem=strict`, `NoNewPrivileges`,
+`PrivateTmp`, `PrivateDevices`, `ProtectKernel*`, restricted address
+families and syscalls; the reasoning is in the unit's comments). Everything
+is read-only to it except `/var/log/tscan` and `/run/tscan`, and
+`/opt/tscan/.ssh` is hidden. Check the result with:
+```bash
+systemd-analyze security tscan-pipeline --no-pager | tail -1   # 1.8 OK as of 2026-09-30
+```
+If a change to the pipeline starts failing with `Read-only file system`,
+`EPERM` or `Address family not supported`, the sandbox is the first suspect
+(see "Pipeline fails with `Operation not permitted`" below).
 
 ---
 
@@ -453,9 +468,10 @@ Displays colour-coded findings in real time. It starts at the end of the
 file, so only new findings appear, and it shows only `outcome == "success"`
 (other outcomes are in the JSONL and may still alert on Discord). Read-only —
 logging and Discord alerting already happen inside `tscan-pipeline.service`
-regardless of whether this is running. Needs only read access to
-`/var/log/tscan/results.jsonl` (see "Logging Directory" above); no root
-required on the current host.
+regardless of whether this is running. Needs read access to
+`/var/log/tscan/results.jsonl`, i.e. `tscan` group membership (see "Logging
+Directory" above). Control characters in captured fields are shown as
+`\xNN` escapes so a hostile client cannot inject terminal escape sequences.
 
 ### Live Status Dashboard
 ```bash
@@ -519,7 +535,7 @@ service is still not active).
 | `/opt/tscan/tscan_ng/config/tscan_ng.conf` | `tscan`    | `640` | May hold a Discord webhook secret; only `tscan`-run processes need to read it |
 | `/opt/tscan/.ssh`                          | `tscan`    | `700` | Deploy key must not be readable by other users    |
 | `/opt/tscan/scripts/update.sh`             | `tscan`    | —     | Ops script ownership                              |
-| `/var/log/tscan`                           | `tscan`    | `750` | Log directory                                     |
+| `/var/log/tscan`                           | `tscan`    | `750` | Findings log holds cleartext credentials; mode enforced by `LogsDirectoryMode=` on every start; files `640` (`UMask=0027`) |
 | `/run/tscan`                               | `tscan`    | `755` | Created by `RuntimeDirectory=tscan`; ephemeral, torn down on service stop |
 | `/var/lib/tscan-healthcheck`               | `tscan`    | `755` | Created by `StateDirectory=`; persists across reboots |
 | Git operations                             | via `sudo -u tscan` | — | Deploy key and git identity live in the repo's own `.git/config`, not any user's home |
@@ -602,6 +618,11 @@ sudo systemctl restart tscan-pipeline
 ### Pipeline fails with `Operation not permitted`
 - The service unit is missing `AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN`
 - This is already set in the repo's `systemd/tscan-pipeline.service`
+- If the capabilities are present, the sandbox may be blocking a new code
+  path: `SystemCallFilter=` returns `EPERM`, `RestrictAddressFamilies=`
+  returns `EAFNOSUPPORT`, and `ProtectSystem=strict` makes writes outside
+  `/var/log/tscan` and `/run/tscan` fail with `Read-only file system`. Adjust
+  the unit rather than removing the sandbox, and say why in its comments.
 - Fix: reinstall the unit and restart:
 ```bash
 sudo cp /opt/tscan/systemd/tscan-pipeline.service /etc/systemd/system/

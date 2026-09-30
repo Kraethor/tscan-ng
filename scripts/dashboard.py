@@ -41,13 +41,13 @@ Environment / configuration:
     and a terminal that supports curses colour.
 
 Privileges:
-    None. Read-only and unprivileged: everything it reads is world-readable
+    No sudo, no root. Read-only. Everything it reads is world-readable
     (`systemctl show` properties, /sys/class/net/*/statistics and operstate,
-    `ip -4 -brief addr show`, /var/lib/tscan-healthcheck/down existence,
-    /var/log/tscan/results.jsonl). No sudo, no root. Caveat: reading
-    results.jsonl also needs search permission on /var/log/tscan and read
-    permission on the file; if either is denied the FINDINGS panel silently
-    stays at zero rather than erroring (see FindingsTailer).
+    `ip -4 -brief addr show`, /var/lib/tscan-healthcheck/down existence)
+    except /var/log/tscan/results.jsonl: that directory is 0750 tscan:tscan
+    (set by the unit's LogsDirectoryMode=, TODO.md #6), so the user needs
+    to be in the tscan group. If access is denied the FINDINGS panel
+    silently stays at zero rather than erroring (see FindingsTailer).
 
 Exit codes:
     0  normal quit (q/Esc/Ctrl-C).

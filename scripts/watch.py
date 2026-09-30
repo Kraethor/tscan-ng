@@ -40,11 +40,16 @@ Environment:
     check, no NO_COLOR support), so piping to a file embeds escape sequences.
 
 Privileges:
-    None beyond read access to the results file. On the current host
-    /var/log/tscan is mode 775 and results.jsonl is 644 (tscan-owned, created
-    by the service), so any user can run it. If /var/log/tscan is tightened
-    to 750 as docs/REBUILD.md's "Logging Directory" step suggests, only
-    tscan and its group can read it and this script then needs `sudo`.
+    Read access to the results file. /var/log/tscan is 0750 tscan:tscan and
+    the service creates files 0640 (LogsDirectoryMode= and UMask= in
+    tscan-pipeline.service, TODO.md #6), so the user must be in the tscan
+    group (thoward is) or use `sudo`.
+
+Untrusted input:
+    Nearly every field of a finding comes from captured traffic. Control and
+    format characters in string fields are printed as \\xNN / \\uNNNN escapes
+    (see _escape()), so a hostile client cannot send ANSI/OSC sequences to the
+    operator's terminal. The exact bytes remain in results.jsonl.
 
 Exit codes:
     0  Ctrl-C (prints "Monitor stopped." and exits cleanly).
@@ -74,6 +79,7 @@ import json
 import os
 import sys
 import time
+import unicodedata
 from datetime import datetime
 
 # ── ANSI helpers ──────────────────────────────────────────────────────────────
@@ -152,6 +158,51 @@ def _header(proto_color: str, label: str, ts_str: str) -> str:
     return proto_color + left_seg + mid_seg + fill + right_seg + RESET
 
 
+# ── Escaping of untrusted fields ──────────────────────────────────────────────
+
+# Unicode categories that can change what the terminal does rather than just
+# print a glyph: Cc = C0/C1 controls and DEL (ESC starts ANSI/OSC sequences,
+# 0x9B is a one-byte CSI), Cf = format characters (bidi overrides such as
+# U+202E, zero-width characters), Zl/Zp = line/paragraph separators.
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
+
+def _is_unsafe(ch: str) -> bool:
+    """Return True if *ch* must not be written raw to the terminal."""
+    return unicodedata.category(ch) in _UNSAFE_CATEGORIES
+
+
+def _escape(text: str) -> str:
+    """
+    Replace unsafe characters in *text* with visible \\xNN / \\uNNNN escapes.
+
+    Almost every field of a finding (creds, host, uri, user, ...) is copied
+    from network traffic, so it is attacker-controlled; JSON decoding turns
+    \\u001b in results.jsonl back into a real ESC. Printed raw, it could clear
+    the screen, rewrite earlier findings or set the window title.
+
+    Backslashes are left as they are so ordinary credentials display exactly;
+    a password that literally contains the text "\\x1b" therefore looks the
+    same as an escaped ESC. results.jsonl holds the exact value.
+    """
+    if not any(_is_unsafe(ch) for ch in text):
+        return text
+    return "".join(
+        (f"\\x{ord(ch):02x}" if ord(ch) < 0x100 else f"\\u{ord(ch):04x}")
+        if _is_unsafe(ch) else ch
+        for ch in text
+    )
+
+
+def _escape_finding(finding: dict) -> dict:
+    """Return a copy of *finding* with every top-level string value escaped.
+
+    Non-string values (ts, ports, status codes) are left alone. A nested
+    list/dict would be printed via its repr(), which already escapes control
+    characters."""
+    return {k: _escape(v) if isinstance(v, str) else v for k, v in finding.items()}
+
+
 # ── Finding formatter ─────────────────────────────────────────────────────────
 
 def _format(finding: dict) -> str | None:
@@ -172,6 +223,10 @@ def _format(finding: dict) -> str | None:
     The filter line is rendered in bold bright-yellow so it stands out as the
     "copy this" element.
 
+    Every string field is passed through _escape_finding() first, so control
+    characters from the captured traffic are shown as \\xNN escapes instead of
+    being interpreted by the terminal.
+
     Args:
         finding: Parsed JSONL finding dict from tscan-ng.
 
@@ -180,6 +235,7 @@ def _format(finding: dict) -> str | None:
     """
     if finding.get("outcome") != "success":
         return None
+    finding = _escape_finding(finding)
 
     ftype = finding.get("type", "unknown")
     proto_color, label = _PROTO.get(ftype, (BOLD + BRIGHT_WHITE, ftype.upper()))

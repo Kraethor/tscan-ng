@@ -14,11 +14,14 @@ from tscan_ng.config import Config
 
 
 def conf(extra: str = "") -> Config:
-    """Config from a temp file using iface 'lo' plus *extra* INI text."""
+    """Config from a temp file using iface 'lo', a temp output file and *extra* INI text."""
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "t.conf")
         with open(path, "w") as f:
-            f.write("[capture]\niface = lo\n" + extra)
+            # Output goes to the temp dir: validation requires a writable output
+            # directory, and /var/log/tscan is not writable by non-tscan users (#6).
+            f.write("[capture]\niface = lo\n"
+                    f"[dispatcher]\nout = {os.path.join(d, 'results.jsonl')}\n" + extra)
         return Config(path)
 
 
