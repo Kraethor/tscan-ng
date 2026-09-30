@@ -16,11 +16,12 @@ protocol's reply out of session.server_buf and returns
                          server_buf that belong to this reply, or
     None                 no reply yet.
 
-A resolver never modifies server_buf. try_resolve() deletes the consumed
-bytes and shifts the remaining pending findings' floors, so one reply can
-never answer two findings and floors stay valid. RESOLVERS maps every
-finding type to its module's resolve(), built from
-detectors.DETECTOR_MODULES and their FINDING_TYPES.
+A resolver never modifies server_buf. try_resolve() removes the consumed
+bytes with Session.consume_server(), which also shifts the remaining
+pending findings' floors, so one reply can never answer two findings and
+floors stay valid (TODO.md #13). RESOLVERS maps every finding type to its
+module's resolve(), built from detectors.DETECTOR_MODULES and their
+FINDING_TYPES.
 
 Replaces run.py's _try_resolve(), an 11-branch if/elif that duplicated each
 detector's own immediate-resolve parser.
@@ -54,8 +55,7 @@ def try_resolve(p, session, ts: float) -> dict | None:
     if result is None:
         return None
     fields, consumed = result
-    del session.server_buf[:consumed]
-    session.shift_pending_floors(consumed)
+    session.consume_server(consumed)
     clean = {k: v for k, v in p.finding.items() if not k.startswith("_")}
     return {**clean, "ts_start": p.ts_start, "ts_end": ts, **fields}
 

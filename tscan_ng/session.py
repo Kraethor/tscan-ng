@@ -191,7 +191,7 @@ class PendingFinding:
                             appear at or after this position — bytes before it
                             predate the credential submission and are safe to
                             trim. Shifted down whenever server_buf is trimmed
-                            or consumed (see Session.shift_pending_floors()) so
+                            or consumed (see Session.consume_server()) so
                             it stays valid as an index into the current buffer.
     """
     finding:          dict
@@ -323,16 +323,33 @@ class Session:
             finding=finding, ts_start=ts_start,
             server_buf_floor=len(self.server_buf) if floor is None else floor))
 
+    def consume_server(self, n: int):
+        """
+        Remove the first *n* bytes of server_buf and shift pending floors.
+
+        The only way bytes leave server_buf (TODO.md #13): used by
+        tscan_ng.resolve when a reply is matched and by SessionTable's size
+        trim. Doing the delete and the shift together means no caller can
+        forget the shift and leave other pending findings' floors pointing
+        past their data. tests/test_consume_server.py checks nothing else in
+        the package deletes from server_buf.
+
+        Args:
+            n: Number of bytes to remove; 0 or less does nothing.
+        """
+        if n <= 0:
+            return
+        del self.server_buf[:n]
+        self.shift_pending_floors(n)
+
     def shift_pending_floors(self, consumed: int):
         """
-        Shift all pending findings' server_buf_floor down after bytes are
-        removed from the front of server_buf.
+        Shift all pending findings' server_buf_floor down after *consumed*
+        bytes were removed from the front of server_buf.
 
-        Call this immediately after any `del session.server_buf[:N]` —
-        whether from trimming or from a resolved finding consuming its
-        matched response — so remaining pending findings' floors stay valid
-        indexes into the now-shorter buffer. Clamped to 0 rather than going
-        negative.
+        Called by consume_server(); use that rather than calling this
+        directly. Keeps the remaining pending findings' floors valid indexes
+        into the now-shorter buffer. Clamped to 0 rather than going negative.
 
         Args:
             consumed: Number of bytes removed from the front of server_buf.
@@ -607,8 +624,7 @@ class SessionTable:
                         "increase session_max_buf to reduce credential data loss",
                         session.session_id, len(session.server_buf))
                     session._server_trim_warned = True
-                del session.server_buf[:cut]
-                session.shift_pending_floors(cut)
+                session.consume_server(cut)
 
         return session, closed
 
