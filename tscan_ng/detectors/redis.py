@@ -49,6 +49,11 @@ Known limitations:
       an AUTH match, so an AUTH arriving after 4 KB of other commands on
       the same connection is not seen.
     - AUTH with an empty password is skipped. Redis over TLS is opaque.
+    - A client that sends another command and AUTH in one burst, before the
+      first reply arrives (e.g. SELECT then AUTH pipelined), leaves the floor
+      below that command's reply, so AUTH is judged by it. Common clients
+      send AUTH first and wait for its reply. (Same limit as POP3 USER/PASS
+      pipelining.)
 """
 
 import logging
@@ -243,23 +248,6 @@ def _find_auth_response(data: bytes, start: int = 0):
         i = eol + 2
 
     return None, None
-
-
-def _outcome(status: str) -> str:
-    """
-    Return the outcome string from a Redis server response.
-
-    This is a thin passthrough — _find_auth_response already returns a
-    canonical outcome string.  The function exists for symmetry with other
-    detector modules.
-
-    Args:
-        status: Outcome string from _find_auth_response ("success" or "failed").
-
-    Returns:
-        The same string, unchanged.
-    """
-    return status
 
 
 def detect_stream(session, ts: float) -> list:

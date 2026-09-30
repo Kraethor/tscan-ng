@@ -16,12 +16,13 @@ protocol's reply out of session.server_buf and returns
                          server_buf that belong to this reply, or
     None                 no reply yet.
 
-A resolver never modifies server_buf. try_resolve() removes the consumed
-bytes with Session.consume_server(), which also shifts the remaining
-pending findings' floors, so one reply can never answer two findings and
-floors stay valid (TODO.md #13). RESOLVERS maps every finding type to its
-module's resolve(), built from detectors.DETECTOR_MODULES and their
-FINDING_TYPES.
+A resolver never modifies server_buf (http_basic's does advance its own
+Session.http_rsp_gone counter for the lines about to be removed).
+try_resolve() removes the consumed bytes with Session.consume_server(),
+which also shifts the remaining pending findings' floors, so one reply can
+never answer two findings and floors stay valid (TODO.md #13). RESOLVERS
+maps every finding type to its module's resolve(), built from
+detectors.DETECTOR_MODULES and their FINDING_TYPES.
 
 Replaces run.py's _try_resolve(), an 11-branch if/elif that duplicated each
 detector's own immediate-resolve parser.
