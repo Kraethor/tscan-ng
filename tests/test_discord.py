@@ -40,5 +40,32 @@ class DiscordSuppressionTests(unittest.TestCase):
         self.assertEqual(alerts_for({"type": "http_basic", "outcome": "success"}, webhook=""), 0)
 
 
+def payload_for(finding: dict) -> str:
+    """Return the Discord message text _send_finding would post for *finding*."""
+    with mock.patch.object(discord, "_post") as post:
+        discord._send_finding("https://example.invalid/hook", finding)
+        return post.call_args[0][1]["content"]
+
+
+class DiscordContentTests(unittest.TestCase):
+    def test_snmp_community_string_is_not_sent(self):
+        text = payload_for({"type": "snmp_creds", "outcome": "success",
+                            "creds": "s3cr3t-community", "session_id": "abcd1234"})
+        self.assertNotIn("s3cr3t-community", text)
+        self.assertIn("snmp_creds", text)
+        self.assertIn("abcd1234", text)
+
+    def test_username_still_sent_but_not_password(self):
+        text = payload_for({"type": "ftp_creds", "outcome": "success",
+                            "creds": "alice:hunter2", "session_id": "s1"})
+        self.assertIn("alice", text)
+        self.assertNotIn("hunter2", text)
+
+    def test_password_only_creds_render_as_unknown(self):
+        text = payload_for({"type": "irc_creds", "outcome": "success",
+                            "creds": ":hunter2", "session_id": "s1"})
+        self.assertNotIn("hunter2", text)
+
+
 if __name__ == "__main__":
     unittest.main()

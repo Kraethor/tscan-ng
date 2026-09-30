@@ -83,9 +83,9 @@ Finding extras:
                  "GetBulkRequest".
     "creds"    — the community string itself. No colon-separated
                  username:password shape (SNMPv1/v2c has no username
-                 concept), so DiscordSink's creds.split(":", 1)[0] just
-                 yields the whole community string, which is exactly the
-                 credential worth showing.
+                 concept), so it is withheld from Discord alerts
+                 (DiscordSink._NO_USERNAME_TYPES) and appears only in the
+                 JSONL log.
     "status"   — the Response-PDU's error-status integer, stringified.
 
 Alerting: an "no_response" snmp_creds finding (an unanswered request, the

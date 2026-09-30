@@ -30,9 +30,9 @@ Design goals (carried over from scripts/discord_alert.py):
     daemon thread.
   - Never expose credentials to Discord: only `type`, `outcome`, the
     username portion of `creds` (text before the first ":"), and
-    `session_id` are sent for findings. Caveat: a creds value with no ":"
-    (e.g. an SNMP community string, whose `creds` is the community itself)
-    is sent whole, since it is entirely "the username portion".
+    `session_id` are sent for findings. Types whose `creds` has no username
+    part (SNMP: the value is the community string itself) send no creds at
+    all -- see _NO_USERNAME_TYPES.
   - Never raise back into the caller: exceptions from the network call are
     swallowed inside the background thread.
   - Never leak the webhook URL itself into logs: the URL's path *is* the
@@ -171,6 +171,12 @@ class DiscordSink:
         return t
 
 
+# Finding types whose "creds" value has no username component: the entire
+# value is the secret (an SNMP community string), so it is never sent to
+# Discord. The full value stays in the JSONL log.
+_NO_USERNAME_TYPES = frozenset({"snmp_creds"})
+
+
 def _send_finding(webhook_url: str, finding: dict) -> None:
     """
     Build and POST the Discord payload for one credential finding (any
@@ -188,7 +194,12 @@ def _send_finding(webhook_url: str, finding: dict) -> None:
                  as "unknown".
     """
     ftype = finding.get("type", "unknown")
-    username = finding.get("creds", "").split(":", 1)[0] or "unknown"
+    if ftype in _NO_USERNAME_TYPES:
+        # The whole creds value is the secret; there is no username part to
+        # show, and split(":") would return all of it.
+        username = "(none - secret withheld)"
+    else:
+        username = finding.get("creds", "").split(":", 1)[0] or "unknown"
     session_id = finding.get("session_id", "unknown")
     outcome = finding.get("outcome", "unknown")
 
