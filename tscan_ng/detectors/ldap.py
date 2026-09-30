@@ -36,11 +36,12 @@ bytes. Both directions are located by scanning for a SEQUENCE tag (0x30) and
 parsing outward from there rather than by tracking message boundaries.
 
 Response correlation:
-    Not keyed on messageID. The FIRST BindResponse found anywhere in
-    server_buf is taken as the answer to the BindRequest just captured. Binds
-    that this module skips (anonymous, unauthenticated, SASL) still produce a
-    BindResponse that is not consumed, so it can be paired with a later simple
-    bind. SASL multi-step binds answer with resultCode 14
+    Keyed on messageID (#14): the BindRequest's messageID is carried on the
+    pending finding as the private "_message_id", and resolve() takes the
+    BindResponse with the same messageID, skipping answers to other binds
+    (anonymous, unauthenticated or SASL binds this module ignores, or earlier
+    simple binds). Consuming up to the matched response also discards those
+    skipped answers. SASL multi-step binds answer with resultCode 14
     (saslBindInProgress), which maps to "server_error".
 
 Known limitations:
@@ -188,9 +189,12 @@ def _find_bind_request(data: bytes):
         data: Raw bytes from the client stream buffer (bounded to _MAX_SCAN).
 
     Returns:
-        (dn, password, end_offset) if a simple BindRequest is found, where
-        end_offset points past the last byte of the matched LDAPMessage.
-        Returns (None, None, None) if no valid simple BindRequest is present.
+        (dn, password, message_id, end_offset) if a simple BindRequest is
+        found, where message_id is the LDAPMessage messageID (used by
+        resolve() to pick the matching BindResponse) and end_offset points
+        past the last byte of the matched LDAPMessage.
+        Returns (None, None, None, None) if no valid simple BindRequest is
+        present.
     """
     i = 0
     while i < len(data):
@@ -205,10 +209,10 @@ def _find_bind_request(data: bytes):
             break
 
         # Parse the first field: messageID INTEGER. (Offsets from here on are
-        # relative to msg_value / req_value, not to the whole buffer; the
-        # value itself is not needed and is ignored.)
+        # relative to msg_value / req_value, not to the whole buffer.) The
+        # value is kept so resolve() can match the BindResponse by it.
         off = 0
-        id_tag, _id_val, off = _parse_ber_tlv(msg_value, off)
+        id_tag, id_val, off = _parse_ber_tlv(msg_value, off)
         if id_tag != _TAG_INTEGER:
             i += 1
             continue
@@ -250,14 +254,14 @@ def _find_bind_request(data: bytes):
             i = msg_end
             continue
 
-        return dn, password, msg_end
+        return dn, password, int.from_bytes(id_val or b"", "big"), msg_end
 
-    return None, None, None
+    return None, None, None, None
 
 
-def _find_bind_response(data: bytes):
+def _find_bind_response(data: bytes, message_id: int | None = None):
     """
-    Scan *data* for the first complete LDAPMessage containing a BindResponse.
+    Scan *data* for the BindResponse answering the bind with *message_id*.
 
     Expected structure (simplified from RFC 4511):
         SEQUENCE {                          -- LDAPMessage
@@ -269,12 +273,16 @@ def _find_bind_response(data: bytes):
             }
         }
 
-    The messageID is parsed but NOT compared with the request's; the first
-    BindResponse in the buffer wins. Called by resolve(). The result code is taken from the first byte of the
+    A BindResponse whose messageID differs from *message_id* (the answer to
+    some other bind on the connection) is skipped by its full length, the
+    way snmp._find_snmp_response() skips other request-ids (#14). None
+    matches the first BindResponse (for a finding recorded without an id).
+    Called by resolve(). The result code is taken from the first byte of the
     ENUMERATED value only.
 
     Args:
-        data: Raw bytes from the server stream buffer.
+        data:       Raw bytes from the server stream buffer.
+        message_id: messageID of the BindRequest being answered, or None.
 
     Returns:
         (result_code, end_offset) if a BindResponse is found, where result_code
@@ -294,7 +302,7 @@ def _find_bind_response(data: bytes):
             break
 
         off = 0
-        id_tag, _id_val, off = _parse_ber_tlv(msg_value, off)
+        id_tag, id_val, off = _parse_ber_tlv(msg_value, off)
         if id_tag != _TAG_INTEGER:
             i += 1
             continue
@@ -302,6 +310,11 @@ def _find_bind_response(data: bytes):
         rsp_tag, rsp_value, off = _parse_ber_tlv(msg_value, off)
         if rsp_tag != _TAG_BIND_RSP:
             # Not a BindResponse — skip to next message.
+            i = msg_end
+            continue
+
+        if message_id is not None and int.from_bytes(id_val or b"", "big") != message_id:
+            # The answer to a different bind — skip it whole.
             i = msg_end
             continue
 
@@ -375,7 +388,7 @@ def detect_stream(session, ts: float) -> list:
 
     # Bound the scan to avoid O(n) work on very deep buffers.
     client_bytes = bytes(session.client_buf[:_MAX_SCAN])
-    dn, password, req_end = _find_bind_request(client_bytes)
+    dn, password, message_id, req_end = _find_bind_request(client_bytes)
 
     if dn is None:
         return []
@@ -403,7 +416,9 @@ def detect_stream(session, ts: float) -> list:
                                    session.sport, session.dport),
     }
 
-    session.add_pending(base, ts_start=ts)
+    # "_message_id" is private (stripped before output, like snmp's
+    # "_request_id"); resolve() matches the BindResponse on it.
+    session.add_pending({**base, "_message_id": message_id}, ts_start=ts)
     del session.client_buf[:req_end]
     return []
 
@@ -412,8 +427,8 @@ def resolve(p, session):
     """
     Match a pending LDAP simple bind against its BindResponse (see tscan_ng.resolve).
 
-    Takes the first BindResponse in server_buf; the messageID is not compared
-    (see _find_bind_response).
+    Takes the BindResponse whose messageID equals the request's
+    ("_message_id"), skipping answers to other binds (#14).
 
     Args:
         p:       PendingFinding for a ldap_creds finding.
@@ -422,7 +437,8 @@ def resolve(p, session):
     Returns:
         ({"status", "outcome"}, bytes to consume) or None if no reply yet.
     """
-    result_code, rsp_end = _find_bind_response(bytes(session.server_buf))
+    result_code, rsp_end = _find_bind_response(bytes(session.server_buf),
+                                               p.finding.get("_message_id"))
     if result_code is None:
         return None
     return {"status": str(result_code), "outcome": _outcome(result_code)}, rsp_end

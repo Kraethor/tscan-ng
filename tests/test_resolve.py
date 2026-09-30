@@ -79,7 +79,15 @@ class RegistryTests(unittest.TestCase):
 
 
 class AlreadyBufferedTests(unittest.TestCase):
-    """Credentials and the server's answer both buffered before detection."""
+    """Credentials and the server's answer both buffered before detection.
+
+    Only for protocols that match the reply by tag, id, content or an
+    explicit prompt floor. The positional ones (ftp, pop3, smtp, redis) take
+    the first reply after the floor set when the credential was seen (#14),
+    so for them the reply must arrive after detection; see
+    ReplyAfterDetectionTests. In the pipeline it always does: each frame is
+    processed on arrival and the reply frame follows the command frame.
+    """
 
     def check(self, dport, client, server, outcome, **fields):
         s = make_session(dport)
@@ -95,30 +103,12 @@ class AlreadyBufferedTests(unittest.TestCase):
             self.assertEqual(done[0][key], value)
         return s, done[0]
 
-    def test_ftp(self):
-        s, f = self.check(21, b"USER bob\r\nPASS pw1\r\n",
-                          b"220 hi\r\n331 pw?\r\n230 in\r\n", "success",
-                          creds="bob:pw1", status="230")
-        self.assertNotIn(b"230", bytes(s.server_buf))  # the reply was consumed
-
-    def test_pop3(self):
-        self.check(110, b"USER bob\r\nPASS pw1\r\n",
-                   b"+OK ready\r\n+OK user\r\n+OK in\r\n", "success", creds="bob:pw1")
-
-    def test_smtp_plain(self):
-        blob = base64.b64encode(b"\x00bob\x00pw1")
-        self.check(25, b"AUTH PLAIN " + blob + b"\r\n", b"235 ok\r\n", "success",
-                   creds="bob:pw1")
-
     def test_imap_consumes_tagged_response(self):
         # The old immediate path left the tagged response in server_buf, so a
         # reused tag could match it again.
         s, _ = self.check(143, b"a1 LOGIN bob pw1\r\n", b"* OK hi\r\na1 OK done\r\n",
                           "success", creds="bob:pw1", status="OK")
         self.assertNotIn(b"a1 OK", bytes(s.server_buf))
-
-    def test_redis(self):
-        self.check(6379, b"*2\r\n$4\r\nAUTH\r\n$3\r\npw1\r\n", b"+OK\r\n", "success")
 
     def test_irc(self):
         self.check(6667, b"PRIVMSG NickServ :IDENTIFY pw1\r\n",
@@ -156,6 +146,43 @@ class AlreadyBufferedTests(unittest.TestCase):
                        + ber(tag, ber_int(req_id) + ber_int(err) + ber_int(0) + ber(0x30, b"")))
         self.check(161, pdu(0xA0, 4242, 0), pdu(0xA2, 4242, 0), "success",
                    creds="public", status="0")
+
+
+class ReplyAfterDetectionTests(unittest.TestCase):
+    """Positional protocols in pipeline order: command, detect, reply, resolve."""
+
+    def check(self, dport, client, server_before, reply, outcome, **fields):
+        s = make_session(dport)
+        s.server_buf.extend(server_before)
+        s.client_buf.extend(client)
+        immediate, done = process(s)
+        self.assertEqual((immediate, done), ([], []))
+        self.assertEqual(len(s.pending), 1)
+        s.server_buf.extend(reply)
+        done = resolve.resolve_pending(s, TS + 1)
+        self.assertEqual([f["outcome"] for f in done], [outcome])
+        self.assertEqual(s.pending, [])
+        for key, value in fields.items():
+            self.assertEqual(done[0][key], value)
+        return s
+
+    def test_ftp(self):
+        s = self.check(21, b"USER bob\r\nPASS pw1\r\n", b"220 hi\r\n331 pw?\r\n",
+                       b"230 in\r\n", "success", creds="bob:pw1", status="230")
+        self.assertNotIn(b"230", bytes(s.server_buf))  # the reply was consumed
+
+    def test_pop3(self):
+        self.check(110, b"USER bob\r\nPASS pw1\r\n", b"+OK ready\r\n+OK user\r\n",
+                   b"+OK in\r\n", "success", creds="bob:pw1")
+
+    def test_smtp_plain(self):
+        blob = base64.b64encode(b"\x00bob\x00pw1")
+        self.check(25, b"AUTH PLAIN " + blob + b"\r\n", b"220 mail\r\n", b"235 ok\r\n",
+                   "success", creds="bob:pw1")
+
+    def test_redis(self):
+        self.check(6379, b"*2\r\n$4\r\nAUTH\r\n$3\r\npw1\r\n", b"", b"+OK\r\n",
+                   "success")
 
 
 if __name__ == "__main__":

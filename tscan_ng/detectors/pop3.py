@@ -36,16 +36,11 @@ Credentials extracted:
     AUTH (SASL) exchanges are not handled; only the USER/PASS pair.
 
 Response correlation (positional, not tagged -- POP3 has no command tags):
-    Server lines beginning "+OK" or "-ERR" are collected in order from
-    server_buf. The greeting banner is assumed to be the first one, the USER
-    reply the second and the PASS reply the third. Rules applied by resolve()
-    below:
-      - any "-ERR" anywhere in server_buf resolves immediately as failed;
-      - otherwise, once three responses are present, the third decides;
-      - otherwise the finding is parked as pending.
-    This is an approximation: it assumes the capture saw the banner and that
-    no other +OK/-ERR replies (CAPA, STAT, a previous attempt's replies that
-    were not consumed, ...) precede the PASS reply.
+    The reply to PASS is the first "+OK"/"-ERR" line at or after the pending
+    finding's server_buf_floor -- the server bytes already seen when the PASS
+    command was recorded (see resolve() below). Earlier lines (banner, USER
+    reply, CAPA/STAT replies, a previous attempt's replies) sit below the
+    floor and are skipped (#14).
 
 Known limitations:
     - After a resolved attempt the consumed server_buf no longer contains a
@@ -194,29 +189,27 @@ def resolve(p, session):
     """
     Match a pending POP3 login against the server's replies (see tscan_ng.resolve).
 
-    POP3 session response sequence (normal):
-        responses[0] - server greeting banner (+OK)
-        responses[1] - reply to USER (+OK or -ERR)
-        responses[2] - reply to PASS (+OK or -ERR)   <- the one wanted
+    The reply to PASS is the first +OK/-ERR line at or after the finding's
+    server_buf_floor (the server bytes already seen when the PASS command was
+    recorded). The banner and the USER reply precede the floor and are
+    skipped, which is what fixes the old position-counting bugs (#14): an
+    -ERR to CAPA before login, or a successful retry after a failed attempt
+    whose banner was already consumed, no longer mis-resolve.
 
-    All three must be present before a success is declared, because two +OK
-    lines are ambiguous (banner + USER reply, PASS reply still to come). The
-    first -ERR anywhere is taken as the failure straight away. (It is not
-    strictly unambiguous: an -ERR to CAPA/STAT etc. also matches.)
+    (A client that pipelines USER and PASS in one segment before the banner
+    arrives can still misplace the floor; that edge case is unchanged.)
 
     Args:
         p:       PendingFinding for a pop3_creds finding.
         session: Session whose server_buf is searched.
 
     Returns:
-        ({"status", "outcome"}, bytes to consume) or None if undecided yet.
+        ({"status", "outcome"}, bytes to consume) or None if no reply yet.
     """
-    responses = list(_POP3_RESPONSE_RE.finditer(bytes(session.server_buf)))
-    decisive = next((r for r in responses if r.group(1).upper() == b"-ERR"), None)
-    if decisive is None and len(responses) >= 3:
-        decisive = responses[2]
-    if decisive is None:
-        return None
-    code = decisive.group(1)
-    return ({"status": code.decode("utf-8", "ignore"), "outcome": _outcome(code)},
-            decisive.end())
+    for response in _POP3_RESPONSE_RE.finditer(bytes(session.server_buf)):
+        if response.start() < p.server_buf_floor:
+            continue
+        code = response.group(1)
+        return ({"status": code.decode("utf-8", "ignore"), "outcome": _outcome(code)},
+                response.end())
+    return None

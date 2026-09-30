@@ -35,10 +35,11 @@ Finding extras:
 
 Response correlation:
     Positional, no request ids: the first server_buf line that is exactly
-    "+OK" (success) or begins with "-" (failure) is taken as the AUTH reply.
-    Other replies to earlier commands (e.g. "+OK" to CLIENT SETNAME/SELECT, or
-    "-NOAUTH ..." to a command sent before AUTH) will be attributed to the
-    AUTH if they precede it in server_buf. The matching lives in resolve().
+    "+OK" (success) or begins with "-" (failure) at or after the pending
+    finding's server_buf_floor is taken as the AUTH reply. Replies to
+    commands sent before AUTH ("+OK" to CLIENT SETNAME/SELECT, "-NOAUTH" to a
+    command that needed auth) sit below the floor and are skipped (#14). The
+    matching lives in resolve().
 
 Known limitations:
     - "HELLO <ver> AUTH <user> <pass>" (the RESP3 handshake, whose reply is
@@ -207,25 +208,28 @@ def _find_auth_command(data: bytes):
     return None, None, None
 
 
-def _find_auth_response(data: bytes):
+def _find_auth_response(data: bytes, start: int = 0):
     """
-    Scan *data* for the first Redis server response to an AUTH command.
+    Scan *data* from *start* for the first Redis server response to AUTH.
 
-    Looks for '+OK' (success) or any '-<error>' line (failure).  The first
-    response found is returned, as it corresponds to the earliest unconsumed
-    AUTH command after detect_stream has consumed matched client data.
-    Lines are split on CRLF only; other reply types ('+PONG', ':1', bulk
-    replies) are skipped line by line. Called by resolve().
+    Looks for '+OK' (success) or any '-<error>' line (failure). resolve()
+    passes the pending finding's server_buf_floor as *start*, so replies to
+    commands sent before AUTH (a '+OK' to CLIENT SETNAME/SELECT, or a
+    '-NOAUTH' to a command that needed auth) are skipped (#14). Lines are
+    split on CRLF only; other reply types ('+PONG', ':1', bulk replies) are
+    skipped line by line.
 
     Args:
-        data: Raw bytes from the server stream buffer.
+        data:  Raw bytes from the server stream buffer.
+        start: Offset to begin scanning (the pending finding's floor).
 
     Returns:
         (outcome, end_offset) where outcome is "success" or "failed", and
-        end_offset points past the end of the matched response line.
-        Returns (None, None) if no relevant response is present yet.
+        end_offset is an absolute offset into *data* past the end of the
+        matched response line. Returns (None, None) if no relevant response
+        is present yet.
     """
-    i = 0
+    i = start
     while i < len(data):
         eol = data.find(b'\r\n', i)
         if eol == -1:
@@ -334,7 +338,7 @@ def resolve(p, session):
     Returns:
         ({"status", "outcome"}, bytes to consume) or None if no reply yet.
     """
-    outcome, rsp_end = _find_auth_response(bytes(session.server_buf))
+    outcome, rsp_end = _find_auth_response(bytes(session.server_buf), p.server_buf_floor)
     if outcome is None:
         return None
     return {"status": outcome, "outcome": outcome}, rsp_end

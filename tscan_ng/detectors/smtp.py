@@ -326,8 +326,9 @@ def resolve(p, session):
     """
     Match a pending SMTP AUTH against the server's reply (see tscan_ng.resolve).
 
-    Takes the first 235/535/534/432 line in server_buf (see "Response
-    correlation" in the module docstring for why that can be a stale line).
+    Takes the first 235/535/534/432 line at or after the finding's
+    server_buf_floor (the server bytes already seen when the AUTH was
+    recorded), so a stale 535/534/432 from an earlier attempt is skipped (#14).
 
     Args:
         p:       PendingFinding for an smtp_creds finding.
@@ -336,9 +337,10 @@ def resolve(p, session):
     Returns:
         ({"status", "outcome"}, bytes to consume) or None if no reply yet.
     """
-    response = _SMTP_RESPONSE_RE.search(bytes(session.server_buf))
-    if not response:
-        return None
-    code = response.group(1)
-    return ({"status": code.decode("utf-8", "ignore"), "outcome": _outcome(code)},
-            response.end())
+    for response in _SMTP_RESPONSE_RE.finditer(bytes(session.server_buf)):
+        if response.start() < p.server_buf_floor:
+            continue
+        code = response.group(1)
+        return ({"status": code.decode("utf-8", "ignore"), "outcome": _outcome(code)},
+                response.end())
+    return None

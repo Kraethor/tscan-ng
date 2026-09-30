@@ -214,8 +214,9 @@ def resolve(p, session):
     """
     Match a pending FTP login against the server's reply (see tscan_ng.resolve).
 
-    Takes the first 230/530/421 line in server_buf (see "Response
-    correlation" in the module docstring for why that can be a stale line).
+    Takes the first 230/530/421 line at or after the finding's
+    server_buf_floor (the server bytes already seen when the PASS was
+    recorded), so a stale 530/421 from before this login is skipped (#14).
 
     Args:
         p:       PendingFinding for an ftp_creds / ftp_anonymous finding.
@@ -224,9 +225,10 @@ def resolve(p, session):
     Returns:
         ({"status", "outcome"}, bytes to consume) or None if no reply yet.
     """
-    response = _FTP_RESPONSE_RE.search(bytes(session.server_buf))
-    if not response:
-        return None
-    code = response.group(1)
-    return ({"status": code.decode("utf-8", "ignore"), "outcome": _outcome(code)},
-            response.end())
+    for response in _FTP_RESPONSE_RE.finditer(bytes(session.server_buf)):
+        if response.start() < p.server_buf_floor:
+            continue
+        code = response.group(1)
+        return ({"status": code.decode("utf-8", "ignore"), "outcome": _outcome(code)},
+                response.end())
+    return None
