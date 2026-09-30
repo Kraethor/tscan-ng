@@ -30,7 +30,7 @@ detection → output, with no coordination needed between workers.
 
 Every finding is written to a shared JSONL file (`tscan_ng/sinks/jsonl.py`,
 `flock()`-safe for concurrent writers) and, for any finding whose outcome
-isn't "pending" or "failed" (see `DiscordSink._SUPPRESSED_OUTCOMES`) and isn't
+isn't "failed" (see `DiscordSink._SUPPRESSED_OUTCOMES`) and isn't
 an SNMP `no_response` (unanswered internet scans of UDP 161; see
 `DiscordSink._SUPPRESSED_TYPE_OUTCOMES`), to a
 Discord webhook (`tscan_ng/sinks/discord.py`) — both fire from inside the
@@ -86,7 +86,7 @@ protocol-correlation details and the resulting alerting tradeoff (a
 captured hash is equally crackable whether or not that specific logon
 attempt succeeded, but a failed SMB logon still maps to outcome="failed"
 and so still won't alert, for consistency with every other detector —
-only outcome="failed" and outcome="pending" are suppressed; a non-success,
+only outcome="failed" is suppressed; a non-success,
 non-failed SMB status maps to "server_error", which does alert).
 
 SNMP is the other exception, in the other direction: it's the first and
@@ -164,7 +164,7 @@ Leave `discord_webhook` blank or omit the section to disable alerting
 entirely. Three kinds of alert share the one webhook:
 
 - **Credential finding** — fired for every finding whose outcome is not
-  `pending` or `failed` (so `success`, `redirect`, `server_error`,
+  `failed` (so `success`, `redirect`, `server_error`,
   `no_response` and `unknown` all alert — e.g. an HTTP Basic request answered
   with a 403 usually means the credentials were accepted), except an SNMP
   `no_response` (unanswered internet scans of UDP 161 — logged, not alerted).

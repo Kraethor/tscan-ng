@@ -25,8 +25,8 @@ raw socket recv() -> parse_basic() -> SessionTable -> detectors ->
 JSONLSink + DiscordSink. JSONLSink already flock()s file writes (see
 sinks/jsonl.py), so N processes safely share one output file with no
 further coordination. DiscordSink (see sinks/discord.py) fires a webhook
-alert on a background thread for every finding except outcomes "pending"
-and "failed", so alerting is always on -- it does not depend on anything
+alert on a background thread for every finding except outcome "failed"
+(and unanswered SNMP probes), so alerting is always on -- it does not depend on anything
 reading the JSONL log. Repeat findings are collapsed before either sink by
 _emit()'s cross-process cooldown.
 
@@ -339,7 +339,7 @@ def _emit(sink: JSONLSink, discord: DiscordSink, finding: dict,
     Both sinks share the same write(finding) interface, so every finding
     site in this module calls through here once instead of duplicating the
     two calls. DiscordSink.write() is itself a further no-op if alerting is
-    unconfigured or the finding's outcome is "pending"/"failed".
+    unconfigured or the finding's outcome is "failed".
 
     Marker files (one per distinct key, named by the SHA-256 of the key so
     arbitrary credential bytes never reach the filesystem as a name) live

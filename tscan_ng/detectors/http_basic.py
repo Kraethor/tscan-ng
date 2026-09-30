@@ -45,17 +45,12 @@ Finding outcomes:
                    means the credentials *were* accepted and something else
                    (ACL, WAF, path rule) blocked the request, so this is not
                    noise — see _outcome()'s docstring.
-    pending      - Not emitted by this module: a credential with no response
-                   yet is parked with session.add_pending() and reported
-                   later as success/failed/... or no_response. (The word
-                   only appears in DiscordSink's suppression list.)
     no_response  - Session expired before a server response was seen
                    (emitted by SessionTable.expire())
 
 Alerting note:
-    DiscordSink alerts on every outcome above except "pending" and
-    "failed" (see DiscordSink._SUPPRESSED_OUTCOMES) — "unknown" and
-    "no_response" both alert, since both represent credentials that were
+    DiscordSink alerts on every outcome above except "failed" (see
+    DiscordSink._SUPPRESSED_OUTCOMES) — "unknown" and "no_response" both alert, since both represent credentials that were
     actually submitted and are worth a human look, even though neither is
     a confirmed success.
 

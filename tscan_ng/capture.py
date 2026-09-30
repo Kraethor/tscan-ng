@@ -23,20 +23,19 @@ reference.
 
 This module loads no configuration itself; it only receives a Config
 (see tscan_ng/config.py) as an argument to _build_port_filter(). Importing
-it raises RuntimeError if libpcap cannot be found. Many of the bindings
-below (pcap_create, pcap_activate, pcap_next_ex, ...) are leftovers from
-the removed live-capture code and are no longer called by anything.
+it raises RuntimeError if libpcap cannot be found. Only the bindings
+pipeline.py uses are declared; the leftovers from the removed live-capture
+code (pcap_create, pcap_activate, pcap_next_ex, ...) were deleted in
+TODO.md #55.
 """
 
 import ctypes, ctypes.util
 from tscan_ng.config import Config
 
-# Size of the error buffer libpcap functions expect (PCAP_ERRBUF_SIZE in
-# pcap.h). Not referenced by the bindings still in use.
-PCAP_ERRBUF_SIZE = 256
-
 libpcap_path = ctypes.util.find_library('pcap')
 if not libpcap_path:
+    # Required, not optional: pipeline.py compiles its BPF filter with
+    # libpcap, so there is no capture without it.
     raise RuntimeError("libpcap not found")
 pcap = ctypes.CDLL(libpcap_path)
 
@@ -44,25 +43,14 @@ pcap = ctypes.CDLL(libpcap_path)
 pcap_t = ctypes.c_void_p
 
 
-class timeval(ctypes.Structure):
-    """Maps to C struct timeval (tv_sec, tv_usec)."""
-    _fields_ = [("tv_sec", ctypes.c_long), ("tv_usec", ctypes.c_long)]
-
-
-class pcap_pkthdr(ctypes.Structure):
-    """Maps to C struct pcap_pkthdr (timestamp, capture length, wire length)."""
-    _fields_ = [("ts", timeval), ("caplen", ctypes.c_uint32),
-                ("len", ctypes.c_uint32)]
-
-
 class bpf_program(ctypes.Structure):
     """
     Maps to C struct bpf_program (bf_len, bf_insns).
 
     bf_insns is populated by pcap_compile() with a pointer to a
-    libpcap-allocated instruction array. Never dereferenced from Python —
-    it is only ever passed by reference to pcap_setfilter()/pcap_freecode(),
-    so c_void_p is sufficient here.
+    libpcap-allocated instruction array. pipeline._attach_filter() casts it
+    to its own sock_filter array to build the SO_ATTACH_FILTER argument,
+    then releases it with pcap_freecode().
     """
     _fields_ = [("bf_len", ctypes.c_uint), ("bf_insns", ctypes.c_void_p)]
 
@@ -75,46 +63,8 @@ PCAP_NETMASK_UNKNOWN = 0xffffffff
 
 # libpcap function bindings (argtypes/restype declarations; without them
 # ctypes would default every argument and return to a C int, which truncates
-# 64-bit pointers).
-pcap_create = pcap.pcap_create
-pcap_create.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
-pcap_create.restype = pcap_t
-
-pcap_set_buffer_size = pcap.pcap_set_buffer_size
-pcap_set_buffer_size.argtypes = [pcap_t, ctypes.c_int]
-
-pcap_set_snaplen = pcap.pcap_set_snaplen
-pcap_set_snaplen.argtypes = [pcap_t, ctypes.c_int]
-
-pcap_set_promisc = pcap.pcap_set_promisc
-pcap_set_promisc.argtypes = [pcap_t, ctypes.c_int]
-
-pcap_set_timeout = pcap.pcap_set_timeout
-pcap_set_timeout.argtypes = [pcap_t, ctypes.c_int]
-
-pcap_activate = pcap.pcap_activate
-pcap_activate.argtypes = [pcap_t]
-pcap_activate.restype = ctypes.c_int
-
-pcap_datalink = pcap.pcap_datalink
-pcap_datalink.argtypes = [pcap_t]
-pcap_datalink.restype = ctypes.c_int
-
-pcap_geterr = pcap.pcap_geterr
-pcap_geterr.argtypes = [pcap_t]
-pcap_geterr.restype = ctypes.c_char_p
-
-# Proper argtypes using pcap_pkthdr avoids unsafe c_ubyte cast
-pcap_next_ex = pcap.pcap_next_ex
-pcap_next_ex.argtypes = [
-    pcap_t,
-    ctypes.POINTER(ctypes.POINTER(pcap_pkthdr)),
-    ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
-]
-pcap_next_ex.restype = ctypes.c_int
-
-pcap_close = pcap.pcap_close
-pcap_close.argtypes = [pcap_t]
+# 64-bit pointers). Only what pipeline._attach_filter() uses; the bindings
+# for the removed live-capture path went in TODO.md #55.
 
 # Returns a pcap_t that exists only to compile filters against a given
 # datalink type -- no interface, no capture, no CAP_NET_RAW required.
@@ -129,21 +79,15 @@ pcap_compile.argtypes = [pcap_t, ctypes.POINTER(bpf_program), ctypes.c_char_p,
                          ctypes.c_int, ctypes.c_uint32]
 pcap_compile.restype = ctypes.c_int
 
-pcap_setfilter = pcap.pcap_setfilter
-pcap_setfilter.argtypes = [pcap_t, ctypes.POINTER(bpf_program)]
-pcap_setfilter.restype = ctypes.c_int
-
 pcap_freecode = pcap.pcap_freecode
 pcap_freecode.argtypes = [ctypes.POINTER(bpf_program)]
 
-# pcap_set_immediate_mode only exists in libpcap >= 1.5; bind it to None on
-# older libraries so callers can feature-test instead of crashing at import.
-try:
-    pcap_set_immediate_mode = pcap.pcap_set_immediate_mode
-    pcap_set_immediate_mode.argtypes = [pcap_t, ctypes.c_int]
-except AttributeError:
-    pcap_set_immediate_mode = None
+pcap_geterr = pcap.pcap_geterr
+pcap_geterr.argtypes = [pcap_t]
+pcap_geterr.restype = ctypes.c_char_p
 
+pcap_close = pcap.pcap_close
+pcap_close.argtypes = [pcap_t]
 
 def _err(pc):
     """

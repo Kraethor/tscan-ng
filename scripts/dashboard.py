@@ -21,7 +21,7 @@ Purpose:
                       RESULTS_PATH since the last log rotation. NOTE: only
                       findings with outcome == "success" are counted here,
                       unlike Discord alerting (every outcome except
-                      "pending"/"failed") and the JSONL log itself (all
+                      "failed") and the JSONL log itself (all
                       outcomes), so this number is expected to be lower than
                       the line count of results.jsonl.
       * WORKERS     - the hard-coded WORKERS_CONFIGURED value (NOT read from

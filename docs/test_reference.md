@@ -22,7 +22,7 @@ Where to look for results:
 - `sudo tail -f /var/log/tscan/results.jsonl` — every finding of every
   outcome (`success`, `failed`, `redirect`, `server_error`, `no_response`,
   `unknown`).
-- Discord (if configured) — every outcome except `pending` and `failed`, and except `no_response` on `snmp_creds` findings (unanswered SNMP probes are logged but not alerted).
+- Discord (if configured) — every outcome except `failed`, and except `no_response` on `snmp_creds` findings (unanswered SNMP probes are logged but not alerted).
 
 **Repeat-finding cooldown:** a finding with the same destination IP, destination
 port, credentials and outcome as one already emitted within the last
@@ -284,8 +284,8 @@ a Kerberos-only environment won't produce this exchange.
 
 > **Note:** The finding is always written to `results.jsonl`. For the
 > bad-credentials case the final SESSION_SETUP status maps to
-> `outcome: "failed"`, which is not sent to Discord (only `failed` and
-> `pending` are suppressed), even though the captured hash is useful
+> `outcome: "failed"`, which is not sent to Discord (only `failed` is
+> suppressed), even though the captured hash is useful
 > regardless of outcome. An unrecognised non-success status maps to
 > `server_error`, which does alert. `watch.py` only displays `success`.
 

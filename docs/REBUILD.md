@@ -213,9 +213,9 @@ iface = <your capture interface name>
 
 All other values have safe defaults. See the config file itself and
 `tscan_ng/config.py` for documentation of every setting. Sections:
-`[capture]` (iface, snaplen, buffer_bytes, bpf_filter; `no_immediate` is a
-leftover from the libpcap capture path and is not read by any code now),
-`[dispatcher]` (workers, out; `socket` is vestigial — validated but unused),
+`[capture]` (iface, snaplen, buffer_bytes, bpf_filter), `[dispatcher]`
+(workers, out; the old `no_immediate` and `socket` keys were removed and are
+ignored if present),
 `[sessions]` (timeout_seconds, max_buf_bytes, expiry_interval_sec,
 pending_max_age_sec, max_sessions), `[ports]`, `[discord]`, `[dedup]` and
 `[logging]` (`level`: DEBUG/INFO/WARNING/ERROR/CRITICAL, default INFO; set DEBUG
@@ -273,7 +273,7 @@ depend on `watch.py` or any other viewer running. Three kinds of alert
 share the one webhook:
 
 - **Credential finding**, fired for every finding whose outcome is not
-  `pending` or `failed` (`success`, `redirect`, `server_error`,
+  `failed` (`success`, `redirect`, `server_error`,
   `no_response` and `unknown` all alert), except an SNMP `no_response`
   (unanswered internet scans of UDP 161 are logged but not alerted). Only
   `type`, the username portion of `creds`, the `outcome` and `session_id` are

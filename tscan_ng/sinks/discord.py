@@ -4,7 +4,7 @@ sinks/discord.py - Discord webhook alerting for tscan-ng.
 Two kinds of alert, both posted to the same webhook:
   - write(finding):  a credential-finding alert, fired for every finding
     whose outcome isn't in DiscordSink._SUPPRESSED_OUTCOMES (currently
-    "pending" and "failed" -- see that constant for why -- plus snmp_creds
+    only "failed" -- see that constant for why -- plus snmp_creds
     findings with outcome "no_response", see _SUPPRESSED_TYPE_OUTCOMES).
     Exposes the same
     write(finding) interface as JSONLSink so pipeline.py can treat both
@@ -94,16 +94,17 @@ class DiscordSink:
         self._cooldown_path = cooldown_path
         self._cooldown_sec = cooldown_sec
 
-    # Outcomes not worth an alert: "pending" never reaches write() (it isn't
-    # a terminal state — see pipeline.py's resolution loop), and "failed"
-    # means the server rejected the credentials (401), so there's nothing
+    # Outcomes not worth an alert: "failed" means the server rejected the credentials (401), so there's nothing
     # actionable to page on. Every other terminal outcome (success, redirect,
     # server_error, no_response, and the catch-all "unknown" for status
     # codes _outcome() doesn't otherwise classify -- e.g. 403, which for
     # Basic Auth usually means the credentials *were* accepted and something
     # else blocked the request) is alert-worthy: each represents credentials
     # that were actually submitted and merits a human look.
-    _SUPPRESSED_OUTCOMES = frozenset({"pending", "failed"})
+    _SUPPRESSED_OUTCOMES = frozenset({"failed"})
+    # ("pending" used to be listed too, but no finding is ever written with
+    # it: unresolved findings are parked on session.pending and leave as a
+    # terminal outcome or "no_response". Removed in TODO.md #55.)
 
     # (finding type, outcome) pairs suppressed on top of the outcome-only set
     # above. snmp_creds/no_response: SNMP is UDP and the detector fires on any

@@ -6,9 +6,9 @@ Purpose:
     Tails the JSONL results file written by tscan-pipeline.service
     (tscan_ng/sinks/jsonl.py) and prints a human-readable, coloured summary
     for each *new* finding whose outcome is "success". Findings with any
-    other outcome (failed, pending, no_response, server_error, redirect,
+    other outcome (failed, no_response, server_error, redirect,
     unknown, ...) are silently skipped by this viewer, even though they are
-    present in the JSONL file and (except "failed"/"pending") still trigger
+    present in the JSONL file and (except "failed") still trigger
     Discord alerts -- read the file directly (or with jq) to see them.
 
     The viewer starts at the *end* of the file, so it shows only findings

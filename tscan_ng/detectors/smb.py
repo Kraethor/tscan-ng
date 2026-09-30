@@ -69,8 +69,7 @@ Outcome semantics — a deliberate departure from every other detector here:
     Discord alert (DiscordSink._SUPPRESSED_OUTCOMES suppresses "failed"
     for every detector, not just SMB) even though the hash itself is just
     as usable. outcome="server_error" is a separate case and DOES alert,
-    same as every other detector — only "failed" and "pending" are
-    suppressed. Worth revisiting (e.g. alerting on any complete capture
+    same as every other detector — only "failed" is suppressed. Worth revisiting (e.g. alerting on any complete capture
     regardless of outcome) if failed-but-crackable captures turn out to be
     common enough to matter in practice.
 

@@ -14,10 +14,10 @@ an interface that does not exist, so a truly empty config file does not
 start. Values are re-read from the parsed file on every property access
 (nothing is cached); the file itself is parsed once, in Config.__init__.
 
-Legacy keys: dispatcher.socket and capture.no_immediate date from the
-retired capture.py -> run.py dispatcher design. pipeline.py does not use
-either; they are still parsed (and socket is still validated) but have no
-runtime effect.
+Retired keys: dispatcher.socket and capture.no_immediate (from the old
+capture.py -> run.py dispatcher design) were removed in TODO.md #55.
+Unknown keys are ignored, so an old config that still sets them loads
+unchanged.
 
 Config file format:
 
@@ -25,12 +25,10 @@ Config file format:
     iface               = eth1
     snaplen             = 65535
     buffer_bytes        = 268435456
-    no_immediate        = false   (legacy, unused)
     bpf_filter          = tcp and (port 21 or port 25)
 
     [dispatcher]
     workers             = 4
-    socket              = /run/tscan/tscan.sock   (legacy, unused)
     out                 = /var/log/tscan/results.jsonl
 
     [sessions]
@@ -65,7 +63,6 @@ Config file format:
 """
 
 import configparser
-import logging
 import os
 
 DEFAULT_CONFIG_PATH = "/opt/tscan/tscan_ng/config/tscan_ng.conf"
@@ -244,16 +241,6 @@ class Config:
         return self._getint("capture", "buffer_bytes", fallback=256 * 1024 * 1024)
 
     @property
-    def no_immediate(self) -> bool:
-        """
-        Legacy libpcap immediate-mode toggle; parsed but unused.
-
-        Only the retired libpcap capture path read this. pipeline.py's raw
-        AF_PACKET sockets have no equivalent, so it has no runtime effect.
-        """
-        return self._getbool("capture", "no_immediate", fallback=False)
-
-    @property
     def bpf_filter(self) -> str | None:
         """
         Explicit BPF filter override (attached to each pipeline's AF_PACKET
@@ -281,17 +268,6 @@ class Config:
         """
         return self._getint("dispatcher", "workers",
                             fallback=max(1, os.cpu_count() or 1))
-
-    @property
-    def socket_path(self) -> str:
-        """
-        Legacy Unix datagram socket path (capture -> dispatcher design).
-
-        Unused by pipeline.py, but still validated in _validate (must be
-        set and absolute).
-        """
-        return self._get("dispatcher", "socket",
-                         fallback="/run/tscan/tscan.sock")
 
     @property
     def out_path(self) -> str:
@@ -537,9 +513,6 @@ class Config:
           - capture.iface is set and exists in /sys/class/net
           - capture.snaplen and buffer_bytes are within sane bounds
           - dispatcher.workers is at least 1
-          - dispatcher.socket is an absolute path; its parent directory is
-            checked for world-writable permissions (warning only — the
-            directory may not exist yet when running outside systemd)
           - dispatcher.out directory exists and is writable by the current
             process (silent failures here are very hard to diagnose)
           - sessions values are positive
@@ -573,27 +546,6 @@ class Config:
 
         if self.workers < 1:
             errors.append(f"dispatcher.workers must be >= 1 (got {self.workers})")
-
-        if not self.socket_path:
-            errors.append("dispatcher.socket must be set")
-        elif not os.path.isabs(self.socket_path):
-            errors.append(
-                f"dispatcher.socket must be an absolute path "
-                f"(got {self.socket_path!r})"
-            )
-        else:
-            sock_dir = os.path.dirname(os.path.normpath(self.socket_path))
-            if os.path.isdir(sock_dir):
-                try:
-                    if os.stat(sock_dir).st_mode & 0o002:
-                        # World-writable socket directory allows any local user
-                        # to delete and replace the socket, intercepting packets.
-                        logging.warning(
-                            "config: dispatcher.socket parent directory '%s' is "
-                            "world-writable — any local user can replace the socket",
-                            sock_dir)
-                except OSError:
-                    pass
 
         if self.out_path:
             out_dir = os.path.dirname(self.out_path) or "."
@@ -666,7 +618,6 @@ class Config:
             f"Config(path={self._path!r}, "
             f"iface={self.iface!r}, "
             f"workers={self.workers}, "
-            f"socket={self.socket_path!r}, "
             f"session_timeout={self.session_timeout}s, "
             f"expiry_interval={self.expiry_interval}s, "
             f"ftp_ports={sorted(self.ftp_ports)}, "

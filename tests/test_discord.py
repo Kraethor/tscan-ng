@@ -32,9 +32,9 @@ class DiscordSuppressionTests(unittest.TestCase):
         self.assertEqual(alerts_for({"type": "http_basic", "outcome": "no_response"}), 1)
         self.assertEqual(alerts_for({"type": "ftp_creds", "outcome": "no_response"}), 1)
 
-    def test_failed_and_pending_still_suppressed(self):
+    def test_failed_still_suppressed(self):
         self.assertEqual(alerts_for({"type": "http_basic", "outcome": "failed"}), 0)
-        self.assertEqual(alerts_for({"type": "snmp_creds", "outcome": "pending"}), 0)
+        self.assertEqual(alerts_for({"type": "snmp_creds", "outcome": "failed"}), 0)
 
     def test_no_webhook_means_no_alert(self):
         self.assertEqual(alerts_for({"type": "http_basic", "outcome": "success"}, webhook=""), 0)

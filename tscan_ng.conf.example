@@ -19,10 +19,6 @@ snaplen             = 65535
 # (SO_RCVBUFFORCE). Code default is 256MB (268435456); see config.py.
 buffer_bytes        = 268435456
 
-# Legacy libpcap setting, parsed but unused by the current AF_PACKET
-# pipeline -- has no effect either way.
-no_immediate        = true
-
 # Advanced: explicit BPF filter override (tcpdump/pcap-filter syntax).
 # Unset (default) auto-builds a filter from every detector's configured
 # ports in [ports] below. Set to an empty string to disable filtering
@@ -32,10 +28,6 @@ no_immediate        = true
 [dispatcher]
 # Number of pipeline processes, i.e. PACKET_FANOUT members (default: CPU count)
 workers             = 12
-
-# Legacy (old capture -> dispatcher design): unused by the current pipeline,
-# but still validated at startup (must be set and an absolute path).
-socket              = /run/tscan/tscan.sock
 
 # JSONL output file
 out                 = /var/log/tscan/results.jsonl
