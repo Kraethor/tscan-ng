@@ -101,6 +101,7 @@ Working files behind this list (gitignored, may be stale): `.claude/findings_cor
 - Deployed systemd unit files matched the repo before the comment edits.
 
 ## Last Updated
+2026-09-30 (late): code review of #55/#56/#13/#14 found no bugs; follow-ups done (Redis pipelining limit documented, dead `redis._outcome` removed). 22 done, 38 open, #60 in progress; 102 tests. #14 live-verified on the cloud fake servers (ser8 now has its own `ssh cloud` key).
 2026-09-30 (night): #13 and #14 done (`Session.consume_server`; floor-based ftp/pop3/smtp/redis, LDAP by messageID); 102 tests.
 2026-09-30 (night): #56 done (single resolver registry in `resolve.py`, `run.py` removed); 89 tests.
 2026-09-30 (evening): #55 done (dead code/config removed, `decode_b64` padding fixed); 74 tests.
