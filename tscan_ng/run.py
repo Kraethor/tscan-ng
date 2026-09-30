@@ -38,7 +38,7 @@ from tscan_ng.detectors.smtp import (
     _SMTP_RESPONSE_RE, _outcome as _smtp_outcome
 )
 from tscan_ng.detectors.pop3 import _POP3_RESPONSE_RE, _outcome as _pop3_outcome
-from tscan_ng.detectors.telnet import _outcome as _telnet_outcome
+from tscan_ng.detectors.telnet import _find_outcome as _telnet_find_outcome
 from tscan_ng.detectors.ldap import _find_bind_response, _outcome as _ldap_outcome
 from tscan_ng.detectors.redis import _find_auth_response
 from tscan_ng.detectors.smb import _find_final_status, _outcome as _smb_outcome
@@ -56,8 +56,8 @@ def _try_resolve(p, session, ts: float) -> dict | None:
     dict if resolved, or None if still pending (also None for an unknown
     type). On a match, the matched response (and everything before it) is
     deleted from session.server_buf and pending floors are shifted, so the
-    same response cannot resolve a later pending finding. telnet_creds is
-    the exception: its matcher does not consume any buffer.
+    same response cannot resolve a later pending finding (telnet_creds now
+    does this too, searching only after the pending finding's floor).
 
     Private fields prefixed with '_' are stripped from the returned
     finding. Side effects: mutates session.server_buf and the pending
@@ -184,8 +184,14 @@ def _try_resolve(p, session, ts: float) -> dict | None:
             }
 
     elif finding_type == "telnet_creds":
-        result = _telnet_outcome(session.server_buf)
+        # Only text after the pending finding's floor (i.e. after the password
+        # was sent) can answer it; consume the match so a retry on the same
+        # connection is judged on its own response.
+        result, rsp_end = _telnet_find_outcome(bytes(session.server_buf),
+                                               p.server_buf_floor)
         if result:
+            del session.server_buf[:rsp_end]
+            session.shift_pending_floors(rsp_end)
             return {
                 **clean_finding,
                 "ts_start": p.ts_start,

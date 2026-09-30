@@ -40,18 +40,21 @@ Finding outcomes:
                    (emitted by SessionTable.expire())
 
 Outcome determination is heuristic (text matching, no protocol status code):
-    _outcome() searches the ENTIRE server_buf, failure patterns first, for
-    login-failure text or success text ("Last login", "Welcome to", or a line
-    ending in a $ # > prompt character). Consequences worth knowing:
-      - The search is not limited to output after the password was sent, and
-        server_buf is never consumed by this module or by run.py's
-        _try_resolve(). A "Welcome to ..." banner that precedes the login
-        prompt therefore yields "success" immediately, and once any failure
-        text has appeared it wins over every later success.
-      - Success/failure text that never appears leaves the finding pending
-        until it expires as no_response.
+    _find_outcome() searches the server stream for login-failure text or
+    success text ("Last login", "Welcome to", or a line ending in a $ # >
+    prompt character), failure patterns first, but ONLY in the bytes after the
+    password prompt that preceded the password being sent. So a "Welcome to
+    ..." banner before the login prompt no longer counts as success
+    (TODO.md #15). When a verdict is found, the server stream up to and
+    including the matched text is consumed (and pending floors shifted), so a
+    retry after a failed login is judged on its own response instead of the
+    previous attempt's leftover text. Text that never appears leaves the
+    finding pending until it expires as no_response.
 
 Known limitations:
+    - "Welcome to" after the password is still treated as success, which is a
+      weak signal (a server could print it on a failed login); "Login
+      incorrect"-style failure text is checked first and wins.
     - Only the first two non-empty client lines are used, and only the first
       4 KB of each buffer is examined for the prompts, so a long banner can
       hide the prompts. Backspace/DEL editing is not interpreted, so a mistyped
@@ -225,31 +228,37 @@ def _extract_lines(data: bytes) -> list:
 
 # ── Outcome determination ─────────────────────────────────────────────────────
 
-def _outcome(server_buf: bytearray) -> str | None:
+def _find_outcome(server_bytes: bytes, start: int = 0):
     """
-    Determine the authentication outcome from the server buffer.
+    Determine the authentication outcome from the server stream.
 
-    Searches for success or failure indicators in the server stream.
-    Returns None if neither has appeared yet — the caller should
-    register a pending finding and retry on the next packet.
+    Searches server_bytes[start:] for failure indicators first, then success
+    indicators. Returns (None, None) if neither has appeared yet -- the
+    caller should register a pending finding and retry on the next packet.
 
-    The whole of server_buf is searched (unbounded, on every call), failure
-    patterns first; nothing is consumed, so old prompts/banners/failures
-    persist and influence later results on the same connection. Also imported
-    by run.py's _try_resolve() for pending findings.
+    Only the bytes from *start* onward are considered, so text the server
+    sent before the password was typed (banners, earlier attempts) cannot
+    decide the outcome. Also imported by run.py's _try_resolve() for pending
+    findings (which passes the finding's server_buf_floor as *start*).
 
     Args:
-        server_buf: Reassembled server-direction byte stream.
+        server_bytes: Reassembled server-direction byte stream.
+        start:        Offset in server_bytes where the response to the
+                      password can begin (the end of the password prompt, or
+                      the pending finding's floor).
 
     Returns:
-        'success', 'failed', or None if outcome is not yet determinable.
+        (outcome, end_offset): outcome is 'success' or 'failed' and
+        end_offset is the absolute offset just past the matched text, for the
+        caller to consume; (None, None) if not yet determinable.
     """
-    server_bytes = bytes(server_buf)
-    if _FAIL_RE.search(server_bytes):
-        return "failed"
-    if _SUCCESS_RE.search(server_bytes):
-        return "success"
-    return None
+    m = _FAIL_RE.search(server_bytes, start)
+    if m:
+        return "failed", m.end()
+    m = _SUCCESS_RE.search(server_bytes, start)
+    if m:
+        return "success", m.end()
+    return None, None
 
 
 # ── Stream detector ───────────────────────────────────────────────────────────
@@ -294,7 +303,8 @@ def detect_stream(session, ts: float) -> list:
     # interactive authentication exchange rather than some other Telnet use.
     if not _LOGIN_PROMPT_RE.search(server_bytes):
         return []
-    if not _PASS_PROMPT_RE.search(server_bytes):
+    pass_prompt = _PASS_PROMPT_RE.search(server_bytes)
+    if not pass_prompt:
         return []
 
     # Strip IAC negotiation sequences and split into typed lines.
@@ -334,8 +344,13 @@ def detect_stream(session, ts: float) -> list:
     }
 
     # "status" mirrors "outcome" (there is no protocol status code to report).
-    result = _outcome(session.server_buf)
+    # Only text after the password prompt can answer the password; the matched
+    # response is consumed so the next attempt starts clean.
+    full_server = bytes(session.server_buf)
+    result, rsp_end = _find_outcome(full_server, pass_prompt.end())
     if result:
+        del session.server_buf[:rsp_end]
+        session.shift_pending_floors(rsp_end)
         return [{
             **base,
             "ts_start": ts,
