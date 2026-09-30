@@ -41,7 +41,7 @@ is identical whether it ends up driving a pcap handle or a Linux socket
 filter, so no translation is needed.
 """
 
-import ctypes, hashlib, logging, multiprocessing as mp, os, socket, struct, sys, time
+import ctypes, hashlib, logging, multiprocessing as mp, multiprocessing.connection, os, signal, socket, struct, sys, threading, time
 from tscan_ng.config import Config
 from tscan_ng.parsing.net import parse_basic, DLT_EN10MB
 from tscan_ng.detectors import STREAM_DETECTORS, configure_all
@@ -215,6 +215,57 @@ def _open_fanout_socket(iface: str, group_id: int, bpf_filter: str,
     return sock
 
 
+# Set by _main_shutdown_handler() when the parent process receives SIGTERM, so
+# main() can tell a requested shutdown (workers exiting cleanly after their own
+# SIGTERM) from workers dying unexpectedly.
+_shutdown_requested = False
+
+
+def _install_worker_stop_handlers() -> threading.Event:
+    """
+    Make SIGTERM and SIGINT stop a worker's capture loop instead of killing it.
+
+    `systemctl stop` sends SIGTERM to every process in the unit's cgroup.
+    Python's default action terminates the process on the spot, so pending
+    sessions were never flushed and any credential seen but not yet answered
+    was lost (TODO.md #21). The handler only sets an Event; the capture loop
+    checks it at the top of every iteration (recv() has a 1 s timeout, so the
+    loop notices within about a second), then falls through to its normal
+    flush_all() and socket close.
+
+    Returns:
+        The Event that is set once a stop signal has been received.
+    """
+    stop = threading.Event()
+
+    def _handler(signum, frame):
+        stop.set()
+
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)
+    return stop
+
+
+def _main_shutdown_handler(signum, frame):
+    """Parent-process SIGTERM handler: note the request and unwind like SIGINT."""
+    global _shutdown_requested
+    _shutdown_requested = True
+    raise KeyboardInterrupt
+
+
+def _install_main_shutdown_handler() -> None:
+    """
+    Treat SIGTERM in the parent process as a requested shutdown.
+
+    Without this, SIGTERM killed main() outright and its cleanup (terminating
+    and joining the workers) never ran. It is converted into the same
+    KeyboardInterrupt path main() already uses for SIGINT, and
+    _shutdown_requested is set so that workers which exit cleanly in response
+    to the same SIGTERM are not mistaken for unexpected worker deaths.
+    """
+    signal.signal(signal.SIGTERM, _main_shutdown_handler)
+
+
 def _stamp_resolved(finding: dict, ts: float) -> dict:
     """
     Return a copy of a pending-then-resolved *finding* with a "ts" field.
@@ -385,7 +436,8 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
     Error handling: an exception while processing one packet is logged and
     counted; 100 consecutive failures (fail_count resets on any success) or
     an OSError from recv() ends the loop as an abnormal exit. On any loop
-    exit the session table is flushed (pending findings closed as
+    exit (including a SIGTERM/SIGINT stop request) the session table is
+    flushed (pending findings closed as
     no_response), the socket closed, and -- if abnormal -- a Discord
     notify() is sent and the process exits with status 1. Startup errors
     (socket/filter setup) propagate as exceptions and also kill the
@@ -440,17 +492,19 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
     # processed packet; hitting 100 (a persistent bug rather than one bad
     # packet) makes this process give up instead of spinning on logged errors.
     fail_count = 0
+    stop = _install_worker_stop_handlers()
     # Set to a reason string on abnormal exit, checked after the loop to
     # decide this process's exit code. A worker dying is only ever supposed
     # to happen via KeyboardInterrupt/terminate() from main() during
-    # shutdown; recv() failing or fail_count maxing out means something is
+    # shutdown (SIGTERM/SIGINT, see _install_worker_stop_handlers); recv()
+    # failing or fail_count maxing out means something is
     # actually wrong (e.g. the capture interface went down), and previously
     # this function just returned normally in both cases -- indistinguishable
     # from a clean shutdown to both systemd (exit code 0 never triggers
     # Restart=on-failure) and to anyone watching (nothing said why). Both
     # get an exit code and a Discord alert now.
     abnormal_exit = None
-    while True:
+    while not stop.is_set():
         try:
             frame = sock.recv(cfg.snaplen)
         except socket.timeout:
@@ -506,6 +560,8 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
                 abnormal_exit = f"pipeline[{pipeline_id}] pid={os.getpid()} exiting: {fail_count} consecutive processing failures"
                 break
 
+    if stop.is_set():
+        logging.info("pipeline[%d]: stop signal received, flushing sessions", pipeline_id)
     for f in sessions.flush_all():
         _emit(sink, discord, {"ts": f["ts_start"], **f}, finding_cooldown_sec)
     sock.close()
@@ -537,16 +593,20 @@ def main(cfg: Config):
     (short of this process itself being interrupted for shutdown) means
     something is wrong.
 
-    Shutdown handling mirrors run.py's old dispatcher(): best-effort on
-    KeyboardInterrupt (SIGINT), which is the same level of graceful
-    shutdown the old code had. Neither the old nor the new code installs a
-    custom SIGTERM handler, so `systemctl stop` still terminates pipeline
-    processes without flushing pending sessions -- a pre-existing gap, not
-    introduced by this change.
+    Shutdown handling: SIGTERM (what `systemctl stop` sends, to the parent
+    and to every worker at once) is converted here into the same
+    KeyboardInterrupt path as SIGINT (_install_main_shutdown_handler), and
+    each worker installs its own handlers (_install_worker_stop_handlers) so
+    it leaves its capture loop and flushes its pending sessions before
+    exiting. A worker that exits cleanly because of the same SIGTERM is not
+    treated as an unexpected death (_shutdown_requested). Findings still
+    pending at that moment are written as no_response instead of being lost
+    (TODO.md #21).
 
     Blocks until a worker dies or the process is interrupted. Workers are
-    non-daemon processes, so they are explicitly terminated (then killed
-    after a 5s join) on the way out.
+    non-daemon processes, so they are explicitly terminated (SIGTERM, which
+    they handle gracefully; then killed if still alive after a 5s join) on
+    the way out.
 
     Args:
         cfg: Loaded Config object.
@@ -562,8 +622,19 @@ def main(cfg: Config):
             for 10 days after the capture interface dropped (see
             pipeline_worker's docstring for the worker side of this fix).
     """
-    procs = [mp.Process(target=pipeline_worker, args=(i, cfg, _FANOUT_GROUP_ID),
-                        daemon=False)
+    _install_main_shutdown_handler()
+    # Explicit "spawn" start method (TODO.md #27 and #21). Python 3.14 defaults
+    # to "forkserver", whose helper processes deadlock the parent's exit once
+    # the parent handles SIGTERM itself: the parent's atexit handler waits for
+    # the resource tracker, the tracker waits for the forkserver to drop its
+    # pipe, and the forkserver waits for the parent to die. The result was
+    # `systemctl stop` hanging for the full 90 s TimeoutStopSec. "spawn" has
+    # no such helper and still starts every worker as a fresh interpreter
+    # (ambient capabilities survive the exec), and pinning it means a Python
+    # upgrade cannot silently change how workers are started.
+    ctx = mp.get_context("spawn")
+    procs = [ctx.Process(target=pipeline_worker, args=(i, cfg, _FANOUT_GROUP_ID),
+                         daemon=False)
              for i in range(cfg.workers)]
     for p in procs:
         p.start()
@@ -583,9 +654,12 @@ def main(cfg: Config):
     except KeyboardInterrupt:
         pass  # Requested shutdown -- not a failure.
     else:
-        dead = {p.pid: p.exitcode for p in procs if not p.is_alive()}
-        logging.error("pipeline: worker(s) exited unexpectedly, tearing down: %s", dead)
-        failed = True
+        if _shutdown_requested:
+            pass  # SIGTERM reached a worker before it reached us: still a requested shutdown.
+        else:
+            dead = {p.pid: p.exitcode for p in procs if not p.is_alive()}
+            logging.error("pipeline: worker(s) exited unexpectedly, tearing down: %s", dead)
+            failed = True
 
     for p in procs:
         if p.is_alive():

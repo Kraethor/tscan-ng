@@ -32,9 +32,11 @@ RuntimeDirectory=tscan
 # Replaces tscan-capture.service + tscan-dispatcher.service: each pipeline
 # process now does its own raw AF_PACKET capture directly (joined to a
 # shared PACKET_FANOUT_HASH group), so it needs the capture capabilities
-# tscan-capture.service used to hold. multiprocessing's fork() preserves
-# ambient capabilities across fork, so every pipeline_worker child inherits
-# these from this parent process without re-exec.
+# tscan-capture.service used to hold. Workers are started with multiprocessing's
+# "spawn" method (a fresh interpreter per worker, pinned in pipeline.main());
+# ambient capabilities survive that exec, so every pipeline_worker child
+# inherits these from this parent process. SIGTERM (systemctl stop) makes each
+# worker flush its pending sessions before exiting.
 AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
 

@@ -47,13 +47,14 @@ echo
 bold "== worker processes =="
 # Counts processes whose full command line matches "tscan_ng.pipeline", i.e.
 # the main process (`python -m tscan_ng.pipeline`). The worker children
-# are started by multiprocessing's forkserver (the default start method on
-# Python 3.14) and their command lines contain "tscan_ng/pipeline.py", which
-# this pattern does not match, so on a healthy host this prints 1 -- use
+# are started with multiprocessing's "spawn" start method (pinned in
+# pipeline.main()); their command lines are `python -c 'from
+# multiprocessing.spawn import spawn_main ...'`, which this pattern does not
+# match, so on a healthy host this prints 1 -- use
 # `systemctl status` (CGroup section) to see the workers.
 count=$(pgrep -cf "tscan_ng\.pipeline")
 if [[ "${count}" -gt 0 ]]; then
-  echo "  ${count} process(es) (1 main + forkserver workers)"
+  echo "  ${count} process(es) (1 main; spawned workers are not counted here)"
 else
   echo "  none running"
 fi

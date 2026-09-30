@@ -182,9 +182,9 @@ sudo -u tscan -H bash -lc '
 The `tscan-pipeline.service` unit grants `CAP_NET_RAW` and `CAP_NET_ADMIN`
 directly to the pipeline process via systemd's `AmbientCapabilities`
 directive. No `setcap` on the Python binary is required — the unit file
-handles this automatically, and Python's `multiprocessing.Process` (used to
-fork off each worker) preserves ambient capabilities across `fork()`, so
-every worker inherits them without a re-exec step.
+handles this automatically, and ambient capabilities survive the `exec` of
+each worker that `multiprocessing` starts (the pipeline pins the `spawn` start
+method), so every worker inherits them without a `setcap` step.
 
 ---
 
