@@ -30,7 +30,7 @@ the response arrives, or closed out as no_response elsewhere (session
 expiry or shutdown, in session.py).
 """
 
-from tscan_ng.detectors.http_basic import _parse_response, _outcome
+from tscan_ng.detectors.http_basic import take_response, _outcome
 from tscan_ng.detectors.imap import (_IMAP_RESPONSE_BYTES_RE,
                                       _outcome as _imap_outcome)
 from tscan_ng.detectors.ftp import _FTP_RESPONSE_RE, _outcome as _ftp_outcome
@@ -79,14 +79,13 @@ def _try_resolve(p, session, ts: float) -> dict | None:
     clean_finding = {k: v for k, v in p.finding.items() if not k.startswith("_")}
 
     if finding_type == "http_basic":
-        response = _parse_response(session.server_buf)
+        # take_response() finds THIS request's response by position (skipping
+        # responses to earlier credential-less requests), consumes it and
+        # shifts the pending floors, so subsequent requests on the same
+        # keep-alive connection are not correlated with this stale response.
+        response = take_response(session, p.finding.get("_rsp_index"))
         if response:
-            status, status_text, rsp_end = response
-            # Consume the response line from server_buf so that subsequent
-            # requests on the same keep-alive connection are not incorrectly
-            # correlated with this (now-stale) response.
-            del session.server_buf[:rsp_end]
-            session.shift_pending_floors(rsp_end)
+            status, status_text, _rsp_end = response
             return {
                 **clean_finding,
                 "ts":          p.ts_start,

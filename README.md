@@ -11,6 +11,8 @@ monitoring via SPAN / mirror ports.
 - `systemd/` – systemd service/timer units, plus a template
   systemd-networkd config for the capture NIC
 - `logrotate/` – log rotation configuration
+- `tests/` – unit tests for detector parsing (stdlib `unittest`, no network
+  or root needed); see "Deployment" below for how to run them
 - `docs/` – rebuild and deployment documentation (`REBUILD.md`) and the
   manual protocol test reference (`test_reference.md`)
 - `requirements.txt` – pinned Python dependencies (`dpkt`, `orjson`,
@@ -247,7 +249,14 @@ whichever admin is running the script). Never run bare `git` as another
 user in `/opt/tscan`: it leaves root/operator-owned objects that the
 `tscan` user can no longer write.
 
-Testing detectors by hand: see `docs/test_reference.md`.
+Unit tests (detector parsing regressions; no network, root or config file
+needed) run from `/opt/tscan` with the project venv, which has `dpkt`:
+
+    PYTHONDONTWRITEBYTECODE=1 venv/bin/python -m unittest discover -s tests -t . -v
+
+`PYTHONDONTWRITEBYTECODE=1` is there because `__pycache__` is not writable
+for the operator account. Testing detectors against live traffic by hand:
+see `docs/test_reference.md`.
 
 ## Notes
 - Designed to run with a non-login service account

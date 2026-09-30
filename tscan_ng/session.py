@@ -220,6 +220,15 @@ class Session:
         created_at: Monotonic timestamp when the session was first created.
         ts_first:   Unix timestamp of the first packet seen (for findings).
         last_ts:    Unix timestamp of the most recently processed packet.
+        http_req_seen: Number of HTTP request header blocks consumed from
+                    client_buf on this flow (credentialed or not). Used by
+                    detectors/http_basic.py to pair each credentialed request
+                    with the response at the same position in the (in-order)
+                    response stream. Unused by other detectors.
+        http_rsp_gone: Number of HTTP status lines already removed from the
+                    front of server_buf (matched or skipped). Together with
+                    http_req_seen this converts "the Nth response on the
+                    flow" into an index into the current server_buf.
         _client_trim_warned: True after the first client_buf trim warning has
                     been emitted. Suppresses repeat warnings on the same session
                     to prevent log flooding on high-volume persistent connections.
@@ -237,6 +246,8 @@ class Session:
     created_at: float     = field(default_factory=time.monotonic)
     ts_first:   float     = 0.0
     last_ts:    float     = 0.0
+    http_req_seen: int = 0
+    http_rsp_gone: int = 0
     # Trim warning suppression: warn once per direction, then go silent.
     # Prevents log flooding on high-volume persistent connections.
     _client_trim_warned: bool = field(default=False, repr=False)

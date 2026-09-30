@@ -82,13 +82,19 @@ Request framing:
     the start of the next request's header block.
 
 Response correlation:
-    The first "HTTP/x.y NNN" status line in server_buf is used, regardless of
-    which request it answers, and it is consumed only when matched to a
-    credential. Responses to requests without Authorization (for example the
-    401 challenge a browser receives before it retries with credentials) are
-    never consumed, so a following credentialed request can be paired with
-    that stale response. Keep-alive/pipelined ordering is otherwise assumed.
-    run.py's _try_resolve() repeats the same matching for pending findings.
+    HTTP/1.x returns exactly one response per request, in request order. Every
+    request header block consumed from client_buf is numbered per session
+    (Session.http_req_seen), whether or not it carries credentials; a
+    credentialed request remembers its number as "_rsp_index". Its response is
+    the status line at that position in the server stream: take_response()
+    finds the Nth "HTTP/x.y NNN" line (allowing for lines already removed,
+    Session.http_rsp_gone), deletes everything up to and including it, and
+    shifts the pending floors. So the 401 a browser receives for its first,
+    credential-less request is skipped and the retry is paired with its own
+    response (TODO.md #2). run.py's _try_resolve() calls the same function
+    for pending findings. Assumes in-order responses (no reordering from
+    multi-connection races; SPAN loss shifts the pairing) and no interim
+    "100 Continue" responses.
 
 Known limitations:
     - HTTPS is opaque; only cleartext HTTP on the configured ports is seen.
@@ -175,26 +181,52 @@ def _outcome(status: int) -> str:
     return "unknown"
 
 
-def _parse_response(server_buf: bytearray) -> tuple[int, str, int] | None:
+def take_response(session, rsp_index: int | None = None):
     """
-    Extract the HTTP status code, text, and byte end-offset from the server buffer.
+    Extract, and consume, the HTTP response for one request on *session*.
 
-    Finds the FIRST status line anywhere in the buffer (not necessarily the
-    one answering the current request). Also imported by run.py's
-    _try_resolve(). Copies the whole buffer to bytes on each call.
+    Responses arrive in request order, so request number k (see
+    Session.http_req_seen) is answered by the k-th status line of the server
+    stream. Status lines already deleted from the front of server_buf are
+    tracked in Session.http_rsp_gone, so the wanted line is at position
+    (rsp_index - http_rsp_gone) among the status lines still buffered. Also
+    imported by run.py's _try_resolve(). Copies the whole buffer to bytes on
+    each call.
+
+    On success everything up to and including the matched status line is
+    deleted from server_buf (which discards earlier, unrelated responses such
+    as a 401 challenge), http_rsp_gone is advanced past every status line
+    removed, and the pending findings' floors are shifted.
 
     Args:
-        server_buf: Reassembled server-direction byte stream.
+        session:   Session whose server_buf is searched.
+        rsp_index: Zero-based number of the request whose response is wanted.
+                   None means "the first buffered status line" (legacy
+                   behaviour, for findings without a recorded index).
 
     Returns:
-        Tuple of (status_code, status_text, end_offset) if a response line is
-        found, otherwise None.  end_offset is the byte position immediately after
-        the matched response line, suitable for use with del server_buf[:end_offset].
+        Tuple of (status_code, status_text, end_offset) if that response is
+        buffered, otherwise None. end_offset is the number of bytes just
+        removed from the front of server_buf. None is also returned if the
+        response was already consumed or trimmed away (index below
+        http_rsp_gone); the finding then stays pending until it expires.
     """
-    m = _RESPONSE_LINE_RE.search(bytes(server_buf))
-    if not m:
+    want = 0 if rsp_index is None else rsp_index - session.http_rsp_gone
+    if want < 0:
         return None
-    return int(m.group(1)), m.group(2).decode("utf-8", "ignore").strip(), m.end()
+    match = None
+    for n, m in enumerate(_RESPONSE_LINE_RE.finditer(bytes(session.server_buf))):
+        if n == want:
+            match = m
+            break
+    if match is None:
+        return None
+    end = match.end()
+    del session.server_buf[:end]
+    session.shift_pending_floors(end)
+    session.http_rsp_gone += want + 1
+    return (int(match.group(1)),
+            match.group(2).decode("utf-8", "ignore").strip(), end)
 
 
 def detect_stream(session, ts: float) -> list[dict]:
@@ -209,8 +241,9 @@ def detect_stream(session, ts: float) -> list[dict]:
     registers a pending finding on the session for later resolution when the
     response arrives. Consumes every scanned request header block (with or
     without credentials) from the client buffer to avoid re-detection on
-    subsequent packets. A matched response line is consumed from server_buf
-    without calling session.shift_pending_floors() (run.py's path does).
+    subsequent packets. Each request block is numbered (Session.http_req_seen)
+    and paired with its own response by take_response(), which also consumes
+    the response and shifts the pending floors.
 
     The scan is bounded to _MAX_HEADER_SCAN bytes per call to prevent O(n²)
     CPU usage at high line speed. The client buffer is consumed before
@@ -248,6 +281,12 @@ def detect_stream(session, ts: float) -> list[dict]:
         consume = header_end + 4
         headers = bytes(session.client_buf[:consume])
         del session.client_buf[:consume]
+
+        # Number this request (every request gets a slot, credentialed or
+        # not) so its response can be found by position later -- the response
+        # to an earlier credential-less request must not be paired with it.
+        rsp_index = session.http_req_seen
+        session.http_req_seen += 1
 
         # Skip requests with no Basic Auth credentials (their header block has
         # already been consumed above).
@@ -302,10 +341,10 @@ def detect_stream(session, ts: float) -> list[dict]:
                                        session.sport, session.dport),
         }
 
-        # Attempt to correlate with a server response already in server_buf
-        response = _parse_response(session.server_buf)
+        # Attempt to correlate with this request's response if already buffered
+        response = take_response(session, rsp_index)
         if response:
-            status, status_text, rsp_end = response
+            status, status_text, _rsp_end = response
             findings.append({
                 **base,
                 "ts_start":    ts,
@@ -314,9 +353,10 @@ def detect_stream(session, ts: float) -> list[dict]:
                 "status_text": status_text,
                 "outcome":     _outcome(status),
             })
-            del session.server_buf[:rsp_end]
         else:
-            # No server response yet — register as pending for later resolution
-            session.add_pending(base, ts_start=ts)
+            # No server response yet -- register as pending for later
+            # resolution. "_rsp_index" (underscore fields are stripped by
+            # run.py's _try_resolve) tells it which response to wait for.
+            session.add_pending({**base, "_rsp_index": rsp_index}, ts_start=ts)
 
     return findings

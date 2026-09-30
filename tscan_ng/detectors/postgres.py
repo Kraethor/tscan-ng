@@ -69,15 +69,11 @@ Byte1(type) Int32(length) payload, where length counts itself and the payload
 but not the type byte. Multi-byte integers are big-endian.
 
 Known limitations:
-    - The message search is a raw single-byte find, and _find_password_message
-      gives up (returns "not found, wait for more data") the first time the
-      candidate byte 'p' is followed by a length field that exceeds the data
-      buffered so far. Because the StartupMessage stays at the front of
-      client_buf and its text (for example "postgres", "application_name",
-      "psql") contains the letter 'p', the real PasswordMessage can be missed
-      whenever a 'p' inside the startup parameters is followed by four bytes
-      that decode to a length larger than the whole buffer. See that
-      function's docstring.
+    - The message search is still a raw single-byte find for 'p', but it now
+      starts after the StartupMessage (and any SSLRequest before it) instead of
+      at the front of client_buf, and a candidate 'p' whose length field is
+      larger than the whole scan window is skipped rather than treated as a
+      truncated message (TODO.md #1). See _find_password_message.
     - Only the first 4 KB of each buffer is examined for the pre-conditions;
       client_buf is consumed only when a PasswordMessage is matched.
     - TLS negotiated via SSLRequest ('S' response) makes the rest opaque.
@@ -185,17 +181,52 @@ def _find_cleartext_auth_request(data: bytes):
         i = idx + 1
 
 
+def _startup_end(data: bytes) -> int:
+    """
+    Return the offset just past the StartupMessage in *data*, or 0 if none.
+
+    client_buf begins with the StartupMessage (optionally preceded by an
+    8-byte SSLRequest), and that message is plain text that routinely
+    contains the letter 'p' ("postgres", "application_name", "psql"). The
+    PasswordMessage search must start after it, or those bytes are mistaken
+    for a message type. Located the same way _find_startup_user does: search
+    for the protocol-version bytes and back up 4 bytes for the length field.
+
+    If the StartupMessage is present but not fully buffered yet, returns
+    len(data) so the caller waits for more data rather than searching inside
+    it.
+
+    Args:
+        data: Raw bytes from the client stream buffer.
+
+    Returns:
+        Offset of the first byte after the StartupMessage, len(data) if it is
+        incomplete, or 0 if no StartupMessage is present in *data*.
+    """
+    idx = data.find(struct.pack(">I", _PG_PROTOCOL_VERSION_3_0))
+    if idx < 4:
+        return 0
+    msg_start = idx - 4
+    length = struct.unpack_from(">I", data, msg_start)[0]
+    if length < 8:
+        return 0
+    msg_end = msg_start + length
+    return msg_end if msg_end <= len(data) else len(data)
+
+
 def _find_password_message(data: bytes):
     """
     Scan *data* (client_buf) for a PasswordMessage: 'p' Int32(length)
     password NUL.
 
-    Weakness: the first 'p' byte whose following Int32 is a plausible-looking
-    length (>= 5) but larger than the bytes buffered is treated as a
-    truncated message and the scan STOPS, returning (None, None); later 'p'
-    candidates are not tried. Since client_buf begins with the StartupMessage
-    (which usually contains 'p' characters), this can mask the real
-    PasswordMessage. A length below 5 just skips that candidate.
+    The search starts after the StartupMessage (see _startup_end) so its
+    parameter text cannot be mistaken for a message. Within the remaining
+    bytes, a candidate 'p' is handled by its length field:
+        - below 5: cannot hold even an empty null-terminated string; skip.
+        - larger than _MAX_SCAN_CLIENT: could never fit in the scan window,
+          so it is not a real PasswordMessage; skip and keep looking.
+        - larger than the bytes buffered so far (but within the window): a
+          genuine message that is still arriving; stop and wait for more data.
 
     Args:
         data: Raw bytes from the client stream buffer (bounded to
@@ -205,7 +236,7 @@ def _find_password_message(data: bytes):
         (password, end_offset) if found, where end_offset points past the
         matched message. Returns (None, None) if not present.
     """
-    i = 0
+    i = _startup_end(data)
     while True:
         idx = data.find(b"p", i)
         if idx == -1:
@@ -213,8 +244,7 @@ def _find_password_message(data: bytes):
         if idx + 5 > len(data):
             return None, None
         length = struct.unpack_from(">I", data, idx + 1)[0]
-        if length < 5:
-            # Too short to hold even an empty null-terminated string.
+        if length < 5 or length > _MAX_SCAN_CLIENT:
             i = idx + 1
             continue
         msg_end = idx + 1 + length

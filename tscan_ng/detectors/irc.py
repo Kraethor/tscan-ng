@@ -58,13 +58,6 @@ Finding extras:
               that has an optional username component (e.g. redis_creds).
 
 Known limitations:
-    - _IDENTIFY_RE's optional-first-argument group is separated from the
-      password by a whitespace run (\\s+), which also matches a line break.
-      When the IDENTIFY line is followed in the SAME scan window by another
-      line (for example a JOIN sent in the same segment), the single-argument
-      form is misparsed: the real password is reported as the "nick" and the first word of the next
-      line as the password. When the IDENTIFY line is the last thing in the
-      buffer (typical when it is sent alone) it parses correctly.
     - Only the first 4 KB of client_buf and 8 KB of server_buf are scanned for
       the immediate-resolve path; client_buf is consumed only on a match.
     - IRC over TLS (6697) is opaque and not in the default port set.
@@ -97,10 +90,12 @@ _MAX_SCAN_SERVER = 8192
 #            is greedy, so with two words it captures the first as the nick.
 #   Group 2: the password (the last word before the end of line, or the only
 #            word). [^\r\n]* then swallows any further trailing text.
-# Requires CRLF. NB: the \s+ after group 1 can also match that CRLF, see the
-# module docstring's known limitations.
+# Requires CRLF. Separators are spaces/tabs only ([ \t]+, never \s+): \s also
+# matches CR/LF, which let the optional nick group run across the line break
+# and swallow the first word of the NEXT line as the password when commands
+# were pipelined in one segment (TODO.md #3).
 _IDENTIFY_RE = re.compile(
-    rb"^PRIVMSG\s+NickServ(?:@\S+)?\s+:(?:IDENTIFY|ID)\s+(?:(\S+)\s+)?(\S+)[^\r\n]*\r\n",
+    rb"^PRIVMSG[ \t]+NickServ(?:@\S+)?[ \t]+:(?:IDENTIFY|ID)[ \t]+(?:(\S+)[ \t]+)?(\S+)[^\r\n]*\r\n",
     re.IGNORECASE | re.MULTILINE,
 )
 
