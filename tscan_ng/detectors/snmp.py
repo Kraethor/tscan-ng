@@ -88,6 +88,10 @@ Finding extras:
                  credential worth showing.
     "status"   — the Response-PDU's error-status integer, stringified.
 
+Alerting: an "no_response" snmp_creds finding (an unanswered request, the
+normal result of internet scans of UDP 161) is written to the JSONL log but
+does not alert on Discord -- see DiscordSink._SUPPRESSED_TYPE_OUTCOMES.
+
 Direction: the flow's client/server orientation comes from session.py's
 _normalize_direction(), which only knows the TCP server ports in
 session._SERVER_PORTS (161 is not among them). A flow is therefore oriented

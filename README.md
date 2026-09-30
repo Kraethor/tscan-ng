@@ -30,7 +30,9 @@ detection → output, with no coordination needed between workers.
 
 Every finding is written to a shared JSONL file (`tscan_ng/sinks/jsonl.py`,
 `flock()`-safe for concurrent writers) and, for any finding whose outcome
-isn't "pending" or "failed" (see `DiscordSink._SUPPRESSED_OUTCOMES`), to a
+isn't "pending" or "failed" (see `DiscordSink._SUPPRESSED_OUTCOMES`) and isn't
+an SNMP `no_response` (unanswered internet scans of UDP 161; see
+`DiscordSink._SUPPRESSED_TYPE_OUTCOMES`), to a
 Discord webhook (`tscan_ng/sinks/discord.py`) — both fire from inside the
 pipeline itself, independent of whether anything is watching. Both sinks sit
 behind one shared repeat-finding cooldown in `pipeline.py`'s `_emit()`: a
@@ -86,7 +88,9 @@ only UDP-carried detector (every other protocol here is TCP), and its
 "outcome" is a much weaker signal than elsewhere — SNMPv1/v2c has no
 "authentication failed" response; a rejected community string typically
 just gets silently dropped by the agent rather than answered. See
-`tscan_ng/detectors/snmp.py` for the full reasoning.
+`tscan_ng/detectors/snmp.py` for the full reasoning. Because unanswered
+scans of UDP 161 are constant, an SNMP `no_response` is logged to the JSONL
+file but does not alert on Discord; an SNMP finding that got a reply still does.
 
 ## Configuration
 

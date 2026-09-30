@@ -4,7 +4,9 @@ sinks/discord.py - Discord webhook alerting for tscan-ng.
 Two kinds of alert, both posted to the same webhook:
   - write(finding):  a credential-finding alert, fired for every finding
     whose outcome isn't in DiscordSink._SUPPRESSED_OUTCOMES (currently
-    "pending" and "failed" -- see that constant for why). Exposes the same
+    "pending" and "failed" -- see that constant for why -- plus snmp_creds
+    findings with outcome "no_response", see _SUPPRESSED_TYPE_OUTCOMES).
+    Exposes the same
     write(finding) interface as JSONLSink so pipeline.py can treat both
     sinks identically at each finding call site.
   - notify(message): a free-text operational alert -- pipeline_worker exit,
@@ -103,15 +105,36 @@ class DiscordSink:
     # that were actually submitted and merits a human look.
     _SUPPRESSED_OUTCOMES = frozenset({"pending", "failed"})
 
+    # (finding type, outcome) pairs suppressed on top of the outcome-only set
+    # above. snmp_creds/no_response: SNMP is UDP and the detector fires on any
+    # request datagram, so internet-wide scans of UDP 161 -- answered by
+    # nothing, on a host that runs no SNMP agent -- resolve as no_response
+    # constantly. That is unsolicited-probe noise, not credentials worth a
+    # human look, unlike a no_response on a TCP protocol where the reply may
+    # simply not have been captured. The finding is still written to the
+    # JSONL log; only the Discord alert is skipped.
+    _SUPPRESSED_TYPE_OUTCOMES = frozenset({("snmp_creds", "no_response")})
+
+    @classmethod
+    def _is_suppressed(cls, finding: dict) -> bool:
+        """
+        True if *finding* should not be alerted on: its outcome is in
+        _SUPPRESSED_OUTCOMES, or its (type, outcome) pair is in
+        _SUPPRESSED_TYPE_OUTCOMES.
+        """
+        outcome = finding.get("outcome")
+        return (outcome in cls._SUPPRESSED_OUTCOMES
+                or (finding.get("type"), outcome) in cls._SUPPRESSED_TYPE_OUTCOMES)
+
     def write(self, finding: dict) -> None:
         """
         Fire a background alert for *finding* if alerting is enabled and the
-        finding's outcome isn't in _SUPPRESSED_OUTCOMES. No-op otherwise.
+        finding is not suppressed (see _is_suppressed). No-op otherwise.
 
         Args:
             finding: Finding dict, same shape as written to the JSONL sink.
         """
-        if not self._webhook_url or finding.get("outcome") in self._SUPPRESSED_OUTCOMES:
+        if not self._webhook_url or self._is_suppressed(finding):
             return
         threading.Thread(
             target=_send_finding, args=(self._webhook_url, finding), daemon=True

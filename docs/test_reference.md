@@ -22,7 +22,7 @@ Where to look for results:
 - `sudo tail -f /var/log/tscan/results.jsonl` — every finding of every
   outcome (`success`, `failed`, `redirect`, `server_error`, `no_response`,
   `unknown`).
-- Discord (if configured) — every outcome except `pending` and `failed`.
+- Discord (if configured) — every outcome except `pending` and `failed`, and except `no_response` on `snmp_creds` findings (unanswered SNMP probes are logged but not alerted).
 
 **Repeat-finding cooldown:** a finding with the same destination IP, destination
 port and credentials as one already emitted within the last
