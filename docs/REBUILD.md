@@ -217,7 +217,10 @@ All other values have safe defaults. See the config file itself and
 leftover from the libpcap capture path and is not read by any code now),
 `[dispatcher]` (workers, out; `socket` is vestigial — validated but unused),
 `[sessions]` (timeout_seconds, max_buf_bytes, expiry_interval_sec,
-pending_max_age_sec, max_sessions), `[ports]`, `[discord]` and `[dedup]`.
+pending_max_age_sec, max_sessions), `[ports]`, `[discord]`, `[dedup]` and
+`[logging]` (`level`: DEBUG/INFO/WARNING/ERROR/CRITICAL, default INFO; set DEBUG
+only while troubleshooting, as it logs a traceback per malformed packet and
+turns on library debug output).
 The file is read once at startup; `config.py` validates it and the service
 exits with a "Invalid configuration" error (status 1) on bad values,
 including a `capture.iface` that is not present in `/sys/class/net`.

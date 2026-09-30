@@ -397,12 +397,13 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
         group_id:    Shared PACKET_FANOUT group ID -- every pipeline
                      process must be called with the same value.
     """
-    # Root logger at DEBUG in every worker, in contrast to main()'s INFO in
-    # the parent. This also enables DEBUG output from libraries and from
-    # parsing.net (one traceback per malformed packet); sinks/discord.py
-    # separately pins urllib3 to WARNING so the webhook URL is not logged.
+    # Root logger level in every worker comes from [logging] level (default
+    # INFO). DEBUG also enables DEBUG output from libraries and from
+    # parsing.net (one traceback per malformed packet), so it is opt-in;
+    # sinks/discord.py pins urllib3 to WARNING regardless, so the webhook URL
+    # is never logged.
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=cfg.log_level,
         format=f"%(levelname)s pipeline[{pipeline_id}] pid=%(process)d %(message)s")
     configure_all(cfg)
 

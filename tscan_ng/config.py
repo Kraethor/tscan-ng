@@ -494,6 +494,21 @@ class Config:
         return float(self._getint("dedup", "finding_cooldown_sec", fallback=1800))
 
     @property
+    def log_level(self) -> str:
+        """
+        Root log level for the pipeline worker processes, from [logging]
+        level (default INFO). Upper-cased; must be one of DEBUG, INFO,
+        WARNING, ERROR, CRITICAL (checked in _validate). A blank value falls
+        back to INFO.
+
+        Workers used to be hardwired to DEBUG, which made parsing.net log a
+        traceback for every malformed packet and turned on DEBUG output from
+        every library; set this to DEBUG only while troubleshooting
+        (TODO.md #18).
+        """
+        return self._get("logging", "level", fallback="INFO").strip().upper() or "INFO"
+
+    @property
     def server_ports(self) -> frozenset:
         """
         Union of every detector's configured ports (TCP and UDP): the set of
@@ -592,6 +607,13 @@ class Config:
                     f"dispatcher.out directory '{out_dir}' is not writable "
                     "by the current user"
                 )
+
+        # --- logging ---------------------------------------------------------
+
+        if self.log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            errors.append(
+                f"logging.level must be DEBUG, INFO, WARNING, ERROR or CRITICAL "
+                f"(got {self.log_level!r})")
 
         # --- sessions --------------------------------------------------------
 

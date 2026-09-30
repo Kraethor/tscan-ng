@@ -101,7 +101,8 @@ setting is `capture.iface`. All other values have safe defaults; see the
 config file itself and `tscan_ng/config.py` for full documentation of
 every setting, including `[capture]` (interface, snaplen, buffer size),
 `[dispatcher]` (worker count, output path), `[sessions]` (timeouts,
-buffer/session limits), `[discord]` (webhook, operational-alert cooldown) and
+buffer/session limits), `[logging]` (worker log level, default INFO), `[discord]`
+(webhook, operational-alert cooldown) and
 `[dedup]` (repeat-finding cooldown). The config file is read once at startup,
 so restart the service after editing it. Note that `[dispatcher] socket` is a
 leftover from the retired dispatcher architecture: it is still validated by

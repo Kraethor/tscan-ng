@@ -119,3 +119,14 @@ notify_cooldown_sec = 300
 # line and one alert per window; a different target or different
 # credentials still gets logged/alerted immediately. 1800 = 30 minutes.
 finding_cooldown_sec = 1800
+
+
+[logging]
+# -------------------------------------------------------------------
+# Log verbosity of the pipeline worker processes (journalctl -u tscan-pipeline)
+# -------------------------------------------------------------------
+# One of DEBUG, INFO, WARNING, ERROR, CRITICAL. INFO is the default and is
+# right for normal operation. DEBUG logs a traceback for every malformed
+# packet and turns on DEBUG output from libraries: use it only while
+# troubleshooting, then set it back. Restart the service after changing it.
+level = INFO
