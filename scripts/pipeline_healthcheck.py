@@ -7,7 +7,7 @@ state directly through systemctl, entirely outside the tscan-ng Python
 process, so it can catch failures the in-process Discord alerting
 (tscan_ng/sinks/discord.py) structurally cannot see: an OOM-kill (SIGKILL,
 no code runs to send an alert), a startup failure before Config() even
-succeeds, or any other way the process could vanish without a chance to
+succeeds (for example the capture NIC being absent), or any other way the process could vanish without a chance to
 alert on its own way out.
 
 Alerts once per state transition (up -> down, down -> up), not once per
@@ -49,12 +49,13 @@ Environment / configuration:
     No environment variables. Reads the Discord webhook via
     tscan_ng.config.Config() from /opt/tscan/tscan_ng/config/tscan_ng.conf
     ([discord] discord_webhook; empty => alerting silently disabled, but the
-    marker file is still maintained). Note that Config() also runs the full
-    configuration validation (capture.iface must exist in /sys/class/net,
-    output directory must be writable, ...), so an invalid config -- including
-    the capture NIC being absent from /sys/class/net, e.g. a USB NIC that
-    has been unplugged -- makes this script raise before it checks or
-    alerts on anything.
+    marker file is still maintained). The config is loaded with
+    Config(validate=False) on purpose: the full validation (capture.iface
+    must exist in /sys/class/net, ...) fails exactly when the capture NIC has
+    been unplugged, which is the documented main outage, and a watchdog that
+    dies with the thing it watches alerts nobody (TODO.md #4). If the config
+    cannot even be parsed, the webhook is treated as empty (no Discord alert
+    can be sent) but the systemctl check and the marker file still run.
     Shebang points at the venv interpreter (/opt/tscan/venv/bin/python)
     because `requests` (imported by tscan_ng.sinks.discord) lives only there.
 
@@ -73,9 +74,9 @@ State files (in STATE_DIR = /var/lib/tscan-healthcheck):
 Exit codes:
     0  every normal path above, including "alert could not be delivered"
        (Discord failures are swallowed inside DiscordSink).
-    1  unhandled exception (Python traceback in the journal): invalid
-       Config (ValueError), subprocess.TimeoutExpired from systemctl,
-       OSError creating/removing the marker. The unit then shows
+    1  unhandled exception (Python traceback in the journal):
+       subprocess.TimeoutExpired from systemctl, OSError creating/removing
+       the marker. (An invalid or unreadable config no longer raises.) The unit then shows
        status=1/FAILURE, which per docs/REBUILD.md means "the healthcheck
        itself broke", not necessarily that the pipeline is down.
 """
@@ -87,10 +88,11 @@ import time
 
 sys.path.insert(0, "/opt/tscan")
 
-from tscan_ng.config import Config
+from tscan_ng.config import Config, DEFAULT_CONFIG_PATH
 from tscan_ng.sinks.discord import DiscordSink
 
 UNIT = "tscan-pipeline.service"      # unit being watched
+CONFIG_PATH = DEFAULT_CONFIG_PATH    # where the Discord webhook is read from
 STATE_DIR = "/var/lib/tscan-healthcheck"
 DOWN_MARKER = os.path.join(STATE_DIR, "down")
 MIN_UP_SECONDS = 30   # continuous-active time required before declaring recovery (debounce)
@@ -125,6 +127,19 @@ def _active_duration() -> float:
     return max(0.0, (now_usec - entered_usec) / 1_000_000)
 
 
+def _load_webhook() -> str:
+    """Return the configured Discord webhook URL, or "" if it can't be read.
+
+    Loads Config without validation (see the module docstring): the watchdog
+    must work while the capture NIC is missing or the config is otherwise
+    invalid. Any failure to read the config yields "" (alerting disabled)
+    instead of an exception, so the down-marker logic below still runs."""
+    try:
+        return Config(CONFIG_PATH, validate=False).discord_webhook
+    except Exception:
+        return ""
+
+
 def main() -> None:
     """Check tscan-pipeline.service's current state against the persisted
     down-marker and alert exactly once on each up<->down transition (see
@@ -134,8 +149,6 @@ def main() -> None:
     except OSError:
         pass  # systemd's StateDirectory= already created this under normal operation.
 
-    # Raises ValueError if the config fails validation (see module docstring).
-    cfg = Config()
     # cooldown_sec=0: this module already dedupes on state transition, so
     # notify() should always send when we decide to call it. A separate
     # cooldown_path keeps this independent of pipeline_worker's own
@@ -143,7 +156,7 @@ def main() -> None:
     # reporting even if an individual worker's crash alert was recently
     # suppressed.
     discord = DiscordSink(
-        cfg.discord_webhook,
+        _load_webhook(),
         cooldown_path=os.path.join(STATE_DIR, "discord_marker"),
         cooldown_sec=0,
     )

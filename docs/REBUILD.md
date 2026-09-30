@@ -481,8 +481,11 @@ sudo systemctl status tscan-pipeline-healthcheck.service --no-pager
 ```
 The service's last run should be `code=exited, status=0/SUCCESS` — a
 non-zero exit here means the healthcheck script itself broke, not
-necessarily that the pipeline is down. The script loads the full `Config`
-(including validation), so an invalid config file makes it exit 1 as well.
+necessarily that the pipeline is down. The script reads only the Discord
+webhook, without config validation, so a missing capture NIC or an invalid or
+unreadable config file does not stop it: it still checks the unit and sends
+the DOWN alert (with an unreadable config there is no webhook, so no Discord
+message, but the marker file is still written).
 To reset its state, remove `/var/lib/tscan-healthcheck/down` (this makes it
 treat the pipeline as "up"; it will alert DOWN again on the next tick if the
 service is still not active).

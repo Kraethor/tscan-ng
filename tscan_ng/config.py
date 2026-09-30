@@ -89,7 +89,7 @@ class Config:
             surfaces through _validate as well.
     """
 
-    def __init__(self, path: str = DEFAULT_CONFIG_PATH):
+    def __init__(self, path: str = DEFAULT_CONFIG_PATH, validate: bool = True):
         """
         Load configuration from the given path.
 
@@ -99,16 +99,25 @@ class Config:
         unusable values. The path is remembered only for __repr__.
 
         Args:
-            path: Filesystem path to the INI config file.
+            path:     Filesystem path to the INI config file.
+            validate: If False, skip _validate. For callers that only need to
+                      read a few raw settings and must keep working when the
+                      full config is unusable at the moment -- the external
+                      health check (scripts/pipeline_healthcheck.py) reads the
+                      Discord webhook this way so it can still alert when the
+                      capture NIC has vanished and validation would fail. The
+                      pipeline itself always validates.
 
         Raises:
-            ValueError: If _validate finds any invalid setting.
+            ValueError: If validate is true and _validate finds any invalid
+                        setting.
         """
         self._cfg = configparser.ConfigParser()
         if os.path.exists(path):
             self._cfg.read(path)
         self._path = path
-        self._validate()
+        if validate:
+            self._validate()
 
     def _get(self, section: str, key: str, fallback):
         """
