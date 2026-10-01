@@ -28,8 +28,12 @@ Replaces run.py's _try_resolve(), an 11-branch if/elif that duplicated each
 detector's own immediate-resolve parser.
 
 Pending findings that never get a reply are closed as no_response elsewhere
-(age limit, session expiry, eviction or shutdown; see session.py).
+(age limit, session expiry, eviction or shutdown; see session.py). So is a
+finding whose resolver raised: resolve_pending() logs it once, marks it
+resolver_failed and stops offering it (TODO.md #59).
 """
+
+import logging
 
 from tscan_ng.detectors import DETECTOR_MODULES
 
@@ -69,6 +73,11 @@ def resolve_pending(session, ts: float) -> list[dict]:
     rest stay pending. Oldest first matters for the positional protocols:
     the first unanswered credential gets the first reply.
 
+    Each finding is isolated (TODO.md #59): if its resolver raises, the
+    exception is logged once, the finding is marked resolver_failed and kept
+    pending without being offered again (it ends as no_response), and the
+    other findings are still tried.
+
     Args:
         session: Session whose pending findings are checked.
         ts:      Unix timestamp of the current packet.
@@ -79,7 +88,16 @@ def resolve_pending(session, ts: float) -> list[dict]:
     """
     resolved, still_pending = [], []
     for p in session.pending:
-        done = try_resolve(p, session, ts)
+        done = None
+        if not p.resolver_failed:
+            try:
+                done = try_resolve(p, session, ts)
+            except Exception:
+                p.resolver_failed = True
+                logging.exception(
+                    "resolver for %s raised on session %s; leaving the finding "
+                    "to close as no_response",
+                    p.finding.get("type", "?"), session.session_id)
         if done is None:
             still_pending.append(p)
         else:

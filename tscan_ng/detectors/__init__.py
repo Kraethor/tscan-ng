@@ -1,8 +1,9 @@
 """
 detectors/__init__.py - Detector registry for tscan-ng.
 
-Exports DETECTOR_MODULES (one module per protocol) and STREAM_DETECTORS,
-their detect_stream functions, consumed by each pipeline_worker() process in
+Exports DETECTOR_MODULES (one module per protocol), STREAM_DETECTORS (their
+detect_stream functions) and run_detectors(), which calls them with
+per-detector exception isolation, consumed by each pipeline_worker() process in
 pipeline.py, the deployed tscan-pipeline.service path. tscan_ng.resolve
 builds its resolver registry from DETECTOR_MODULES. Every protocol here needs stream reassembly to correlate a credential
 with its server response (see e.g. detectors/ftp.py's module docstring), so
@@ -34,10 +35,13 @@ apply the port sets from the config file to every protocol detector.
 How detectors are driven (pipeline.py pipeline_worker(), per captured packet):
     1. SessionTable.add_packet() appends the payload to the flow's
        client_buf/server_buf and returns the Session.
-    2. Every function in STREAM_DETECTORS is called with (session, ts), in list
-       order. Order has no functional significance: each detector gates on its
-       own port set, so at most one does real work for a given flow.
-       Credentials are parked with session.add_pending().
+    2. run_detectors() calls every function in STREAM_DETECTORS with
+       (session, ts), in list order. Order has no functional significance:
+       each detector gates on its own port set, so at most one does real
+       work for a given flow. Credentials are parked with
+       session.add_pending(). Each call is isolated (TODO.md #59): a
+       detector that raises is logged and skipped for the rest of that
+       flow, and the others still run.
     3. tscan_ng.resolve.resolve_pending() offers every pending finding to the
        resolve() of the module that emitted its "type". A reply that is
        already buffered is therefore matched on the same packet. Each
@@ -69,6 +73,8 @@ that enumerates the protocols; missing one causes a silent failure):
     new outcome values the alerting behaviour you want.
 """
 
+import logging
+
 from tscan_ng.detectors import (
     http_basic, ftp, pop3, imap, smtp, telnet, ldap, redis, smb, snmp, irc, postgres,
 )
@@ -78,6 +84,41 @@ DETECTOR_MODULES = [
 ]
 
 STREAM_DETECTORS = [mod.detect_stream for mod in DETECTOR_MODULES]
+
+
+def run_detectors(session, ts: float) -> list[dict]:
+    """
+    Offer *session* to every detector in STREAM_DETECTORS, isolating each one.
+
+    A detector that raises is logged once (with traceback, detector module
+    and session id) and added to session.failed_detectors, so it is not
+    called for that flow again: nothing was consumed from the buffer, so it
+    would raise on every later packet of the flow. The remaining detectors
+    still run, and the failure does not count as a packet-processing failure
+    in pipeline._capture_loop() (TODO.md #59).
+
+    Args:
+        session: Session the current packet was added to.
+        ts:      Unix timestamp of the current packet.
+
+    Returns:
+        The findings the detectors returned (none today: they park
+        credentials with session.add_pending() instead).
+    """
+    findings = []
+    for det in STREAM_DETECTORS:
+        if det in session.failed_detectors:
+            continue
+        try:
+            findings.extend(det(session, ts))
+        except Exception:
+            session.failed_detectors.add(det)
+            logging.exception(
+                "detector %s raised on session %s (%s:%d -> %s:%d); "
+                "skipping it for the rest of this flow",
+                getattr(det, "__module__", det), session.session_id,
+                session.src, session.sport, session.dst, session.dport)
+    return findings
 
 
 def configure_all(cfg) -> None:

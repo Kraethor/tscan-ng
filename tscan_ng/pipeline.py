@@ -45,7 +45,7 @@ filter, so no translation is needed.
 import ctypes, hashlib, logging, multiprocessing as mp, multiprocessing.connection, os, signal, socket, struct, sys, time
 from tscan_ng.config import Config
 from tscan_ng.parsing.net import parse_basic, DLT_EN10MB
-from tscan_ng.detectors import STREAM_DETECTORS, configure_all
+from tscan_ng.detectors import run_detectors, configure_all
 from tscan_ng.sinks.jsonl import JSONLSink
 from tscan_ng.sinks.discord import DiscordSink
 from tscan_ng.sinks.cooldown import claim_slot
@@ -501,9 +501,10 @@ def _capture_loop(sock, cfg, sessions: SessionTable, sink: JSONLSink, discord: D
             # Detectors park credentials as pending (they return nothing
             # today; the loop keeps the interface open); resolve_pending()
             # then matches any reply already buffered, on this same packet.
-            for det in STREAM_DETECTORS:
-                for f in det(session, ts):
-                    _emit(sink, discord, {"ts": ts, **f}, finding_cooldown_sec)
+            # Both isolate each detector/resolver: one that raises is logged
+            # and skipped, and does not count as a failure here (TODO.md #59).
+            for f in run_detectors(session, ts):
+                _emit(sink, discord, {"ts": ts, **f}, finding_cooldown_sec)
             if session.pending:
                 for resolved in resolve_pending(session, ts):
                     _emit(sink, discord, _stamp_resolved(resolved, ts),
@@ -548,7 +549,10 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
     these timestamps only for correlation/expiry ordering, not forensic
     packet timing, so the small latency skew is an acceptable simplification.
 
-    Error handling: an exception while processing one packet is logged and
+    Error handling: a detector or resolver that raises is isolated by
+    detectors.run_detectors() / resolve.resolve_pending() (logged, skipped
+    for that flow or finding, not counted here; TODO.md #59). Any other
+    exception while processing one packet is logged and
     counted; 100 consecutive failures (fail_count resets on any success) or
     an OSError from recv() ends the loop as an abnormal exit. On any loop
     exit (including a SIGTERM/SIGINT stop request) the session table is

@@ -193,10 +193,16 @@ class PendingFinding:
                             trim. Shifted down whenever server_buf is trimmed
                             or consumed (see Session.consume_server()) so
                             it stays valid as an index into the current buffer.
+        resolver_failed:    True once this finding's resolver has raised
+                            (TODO.md #59). resolve.resolve_pending() then
+                            leaves it alone, so it is closed as no_response
+                            by the usual age limit instead of raising again
+                            on every packet.
     """
     finding:          dict
     ts_start:         float
     server_buf_floor: int = 0
+    resolver_failed:  bool = False
 
 
 @dataclass
@@ -234,6 +240,10 @@ class Session:
                     front of server_buf (matched or skipped). Together with
                     http_req_seen this converts "the Nth response on the
                     flow" into an index into the current server_buf.
+        failed_detectors: detect_stream functions that raised on this flow
+                    (TODO.md #59). detectors.run_detectors() does not offer
+                    the flow to them again: the buffer is in a state they
+                    cannot handle, so they would raise on every later packet.
         _client_trim_warned: True after the first client_buf trim warning has
                     been emitted. Suppresses repeat warnings on the same session
                     to prevent log flooding on high-volume persistent connections.
@@ -253,6 +263,7 @@ class Session:
     last_ts:    float     = 0.0
     http_req_seen: int = 0
     http_rsp_gone: int = 0
+    failed_detectors: set = field(default_factory=set, repr=False)
     # Trim warning suppression: warn once per direction, then go silent.
     # Prevents log flooding on high-volume persistent connections.
     _client_trim_warned: bool = field(default=False, repr=False)
