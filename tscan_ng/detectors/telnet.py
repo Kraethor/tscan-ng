@@ -360,7 +360,9 @@ def resolve(p, session):
     Returns:
         ({"status", "outcome"}, bytes to consume) or None if undecided yet.
     """
-    result, rsp_end = _find_outcome(bytes(session.server_buf), p.server_buf_floor)
+    # Pass the server_buf bytearray directly (searched from the floor), so
+    # nothing is copied per packet (TODO.md #23).
+    result, rsp_end = _find_outcome(session.server_buf, p.server_buf_floor)
     if not result:
         return None
     return {"status": result, "outcome": result}, rsp_end

@@ -229,7 +229,7 @@ def _find_snmp_request(data: bytes):
     return None, None, None, None, None
 
 
-def _find_snmp_response(data: bytes, request_id: int):
+def _find_snmp_response(data, request_id: int):
     """
     Scan *data* for a Response-PDU (GetResponse) matching *request_id*.
 
@@ -238,7 +238,7 @@ def _find_snmp_response(data: bytes, request_id: int):
     resolve().
 
     Args:
-        data:       Raw bytes from the server stream buffer.
+        data:       Server stream buffer (a bytes or bytearray; not copied).
         request_id: The request-id to match against (the SNMP request-id
                     INTEGER, which may be negative).
 
@@ -376,7 +376,10 @@ def resolve(p, session):
     Returns:
         ({"status", "outcome"}, bytes to consume) or None if no reply yet.
     """
-    error_status, rsp_end = _find_snmp_response(bytes(session.server_buf),
+    # Scan the server_buf bytearray directly, no per-packet copy (TODO.md #23).
+    # Correlation is by request-id (not a byte floor), so the reply may already
+    # be buffered; the scan starts at 0.
+    error_status, rsp_end = _find_snmp_response(session.server_buf,
                                                 p.finding.get("_request_id"))
     if error_status is None:
         return None

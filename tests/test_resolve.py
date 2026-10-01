@@ -71,6 +71,17 @@ class RegistryTests(unittest.TestCase):
             with self.subTest(module=mod.__name__):
                 self.assertIsNone(pattern.search(inspect.getsource(mod.detect_stream)))
 
+    def test_no_resolver_copies_whole_server_buf(self):
+        # TODO.md #23: resolvers must search the server_buf bytearray directly,
+        # never copy it whole per packet. bytes(session.server_buf[:N]) (a
+        # bounded slice in detect_stream) is fine; the unbounded
+        # bytes(session.server_buf) is the quadratic copy this forbids.
+        pattern = re.compile(r"bytes\(\s*session\.server_buf\s*\)")
+        for mod in DETECTOR_MODULES:
+            with self.subTest(module=mod.__name__):
+                self.assertIsNone(pattern.search(inspect.getsource(mod)),
+                                  f"{mod.__name__} copies the whole server_buf (TODO #23)")
+
     def test_unknown_type_stays_pending(self):
         s = make_session(80)
         s.add_pending({"type": "nope"}, TS)

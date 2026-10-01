@@ -243,7 +243,10 @@ def resolve(p, session):
     want = 0 if rsp_index is None else rsp_index - session.http_rsp_gone
     if want < 0:
         return None
-    for n, match in enumerate(_RESPONSE_LINE_RE.finditer(bytes(session.server_buf))):
+    # Scan the server_buf bytearray directly (positional counting uses
+    # http_rsp_gone, not a byte floor), so nothing is copied per packet
+    # (TODO.md #23).
+    for n, match in enumerate(_RESPONSE_LINE_RE.finditer(session.server_buf)):
         if n == want:
             session.http_rsp_gone += want + 1
             status = int(match.group(1))

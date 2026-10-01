@@ -295,9 +295,9 @@ def resolve(p, session):
     Returns:
         ({"status", "outcome"}, bytes to consume) or None if no reply yet.
     """
-    for response in _SMTP_RESPONSE_RE.finditer(bytes(session.server_buf)):
-        if response.start() < p.server_buf_floor:
-            continue
+    # Scan the server_buf bytearray directly from the floor (no per-packet copy,
+    # TODO.md #23).
+    for response in _SMTP_RESPONSE_RE.finditer(session.server_buf, p.server_buf_floor):
         code = response.group(1)
         return ({"status": code.decode("utf-8", "replace"), "outcome": _outcome(code)},
                 response.end())

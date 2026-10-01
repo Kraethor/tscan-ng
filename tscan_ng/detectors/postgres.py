@@ -290,7 +290,7 @@ def _extract_error_field(payload: bytes, field_type: bytes):
     return None
 
 
-def _find_auth_outcome(data: bytes):
+def _find_auth_outcome(data):
     """
     Scan *data* (server_buf) for the final AuthenticationOk or ErrorResponse
     following a PasswordMessage.
@@ -303,7 +303,7 @@ def _find_auth_outcome(data: bytes):
     data stops the scan (treated as truncated). Called by resolve().
 
     Args:
-        data: Raw bytes from the server stream buffer.
+        data: Server stream buffer (a bytes or bytearray; not copied).
 
     Returns:
         (outcome, status, end_offset) if found, where outcome is one of
@@ -424,7 +424,10 @@ def resolve(p, session):
     Returns:
         ({"status", "outcome"}, bytes to consume) or None if no reply yet.
     """
-    outcome, status, rsp_end = _find_auth_outcome(bytes(session.server_buf))
+    # Scan the server_buf bytearray directly, no per-packet copy (TODO.md #23).
+    # The scan starts at 0 and skips the earlier cleartext-password request
+    # (_find_auth_outcome); consume removes it along with the final message.
+    outcome, status, rsp_end = _find_auth_outcome(session.server_buf)
     if outcome is None:
         return None
     return {"status": status, "outcome": outcome}, rsp_end

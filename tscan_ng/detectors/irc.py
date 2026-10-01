@@ -153,12 +153,12 @@ def _find_identify(data: bytes):
     return nick_str, password_str, m.end()
 
 
-def _find_identify_response(data: bytes):
+def _find_identify_response(data):
     """
     Scan *data* for a NickServ NOTICE accepting or rejecting an IDENTIFY.
 
     Args:
-        data: Raw bytes from the server stream buffer.
+        data: Server stream buffer (a bytes or bytearray; not copied).
 
     Returns:
         ("success" | "failed", end_offset) for the first NickServ NOTICE
@@ -253,7 +253,8 @@ def resolve(p, session):
     Returns:
         ({"status", "outcome"}, bytes to consume) or None if no reply yet.
     """
-    outcome, rsp_end = _find_identify_response(bytes(session.server_buf))
+    # Scan the server_buf bytearray directly, no per-packet copy (TODO.md #23).
+    outcome, rsp_end = _find_identify_response(session.server_buf)
     if outcome is None:
         return None
     return {"status": outcome, "outcome": _outcome(outcome)}, rsp_end

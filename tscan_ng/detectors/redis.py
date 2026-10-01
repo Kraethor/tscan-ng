@@ -421,8 +421,10 @@ def resolve(p, session):
     Returns:
         ({"status", "outcome"}, bytes to consume) or None if no reply yet.
     """
+    # Pass the server_buf bytearray directly (already scanned from the floor),
+    # so nothing is copied per packet (TODO.md #23).
     outcome, rsp_end = _find_auth_response(
-        bytes(session.server_buf), p.server_buf_floor, p.finding.get("_hello", False))
+        session.server_buf, p.server_buf_floor, p.finding.get("_hello", False))
     if outcome is None:
         return None
     return {"status": outcome, "outcome": outcome}, rsp_end

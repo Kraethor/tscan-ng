@@ -174,7 +174,7 @@ _NTLM_TYPE_CHALLENGE = 2
 _NTLM_TYPE_AUTHENTICATE = 3
 
 
-def _iter_smb2_messages(data: bytes):
+def _iter_smb2_messages(data):
     """
     Yield one tuple per SMB2 message found in *data*.
 
@@ -182,7 +182,7 @@ def _iter_smb2_messages(data: bytes):
     (see module docstring re: not parsing NBSS/NextCommand framing).
 
     Args:
-        data: Raw bytes buffer to scan.
+        data: Buffer to scan (a bytes or bytearray; not copied).
 
     Yields:
         (header_start, is_response, command, status, message_id,
@@ -384,7 +384,7 @@ def _find_ntlm_authenticate(data: bytes):
     return None, None, None, None, None, None, None
 
 
-def _find_final_status(data: bytes, session_id: int, message_id: int):
+def _find_final_status(data, session_id: int, message_id: int):
     """
     Scan *data* (server_buf) for the SESSION_SETUP response that answers the
     AUTHENTICATE of (session_id, message_id): same SessionId and MessageId,
@@ -396,7 +396,7 @@ def _find_final_status(data: bytes, session_id: int, message_id: int):
     first exchange's final status (TODO.md #25).
 
     Args:
-        data:       Raw bytes from the server stream buffer.
+        data:       Server stream buffer (a bytes or bytearray; not copied).
         session_id: SMB2 SessionId of the AUTHENTICATE being resolved.
         message_id: SMB2 MessageId of the AUTHENTICATE being resolved.
 
@@ -523,8 +523,11 @@ def resolve(p, session):
     Returns:
         ({"status", "outcome"}, bytes to consume) or None if no reply yet.
     """
+    # Scan the server_buf bytearray directly, no per-packet copy (TODO.md #23).
+    # Correlation is by SessionId+MessageId (not a byte floor), so the scan
+    # starts at 0; consume removes the earlier CHALLENGE with the final response.
     status, rsp_end = _find_final_status(
-        bytes(session.server_buf),
+        session.server_buf,
         p.finding.get("_session_id"), p.finding.get("_message_id"))
     if status is None:
         return None

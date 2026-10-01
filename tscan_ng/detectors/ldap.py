@@ -185,7 +185,7 @@ def _find_bind_request(data: bytes):
     return None, None, None, None
 
 
-def _find_bind_response(data: bytes, message_id: int | None = None):
+def _find_bind_response(data, message_id: int | None = None):
     """
     Scan *data* for the BindResponse answering the bind with *message_id*.
 
@@ -207,7 +207,7 @@ def _find_bind_response(data: bytes, message_id: int | None = None):
     ENUMERATED value only.
 
     Args:
-        data:       Raw bytes from the server stream buffer.
+        data:       Server stream buffer (a bytes or bytearray; not copied).
         message_id: messageID of the BindRequest being answered, or None.
 
     Returns:
@@ -357,7 +357,9 @@ def resolve(p, session):
     Returns:
         ({"status", "outcome"}, bytes to consume) or None if no reply yet.
     """
-    result_code, rsp_end = _find_bind_response(bytes(session.server_buf),
+    # Scan the server_buf bytearray directly, no per-packet copy (TODO.md #23).
+    # Correlation is by messageID (not a byte floor), so the scan starts at 0.
+    result_code, rsp_end = _find_bind_response(session.server_buf,
                                                p.finding.get("_message_id"))
     if result_code is None:
         return None

@@ -333,7 +333,10 @@ def resolve(p, session):
         ({"status", "outcome"}, bytes to consume) or None if no reply yet.
     """
     tag = p.finding.get("tag", "").upper().encode("utf-8", "ignore")
-    for match in _IMAP_RESPONSE_RE.finditer(bytes(session.server_buf)):
+    # Scan the server_buf bytearray directly, no per-packet copy (TODO.md #23).
+    # Correlation is by tag (not a byte floor), so the scan starts at 0 and the
+    # reply may already be buffered.
+    for match in _IMAP_RESPONSE_RE.finditer(session.server_buf):
         if match.group(1).upper() == tag:
             status = match.group(2).upper().decode("utf-8", "replace")
             return {"status": status, "outcome": _outcome(status)}, match.end()
