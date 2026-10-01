@@ -10,9 +10,15 @@ Provides (TODO.md #57 moved the last four here from per-module copies):
                         - minimal BER reader. ldap.py, snmp.py.
     base_finding()      - the fields every finding starts with. All detectors.
     on_ports()          - "is this flow on my ports" gate. All detectors.
+    advance_scan_window() - drop scanned-but-unmatched client_buf so a
+                          credential behind piled-up traffic is reached
+                          (TODO.md #16). All stream detectors except http_basic
+                          (consumes every header block, #2) and telnet (clears
+                          its whole window once it has a login).
 
-Module-level state: none. The functions are pure (base_finding() and
-on_ports() read the session they are given; nothing is modified, no I/O).
+Module-level state: none. The functions are pure except advance_scan_window(),
+which trims the session's client_buf (base_finding() and on_ports() only read
+the session they are given; no I/O anywhere).
 
 (detect_user_pass(), a per-packet USER/PASS helper from the pre-stream
 detector design, was removed in TODO.md #55; it had no callers.)
@@ -189,6 +195,73 @@ def base_finding(session, ftype: str, creds: str, **extra) -> dict:
         "filter":     _make_filter(session.src, session.dst,
                                    session.sport, session.dport),
     }
+
+
+# Default bytes of the scan window to keep when advancing past unmatched data
+# (advance_scan_window(), TODO.md #16). Large enough to hold a credential
+# line (text protocols) or message (binary protocols) that straddles the old
+# window edge, so it still completes on a later packet; small relative to every
+# detector's _MAX_SCAN_CLIENT (>= 2048).
+_ADVANCE_KEEP_TAIL = 1024
+
+
+def advance_scan_window(session, scan_limit: int, line_oriented: bool,
+                        keep_tail: int = _ADVANCE_KEEP_TAIL) -> int:
+    """
+    Drop already-scanned client_buf bytes that yielded no credential (TODO.md #16).
+
+    Every detector scans only the first scan_limit bytes of client_buf and
+    consumes bytes only when it matches a credential. Without this, once
+    scan_limit bytes of non-credential traffic (other commands, searches,
+    pipelined requests) pile up at the front, a real credential arriving behind
+    them never enters the scan window and is missed. Call this on the detector's
+    "scanned the window, found no (complete) credential" path, after any complete
+    credential already in the window has been consumed, and only when no
+    half-finished credential anchor is pending in the buffer (an FTP USER still
+    waiting for its PASS, an SMTP AUTH LOGIN waiting for its base64 lines) — such
+    an anchor must stay put, so its detector skips this call while one is open.
+
+    The trim fires only when client_buf has grown past scan_limit (there are
+    bytes the bounded scan can never otherwise reach). It keeps the last
+    keep_tail bytes of the window so a credential straddling the old window edge
+    survives to complete on a later packet.
+
+    For a line_oriented protocol the cut is aligned to the last newline in the
+    drop region, so the remaining buffer still begins at a line boundary and the
+    detectors' ^-anchored (re.MULTILINE) regexes keep working; if there is no
+    newline to cut on, nothing is trimmed (that stall is TODO.md #22, a header
+    or line longer than the window). A binary protocol (line_oriented False)
+    cuts on a byte boundary; its detector resyncs by scanning forward for the
+    next message marker (0x30 SEQUENCE, 'p', \\xfeSMB, '*'), so a mid-message cut
+    is recovered rather than fatal.
+
+    Pending findings record only server_buf offsets (PendingFinding.server_buf_
+    floor), never client_buf offsets, so trimming client_buf here cannot
+    invalidate them.
+
+    Args:
+        session:       Session whose client_buf is trimmed.
+        scan_limit:    The detector's _MAX_SCAN_CLIENT (the window it scanned).
+        line_oriented: True to align the cut to a newline (text protocols),
+                       False to cut on a byte boundary (binary protocols).
+        keep_tail:     Bytes of the window to retain at the front after the cut.
+
+    Returns:
+        Number of bytes removed from the front of client_buf (0 if none).
+    """
+    buf = session.client_buf
+    if len(buf) <= scan_limit:
+        return 0
+    drop = scan_limit - keep_tail
+    if drop <= 0:
+        return 0
+    if line_oriented:
+        nl = buf.rfind(b"\n", 0, drop)
+        if nl == -1:
+            return 0
+        drop = nl + 1
+    del buf[:drop]
+    return drop
 
 
 def on_ports(session, ports) -> bool:

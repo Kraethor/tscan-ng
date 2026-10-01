@@ -56,8 +56,10 @@ Known limitations:
       string early.
     - AUTHENTICATE mechanisms other than PLAIN (LOGIN, XOAUTH2, CRAM-MD5, ...)
       are ignored. STARTTLS upgrades make everything after them opaque.
-    - Only the first 4 KB of client_buf is scanned, and the buffer is
-      consumed only when a LOGIN/AUTHENTICATE is matched.
+    - Only the first _MAX_SCAN_CLIENT bytes of client_buf are scanned per call;
+      when nothing matches and no AUTHENTICATE is awaiting its continuation line,
+      the scanned prefix is dropped (advance_scan_window(), TODO.md #16), so a
+      LOGIN behind many other commands is reached on a later packet.
     - LOGIN is matched without requiring the terminating CRLF, so a command
       split across TCP segments can be captured truncated.
     - 993 (IMAPS) is normally TLS; it only yields findings if the traffic on
@@ -66,7 +68,7 @@ Known limitations:
 
 import logging
 import re
-from tscan_ng.detectors.common import base_finding, decode_sasl_plain, on_ports
+from tscan_ng.detectors.common import advance_scan_window, base_finding, decode_sasl_plain, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("imap_creds",)
@@ -305,6 +307,12 @@ def detect_stream(session, ts: float) -> list[dict]:
     # taken at the top of this call, so they remain valid together.
     if consume_end is not None:
         del session.client_buf[:consume_end]
+    elif auth_match is None:
+        # Nothing matched and no AUTHENTICATE is parked waiting for its
+        # continuation line (that command must stay as an anchor). Drop scanned
+        # non-login commands so a LOGIN/AUTHENTICATE behind them is reached on a
+        # later packet (TODO.md #16).
+        advance_scan_window(session, _MAX_SCAN_CLIENT, line_oriented=True)
 
     return []
 

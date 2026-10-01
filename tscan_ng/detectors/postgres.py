@@ -74,13 +74,16 @@ Known limitations:
       at the front of client_buf, and a candidate 'p' whose length field is
       larger than the whole scan window is skipped rather than treated as a
       truncated message (TODO.md #1). See _find_password_message.
-    - Only the first 4 KB of each buffer is examined for the pre-conditions;
-      client_buf is consumed only when a PasswordMessage is matched.
+    - Only the first _MAX_SCAN_CLIENT/_MAX_SCAN_SERVER bytes of each buffer are
+      examined. When the cleartext request is present but no PasswordMessage is
+      in the client window, the scanned prefix is dropped (advance_scan_window(),
+      TODO.md #16); if that cut reaches past the StartupMessage the username
+      falls back to "" but the password is still captured.
     - TLS negotiated via SSLRequest ('S' response) makes the rest opaque.
 """
 
 import struct
-from tscan_ng.detectors.common import base_finding, on_ports
+from tscan_ng.detectors.common import advance_scan_window, base_finding, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("postgres_creds",)
@@ -382,6 +385,14 @@ def detect_stream(session, ts: float) -> list:
     client_bytes = bytes(session.client_buf[:_MAX_SCAN_CLIENT])
     password, req_end = _find_password_message(client_bytes)
     if password is None:
+        # Server asked for a cleartext password but no PasswordMessage is in the
+        # window yet. Drop scanned junk so a PasswordMessage behind it is reached
+        # on a later packet (TODO.md #16). The protocol is byte-framed, so the cut
+        # is byte-aligned and _find_password_message() resyncs. In the rare case
+        # where >_MAX_SCAN_CLIENT bytes precede the password the StartupMessage
+        # may be trimmed too, so the username falls back to "" (creds ":pw"); the
+        # password itself is still captured.
+        advance_scan_window(session, _MAX_SCAN_CLIENT, line_oriented=False)
         return []
 
     if not password:

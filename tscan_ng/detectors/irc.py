@@ -58,15 +58,17 @@ Finding extras:
               that has an optional username component (e.g. redis_creds).
 
 Known limitations:
-    - Only the first 4 KB of client_buf is scanned; it is consumed only on
-      a match.
+    - Only the first _MAX_SCAN_CLIENT bytes of client_buf are scanned per call;
+      when no IDENTIFY is in that window the scanned prefix is dropped
+      (advance_scan_window(), TODO.md #16), so an IDENTIFY behind channel chatter
+      is reached on a later packet.
     - IRC over TLS (6697) is opaque and not in the default port set.
     - No debug log is emitted for skipped empty captures (unlike most
       detectors); logging is not imported.
 """
 
 import re
-from tscan_ng.detectors.common import base_finding, on_ports
+from tscan_ng.detectors.common import advance_scan_window, base_finding, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("irc_creds",)
@@ -220,6 +222,9 @@ def detect_stream(session, ts: float) -> list:
     nick, password, req_end = _find_identify(client_bytes)
 
     if password is None:
+        # No IDENTIFY in the window: drop scanned junk (JOINs, chatter) so an
+        # IDENTIFY behind it is reached on a later packet (TODO.md #16).
+        advance_scan_window(session, _MAX_SCAN_CLIENT, line_oriented=True)
         return []
 
     # Defensive: the regex's (\S+) cannot capture an empty password, so this

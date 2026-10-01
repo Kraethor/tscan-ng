@@ -51,9 +51,10 @@ Response correlation:
     in resolve().
 
 Known limitations:
-    - Only the first 4 KB of client_buf is scanned and it is consumed only on
-      an AUTH match, so an AUTH arriving after 4 KB of other commands on
-      the same connection is not seen.
+    - Only the first _MAX_SCAN_CLIENT bytes of client_buf are scanned per call;
+      when no AUTH/HELLO is in that window the scanned prefix is dropped
+      (advance_scan_window(), TODO.md #16), so an AUTH behind other commands on
+      the same connection is reached on a later packet.
     - AUTH with an empty password is skipped. Redis over TLS is opaque.
     - A client that sends another command and AUTH in one burst, before the
       first reply arrives (e.g. SELECT then AUTH pipelined), leaves the floor
@@ -64,7 +65,7 @@ Known limitations:
 
 import logging
 import re
-from tscan_ng.detectors.common import base_finding, on_ports
+from tscan_ng.detectors.common import advance_scan_window, base_finding, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("redis_creds",)
@@ -381,6 +382,10 @@ def detect_stream(session, ts: float) -> list:
     username, password, is_hello, cmd_end = _find_auth_command(client_bytes)
 
     if username is None:
+        # No AUTH/HELLO command in the window: drop scanned non-auth commands so
+        # an AUTH behind them is reached on a later packet (TODO.md #16). RESP is
+        # byte-framed, so the cut is byte-aligned; _find_auth_command() resyncs.
+        advance_scan_window(session, _MAX_SCAN_CLIENT, line_oriented=False)
         return []
 
     if not password:

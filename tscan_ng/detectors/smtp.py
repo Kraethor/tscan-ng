@@ -63,9 +63,12 @@ Known limitations:
       on the AUTH LOGIN line itself ("AUTH LOGIN <base64 user>") is not
       matched by _SMTP_AUTH_LOGIN_RE.
     - STARTTLS-protected sessions are opaque; 465 (SMTPS) is normally TLS.
-    - Only the first 4 KB of client_buf is scanned. AUTH LOGIN leaves its
-      anchor in the buffer until both credential lines arrive, so an
-      abandoned AUTH LOGIN can cause later bare-word lines (for example
+    - Only the first _MAX_SCAN_CLIENT bytes of client_buf are scanned per call;
+      when no AUTH LOGIN/PLAIN is present the scanned prefix is dropped
+      (advance_scan_window(), TODO.md #16), so an AUTH behind other commands is
+      reached on a later packet. AUTH LOGIN/PLAIN leaves its anchor in the buffer
+      until the credential lines arrive (so no trim happens while one is open),
+      so an abandoned AUTH LOGIN can cause later bare-word lines (for example
       message body text that is pure base64 alphabet) to be decoded as
       credentials.
     - The AUTH LOGIN path does not skip empty/undecodable credentials the way
@@ -75,7 +78,7 @@ Known limitations:
 import logging
 import re
 from tscan_ng.detectors.common import decode_b64 as _decode_b64
-from tscan_ng.detectors.common import base_finding, decode_sasl_plain, on_ports
+from tscan_ng.detectors.common import advance_scan_window, base_finding, decode_sasl_plain, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("smtp_creds",)
@@ -267,6 +270,12 @@ def detect_stream(session, ts: float) -> list:
             session.add_pending(base, ts_start=ts)
 
             del session.client_buf[:end]
+
+    # No AUTH LOGIN or AUTH PLAIN anchor anywhere in the window (a present-but-
+    # incomplete one must stay put): drop scanned non-auth commands so an AUTH
+    # behind them is reached on a later packet (TODO.md #16).
+    if not login_match and not plain_match:
+        advance_scan_window(session, _MAX_SCAN_CLIENT, line_oriented=True)
 
     return []
 

@@ -105,12 +105,17 @@ Correlation caveats:
       or reads another exchange's status. The CHALLENGE must be within the
       first 4 KB of server_buf and is consumed only when the final status
       is.
+    - Only the first _MAX_SCAN_CLIENT bytes of client_buf are scanned per call.
+      When no AUTHENTICATE is in that window the scanned prefix is dropped
+      (advance_scan_window(), TODO.md #16; the byte-aligned cut resyncs on the
+      next \xfeSMB marker), so an AUTHENTICATE behind earlier SMB2 traffic is
+      reached on a later packet.
     - Encrypted (SMB 3 transform header) or signed-and-sealed traffic hides
       later exchanges, but SESSION_SETUP itself is always in the clear.
 """
 
 import struct
-from tscan_ng.detectors.common import base_finding, on_ports
+from tscan_ng.detectors.common import advance_scan_window, base_finding, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("smb_creds",)
@@ -460,6 +465,11 @@ def detect_stream(session, ts: float) -> list:
     (domain, username, workstation, nt_response,
      session_id, message_id, req_end) = _find_ntlm_authenticate(client_bytes)
     if username is None:
+        # No NTLM AUTHENTICATE in the window: drop scanned SMB2 traffic (NEGOTIATE,
+        # TREE_CONNECT, reads) so an AUTHENTICATE behind it is reached on a later
+        # packet (TODO.md #16). SMB2 is byte-framed; _find_ntlm_authenticate()
+        # resyncs on the next \xfeSMB marker, so a byte-aligned cut is recovered.
+        advance_scan_window(session, _MAX_SCAN_CLIENT, line_oriented=False)
         return []
 
     # NTLMv2: NTProofStr (16 bytes) + a variable-length "temp" blob. A bare

@@ -45,10 +45,11 @@ Response correlation:
     (saslBindInProgress), which maps to "server_error".
 
 Known limitations:
-    - Only the first 8 KB of client_buf is scanned. Non-bind messages
-      (searches etc.) are skipped over but never consumed, so a simple bind
-      that starts after 8 KB of other LDAP traffic on the same connection is
-      not seen.
+    - Only the first _MAX_SCAN_CLIENT bytes of client_buf are scanned per call.
+      When no simple bind is in that window the scanned prefix is dropped
+      (advance_scan_window(), TODO.md #16; the byte-aligned cut resyncs on the
+      next 0x30 SEQUENCE), so a simple bind behind a backlog of searches is
+      reached on a later packet.
     - A message whose declared length exceeds the scan window (or is bogus)
       stops the scan for that call, since it is indistinguishable from a
       message still being received.
@@ -57,7 +58,7 @@ Known limitations:
 """
 
 import logging
-from tscan_ng.detectors.common import base_finding, on_ports, parse_ber_len, parse_ber_tlv
+from tscan_ng.detectors.common import advance_scan_window, base_finding, on_ports, parse_ber_len, parse_ber_tlv
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("ldap_creds",)
@@ -316,6 +317,11 @@ def detect_stream(session, ts: float) -> list:
     dn, password, message_id, req_end = _find_bind_request(client_bytes)
 
     if dn is None:
+        # No simple BindRequest in the window: drop scanned non-bind messages
+        # (searches, SASL binds) so a bind behind them is reached on a later
+        # packet (TODO.md #16). BER is byte-framed; _find_bind_request() resyncs
+        # on the next 0x30 SEQUENCE tag, so a byte-aligned cut is recovered.
+        advance_scan_window(session, _MAX_SCAN_CLIENT, line_oriented=False)
         return []
 
     if not password:

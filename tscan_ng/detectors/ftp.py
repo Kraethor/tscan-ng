@@ -52,9 +52,11 @@ Response correlation:
 Known limitations:
     - USER/PASS lines are matched without requiring the terminating CRLF, so a
       command split across TCP segments can yield a truncated password.
-    - Only the first 4 KB of client_buf is scanned and the buffer is only
-      consumed on a match, so a USER/PASS that starts beyond 4 KB of earlier
-      unmatched client bytes is not seen.
+    - Only the first _MAX_SCAN_CLIENT bytes of client_buf are scanned per call.
+      When no USER is in that window the scanned prefix is dropped
+      (advance_scan_window(), TODO.md #16), so a USER/PASS behind a backlog of
+      other commands is reached on a later packet; a credential line longer than
+      the window still cannot be matched.
     - FTPS/AUTH TLS sessions are encrypted after the AUTH TLS exchange and
       produce no findings; FTP data connections (passive/active ports) are
       never inspected.
@@ -62,7 +64,7 @@ Known limitations:
 
 import logging
 import re
-from tscan_ng.detectors.common import base_finding, on_ports
+from tscan_ng.detectors.common import advance_scan_window, base_finding, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("ftp_creds", "ftp_anonymous")
@@ -165,6 +167,9 @@ def detect_stream(session, ts: float) -> list:
 
     user_match = _FTP_USER_RE.search(client_bytes)
     if not user_match:
+        # No USER anchor in the window: drop scanned junk so a USER behind it is
+        # reached on a later packet (TODO.md #16).
+        advance_scan_window(session, _MAX_SCAN_CLIENT, line_oriented=True)
         return []
 
     # Search for PASS only within the remaining scan window after USER, so a
@@ -172,6 +177,11 @@ def detect_stream(session, ts: float) -> list:
     # user_match.end() is always within client_bytes, so this is safe.
     pass_match = _FTP_PASS_RE.search(client_bytes, user_match.end())
     if not pass_match:
+        # USER is parked but PASS has not arrived (or is past the window). Drop
+        # only the junk before USER (a line boundary) so the window can extend
+        # to reach the PASS, keeping the USER anchor itself (TODO.md #16).
+        if user_match.start() > 0:
+            del session.client_buf[:user_match.start()]
         return []
 
     user   = user_match.group(1).decode("utf-8", "replace")

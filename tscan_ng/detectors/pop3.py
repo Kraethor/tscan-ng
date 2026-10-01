@@ -50,15 +50,17 @@ Known limitations:
       "third response" to the USER reply.
     - Commands are matched without requiring the terminating CRLF, so a line
       split across TCP segments can produce a truncated user or password.
-    - Only the first 4 KB of client_buf is scanned; it is consumed only on a
-      match.
+    - Only the first _MAX_SCAN_CLIENT bytes of client_buf are scanned per call;
+      when no USER is in that window the scanned prefix is dropped
+      (advance_scan_window(), TODO.md #16), so a USER/PASS behind other commands
+      is reached on a later packet.
     - 995 (POP3S) is normally TLS and yields nothing unless traffic on that
       port is actually cleartext.
 """
 
 import logging
 import re
-from tscan_ng.detectors.common import base_finding, on_ports
+from tscan_ng.detectors.common import advance_scan_window, base_finding, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("pop3_creds",)
@@ -149,10 +151,17 @@ def detect_stream(session, ts: float) -> list:
 
     user_match = _POP3_USER_RE.search(client_bytes)
     if not user_match:
+        # No USER anchor in the window: drop scanned junk so a USER behind it is
+        # reached on a later packet (TODO.md #16).
+        advance_scan_window(session, _MAX_SCAN_CLIENT, line_oriented=True)
         return []
 
     pass_match = _POP3_PASS_RE.search(client_bytes, user_match.end())
     if not pass_match:
+        # USER parked, PASS not yet seen: drop only the junk before USER so the
+        # window can extend to the PASS, keeping the USER anchor (TODO.md #16).
+        if user_match.start() > 0:
+            del session.client_buf[:user_match.start()]
         return []
 
     user   = user_match.group(1).decode("utf-8", "replace")

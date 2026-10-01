@@ -103,13 +103,15 @@ Known limitations:
     - Requests are matched to responses by request-id only (not by source
       address or community), and only within one 4-tuple session, so a poller
       that reuses one source port sends many requests down one session.
-    - Only the first 2 KB of client_buf is scanned; client_buf is consumed
-      only when a request with a non-empty community is matched (or an empty
-      one is discarded), so unmatched datagrams accumulate at the front.
+    - Only the first _MAX_SCAN_CLIENT bytes of client_buf are scanned per call.
+      When no request is in that window the scanned prefix is dropped
+      (advance_scan_window(), TODO.md #16; the byte-aligned cut resyncs on the
+      next 0x30 SEQUENCE), so a request behind an unanswered one is reached on a
+      later datagram instead of being pinned out of the window forever.
     - A datagram whose community is empty is dropped silently (no log).
 """
 
-from tscan_ng.detectors.common import base_finding, on_ports, parse_ber_len, parse_ber_tlv
+from tscan_ng.detectors.common import advance_scan_window, base_finding, on_ports, parse_ber_len, parse_ber_tlv
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("snmp_creds",)
@@ -339,6 +341,10 @@ def detect_stream(session, ts: float) -> list:
     version, community, request_id, pdu_name, req_end = _find_snmp_request(client_bytes)
 
     if community is None:
+        # No GetRequest/SetRequest in the window: drop scanned bytes so a request
+        # behind an unanswered one is reached on a later datagram (TODO.md #16).
+        # BER is byte-framed; _find_snmp_request() resyncs on the next 0x30 tag.
+        advance_scan_window(session, _MAX_SCAN_CLIENT, line_oriented=False)
         return []
 
     if not community:
