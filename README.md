@@ -257,7 +257,9 @@ privileges and exit codes.
   `/run/tscan/finding_cooldown/`, one marker file per `(dst, dport, creds, outcome)`
   key for the finding cooldown. The directory is emptied when the service
   stops, so the finding cooldown resets on every full stop/start (it survives
-  `Restart=on-failure` cycles).
+  `Restart=on-failure` cycles). Markers older than the cooldown are deleted
+  by worker 0 every `expiry_interval_sec`, so the directory holds at most
+  one window's worth of keys.
 
 ## Deployment
 See `docs/REBUILD.md` for full rebuild instructions. `scripts/push.sh

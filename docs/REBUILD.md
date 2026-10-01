@@ -303,7 +303,9 @@ same way. Distinct targets, distinct credentials or a different outcome (for exa
 `success` after an earlier `failed` with the same credentials) are still emitted
 immediately. State is kept as marker files under `/run/tscan/finding_cooldown/`,
 so it is shared by all workers and is reset by a full service stop/start
-(not by a `Restart=on-failure` cycle). If the marker directory cannot be
+(not by a `Restart=on-failure` cycle). Worker 0 deletes markers older than
+`finding_cooldown_sec` on every maintenance pass (`expiry_interval_sec`), so
+the directory holds at most one window's worth of distinct keys. If the marker directory cannot be
 used, the check fails open (findings are logged, just not deduplicated).
 Not to be confused with `[discord] notify_cooldown_sec`, which only rate-limits
 operational (non-finding) alerts.

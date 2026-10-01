@@ -48,7 +48,7 @@ from tscan_ng.parsing.net import parse_basic, DLT_EN10MB
 from tscan_ng.detectors import run_detectors, configure_all
 from tscan_ng.sinks.jsonl import JSONLSink
 from tscan_ng.sinks.discord import DiscordSink
-from tscan_ng.sinks.cooldown import claim_slot
+from tscan_ng.sinks.cooldown import claim_slot, prune_markers
 from tscan_ng.session import SessionTable
 from tscan_ng.resolve import resolve_pending
 from tscan_ng.capture import (
@@ -342,8 +342,8 @@ def _emit(sink: JSONLSink, discord: DiscordSink, finding: dict,
 
     Marker files (one per distinct key, named by the SHA-256 of the key so
     arbitrary credential bytes never reach the filesystem as a name) live
-    in _FINDING_COOLDOWN_DIR and are only deleted by this code when a sink
-    write raises. The slot is claimed before the sinks are written (so
+    in _FINDING_COOLDOWN_DIR. They are deleted here when a sink write
+    raises, and once expired by _prune_finding_cooldown() (TODO.md #11). The slot is claimed before the sinks are written (so
     concurrent workers cannot both emit the same finding); if a sink write
     raises, the marker is removed again so the failed finding does not
     consume the window, and the exception propagates. If the marker cannot
@@ -379,12 +379,39 @@ def _emit(sink: JSONLSink, discord: DiscordSink, finding: dict,
         raise
 
 
+def _prune_finding_cooldown(pipeline_id: int, finding_cooldown_sec: float) -> None:
+    """
+    Remove expired _emit() cooldown markers (TODO.md #11).
+
+    One marker file per distinct (dst, dport, creds, outcome) key is left in
+    _FINDING_COOLDOWN_DIR (tmpfs); a password-spraying scanner adds one per
+    attempt, so without this the directory only shrinks at restart. Markers
+    older than the cooldown no longer suppress anything, so removing them
+    changes no emission decision (see sinks/cooldown.prune_markers for the
+    locking that makes it safe against concurrent claims).
+
+    The directory is shared by every worker, so only pipeline 0 prunes;
+    the others return at once. Does nothing when the cooldown is disabled.
+
+    Args:
+        pipeline_id:          0-based worker index.
+        finding_cooldown_sec: The cooldown the markers were claimed with.
+    """
+    if finding_cooldown_sec <= 0 or pipeline_id != 0:
+        return
+    removed = prune_markers(_FINDING_COOLDOWN_DIR, finding_cooldown_sec)
+    if removed:
+        logging.debug("pipeline[%d]: pruned %d expired finding-cooldown marker(s)",
+                      pipeline_id, removed)
+
+
 def _maybe_run_periodic(sock: socket.socket, sessions: SessionTable, sink: JSONLSink,
                         discord: DiscordSink, pipeline_id: int, last_expiry: float,
                         expiry_interval: float, finding_cooldown_sec: float = 0) -> float:
     """
-    Run session expiry and log kernel-level packet drops, if expiry_interval
-    has elapsed since the last run.
+    Run session expiry, log kernel-level packet drops and prune expired
+    finding-cooldown markers (pipeline 0 only), if expiry_interval has
+    elapsed since the last run.
 
     Called by _capture_loop() at the top of every pass, whatever happens
     to the frame (TODO.md #19), so rejected or failing frames cannot starve
@@ -430,6 +457,7 @@ def _maybe_run_periodic(sock: socket.socket, sessions: SessionTable, sink: JSONL
         logging.warning(
             "pipeline[%d]: kernel dropped %d packet(s) -- socket recv buffer "
             "full, increase capture.buffer_bytes", pipeline_id, drops)
+    _prune_finding_cooldown(pipeline_id, finding_cooldown_sec)
     return now
 
 
