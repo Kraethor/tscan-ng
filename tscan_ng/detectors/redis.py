@@ -14,14 +14,21 @@ appear as:
     RESP array, username + password (Redis 6.0+ ACL):
         *3\r\n$4\r\nAUTH\r\n$<len>\r\n<username>\r\n$<len>\r\n<password>\r\n
 
+    RESP3 HELLO handshake (Redis 6.0+), AUTH as a keyword argument:
+        *5\r\n$5\r\nHELLO\r\n$1\r\n3\r\n$4\r\nAUTH\r\n$<len>\r\n<user>\r\n$<len>\r\n<pass>\r\n
+        (an optional SETNAME clause may follow AUTH)
+
     Inline command (uncommon, sent by telnet-based clients):
         AUTH <password>\r\n
         AUTH <username> <password>\r\n
+        HELLO <ver> AUTH <username> <password>\r\n
 
 Server responses:
-    +OK\r\n                      → success
-    -ERR invalid password\r\n    → failed (pre-6.0)
-    -WRONGPASS ...\r\n           → failed (6.0+)
+    AUTH:   +OK\r\n                   → success
+            -ERR invalid password\r\n → failed (pre-6.0)
+            -WRONGPASS ...\r\n        → failed (6.0+)
+    HELLO:  a RESP3 map (%<n>...)     → success
+            -NOAUTH / -WRONGPASS ...  → failed
 
 Port handling:
     Gates on _REDIS_PORTS. Sessions on other ports are skipped immediately.
@@ -34,17 +41,16 @@ Finding extras:
     "creds"    — "username:password" or ":password" for display consistency.
 
 Response correlation:
-    Positional, no request ids: the first server_buf line that is exactly
-    "+OK" (success) or begins with "-" (failure) at or after the pending
-    finding's server_buf_floor is taken as the AUTH reply. Replies to
-    commands sent before AUTH ("+OK" to CLIENT SETNAME/SELECT, "-NOAUTH" to a
-    command that needed auth) sit below the floor and are skipped (#14). The
-    matching lives in resolve().
+    Positional, no request ids, keyed from the pending finding's
+    server_buf_floor so replies to commands sent before the credential
+    ("+OK" to CLIENT SETNAME/SELECT, "-NOAUTH" to a command that needed
+    auth) are skipped (#14). For AUTH, the first line that is exactly "+OK"
+    (success) or begins with "-" (failure) is the reply. For HELLO the reply
+    at the floor is the handshake answer: a "-" line is failure, any other
+    (a RESP3 map on success) is success, consumed whole. The matching lives
+    in resolve().
 
 Known limitations:
-    - "HELLO <ver> AUTH <user> <pass>" (the RESP3 handshake, whose reply is
-      not a simple +OK) is not recognised; only a top-level AUTH array or
-      inline AUTH command is.
     - Only the first 4 KB of client_buf is scanned and it is consumed only on
       an AUTH match, so an AUTH arriving after 4 KB of other commands on
       the same connection is not seen.
@@ -80,6 +86,14 @@ _MAX_SCAN_CLIENT = 4096
 # Requires a CRLF terminator. \s+ can also span a line break.
 _AUTH_INLINE_RE = re.compile(
     rb"^AUTH\s+(\S+)(?:\s+(\S+))?\r\n",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Inline RESP3 handshake with credentials: HELLO <ver> AUTH <user> <pass> ...
+# (SETNAME and the rest of the line, if any, are ignored). Group 1 is the
+# username, group 2 the password.
+_HELLO_INLINE_RE = re.compile(
+    rb"^HELLO[ \t]+\S+[ \t]+AUTH[ \t]+(\S+)[ \t]+(\S+)[^\r\n]*\r\n",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -152,23 +166,43 @@ def _parse_resp_array(data: bytes, offset: int):
     return elements, pos
 
 
+def _hello_auth_from_elems(elems: list):
+    """
+    Pull (username, password) out of a parsed RESP `HELLO` array, or None.
+
+    HELLO's form is `HELLO <protover> [AUTH <user> <pass>] [SETNAME <name>]`,
+    so AUTH is an optional keyword followed by two arguments somewhere after
+    the version (TODO.md #24). A HELLO with no AUTH clause carries no
+    credential.
+    """
+    for k in range(1, len(elems) - 2):
+        if elems[k].upper() == b'AUTH':
+            return (elems[k + 1].decode("utf-8", "replace"),
+                    elems[k + 2].decode("utf-8", "replace"))
+    return None
+
+
 def _find_auth_command(data: bytes):
     """
-    Scan *data* for the first Redis AUTH command in RESP or inline format.
+    Scan *data* for the first Redis credential command in RESP or inline form.
 
-    Tries RESP array format first at each position; falls back to the inline
-    regex for clients that use raw text commands. Walks the buffer one byte
-    at a time (bounded by _MAX_SCAN_CLIENT), so an AUTH does not have to be the first
-    command; complete non-AUTH RESP arrays are skipped over whole. An AUTH
-    array with an element count other than 2 or 3 is skipped as a non-match.
+    Recognises both the AUTH command and the RESP3 `HELLO <ver> AUTH <user>
+    <pass>` handshake (TODO.md #24). Tries RESP array format first at each
+    position; falls back to the inline regexes for clients that use raw text
+    commands. Walks the buffer one byte at a time (bounded by
+    _MAX_SCAN_CLIENT), so the command does not have to be first; complete
+    non-matching RESP arrays are skipped over whole. An AUTH array with an
+    element count other than 2 or 3 is skipped as a non-match.
 
     Args:
         data: Raw bytes from the client stream buffer (bounded to _MAX_SCAN_CLIENT).
 
     Returns:
-        (username, password, end_offset) where username is an empty string for
-        password-only AUTH and end_offset points past the last byte of the AUTH
-        command.  Returns (None, None, None) if no AUTH command is found.
+        (username, password, is_hello, end_offset) where username is an empty
+        string for password-only AUTH, is_hello is True when the credential
+        came from a HELLO handshake (its reply is correlated differently),
+        and end_offset points past the last byte of the command. Returns
+        (None, None, None, None) if no credential command is found.
     """
     i = 0
     while i < len(data):
@@ -176,63 +210,129 @@ def _find_auth_command(data: bytes):
             # Attempt to parse a RESP array at this position.
             elems, end = _parse_resp_array(data, i)
             if elems is not None:
-                if len(elems) >= 2 and elems[0].upper() == b'AUTH':
+                if elems and elems[0].upper() == b'AUTH' and len(elems) in (2, 3):
                     if len(elems) == 2:
                         # AUTH <password>
-                        username = ""
-                        password = elems[1].decode("utf-8", "replace")
-                        return username, password, end
-                    elif len(elems) == 3:
-                        # AUTH <username> <password>
-                        username = elems[1].decode("utf-8", "replace")
-                        password = elems[2].decode("utf-8", "replace")
-                        return username, password, end
-                # Valid RESP array but not AUTH — skip past it.
+                        return "", elems[1].decode("utf-8", "replace"), False, end
+                    # AUTH <username> <password>
+                    return (elems[1].decode("utf-8", "replace"),
+                            elems[2].decode("utf-8", "replace"), False, end)
+                if elems and elems[0].upper() == b'HELLO':
+                    creds = _hello_auth_from_elems(elems)
+                    if creds is not None:
+                        return creds[0], creds[1], True, end
+                # Valid RESP array but not a credential command — skip past it.
                 i = end
                 continue
             # Not a valid RESP array at this offset — advance one byte.
             i += 1
             continue
 
-        # Try inline AUTH match at this position.
+        # Try inline AUTH, then inline HELLO AUTH, at this position.
         m = _AUTH_INLINE_RE.match(data, i)
         if m:
             if m.group(2) is not None:
                 # AUTH <username> <password>
-                username = m.group(1).decode("utf-8", "replace")
-                password = m.group(2).decode("utf-8", "replace")
-            else:
-                # AUTH <password>
-                username = ""
-                password = m.group(1).decode("utf-8", "replace")
-            return username, password, m.end()
+                return (m.group(1).decode("utf-8", "replace"),
+                        m.group(2).decode("utf-8", "replace"), False, m.end())
+            # AUTH <password>
+            return "", m.group(1).decode("utf-8", "replace"), False, m.end()
+
+        hm = _HELLO_INLINE_RE.match(data, i)
+        if hm:
+            return (hm.group(1).decode("utf-8", "replace"),
+                    hm.group(2).decode("utf-8", "replace"), True, hm.end())
 
         i += 1
 
-    return None, None, None
+    return None, None, None, None
 
 
-def _find_auth_response(data: bytes, start: int = 0):
+def _skip_resp(data: bytes, i: int, depth: int = 0):
     """
-    Scan *data* from *start* for the first Redis server response to AUTH.
+    Return the offset just past one complete RESP value starting at *i*.
 
-    Looks for '+OK' (success) or any '-<error>' line (failure). resolve()
-    passes the pending finding's server_buf_floor as *start*, so replies to
-    commands sent before AUTH (a '+OK' to CLIENT SETNAME/SELECT, or a
-    '-NOAUTH' to a command that needed auth) are skipped (#14). Lines are
-    split on CRLF only; other reply types ('+PONG', ':1', bulk replies) are
-    skipped line by line.
+    Handles the RESP2 and RESP3 types (simple line, bulk string, array, set,
+    push, and the RESP3 map), recursing into aggregates. Used to consume a
+    HELLO reply whole (its success form is a map), so floors stay valid
+    (TODO.md #24).
+
+    Returns None if the value is not fully buffered yet or is malformed, or
+    if nesting is implausibly deep (a guard against hostile input).
+    """
+    if depth > 32 or i >= len(data):
+        return None
+    tag = data[i:i + 1]
+    eol = data.find(b'\r\n', i)
+    if eol == -1:
+        return None
+    if tag in (b'+', b'-', b':', b'_', b'#', b',', b'('):
+        return eol + 2                                  # simple, line-terminated
+    if tag in (b'$', b'=', b'!'):                       # bulk string/verbatim/error
+        try:
+            n = int(data[i + 1:eol])
+        except ValueError:
+            return None
+        if n < 0:
+            return eol + 2                              # null bulk ($-1)
+        end = eol + 2 + n + 2
+        return end if end <= len(data) else None
+    if tag in (b'*', b'~', b'>', b'%'):                 # array/set/push/map
+        try:
+            n = int(data[i + 1:eol])
+        except ValueError:
+            return None
+        if n < 0:
+            return eol + 2                              # null array
+        count = n * 2 if tag == b'%' else n             # a map has 2 items per entry
+        pos = eol + 2
+        for _ in range(count):
+            pos = _skip_resp(data, pos, depth + 1)
+            if pos is None:
+                return None
+        return pos
+    return None
+
+
+def _find_auth_response(data: bytes, start: int = 0, hello: bool = False):
+    """
+    Scan *data* from *start* for the server's response to AUTH or HELLO.
+
+    resolve() passes the pending finding's server_buf_floor as *start*, so
+    replies to commands sent before the credential (a '+OK' to CLIENT
+    SETNAME/SELECT, or a '-NOAUTH' to a command that needed auth) are skipped
+    (#14).
+
+    For plain AUTH, '+OK' is success and any '-<error>' line is failure;
+    other reply types ('+PONG', ':1', bulk replies) are skipped line by line.
+    For HELLO (TODO.md #24) the reply at the floor is the handshake answer: a
+    '-<error>' line is failure, and any other (a RESP3 map on success) is
+    success, consumed whole with _skip_resp so the floor stays valid.
 
     Args:
         data:  Raw bytes from the server stream buffer.
         start: Offset to begin scanning (the pending finding's floor).
+        hello: True if the pending finding came from a HELLO handshake.
 
     Returns:
         (outcome, end_offset) where outcome is "success" or "failed", and
         end_offset is an absolute offset into *data* past the end of the
-        matched response line. Returns (None, None) if no relevant response
-        is present yet.
+        matched response. Returns (None, None) if no relevant response is
+        present yet.
     """
+    if hello:
+        if start >= len(data):
+            return None, None
+        eol = data.find(b'\r\n', start)
+        if eol == -1:
+            return None, None
+        if data[start:start + 1] == b'-':
+            return "failed", eol + 2
+        end = _skip_resp(data, start)
+        if end is None:
+            return None, None                           # map not fully buffered yet
+        return "success", end
+
     i = start
     while i < len(data):
         eol = data.find(b'\r\n', i)
@@ -278,7 +378,7 @@ def detect_stream(session, ts: float) -> list:
 
     # Bound the scan to avoid O(n) work on very deep buffers.
     client_bytes = bytes(session.client_buf[:_MAX_SCAN_CLIENT])
-    username, password, cmd_end = _find_auth_command(client_bytes)
+    username, password, is_hello, cmd_end = _find_auth_command(client_bytes)
 
     if username is None:
         return []
@@ -298,7 +398,9 @@ def detect_stream(session, ts: float) -> list:
 
     base = base_finding(session, "redis_creds", creds_str, username=username)
 
-    session.add_pending(base, ts_start=ts)
+    # _hello (private, stripped before output) tells resolve() the reply is a
+    # HELLO handshake answer (a RESP3 map on success), not a plain +OK.
+    session.add_pending({**base, "_hello": is_hello}, ts_start=ts)
     del session.client_buf[:cmd_end]
     return []
 
@@ -314,7 +416,8 @@ def resolve(p, session):
     Returns:
         ({"status", "outcome"}, bytes to consume) or None if no reply yet.
     """
-    outcome, rsp_end = _find_auth_response(bytes(session.server_buf), p.server_buf_floor)
+    outcome, rsp_end = _find_auth_response(
+        bytes(session.server_buf), p.server_buf_floor, p.finding.get("_hello", False))
     if outcome is None:
         return None
     return {"status": outcome, "outcome": outcome}, rsp_end

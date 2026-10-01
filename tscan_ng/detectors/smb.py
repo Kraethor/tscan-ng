@@ -53,9 +53,10 @@ Explicit non-goals:
     - NTLMv1 (a bare 24-byte NTChallengeResponse, no extended blob) is not
       extracted, only NTLMv2 (NTProofStr + variable blob). NTLMv1 is
       deprecated and rare on modern clients.
-    - Only the first NTLM auth attempt per TCP connection is tracked;
-      SESSION_SETUP re-authentication later on the same connection is not
-      handled specially (see _find_final_status).
+    - Re-authentication on one connection is handled: each AUTHENTICATE is
+      paired with the CHALLENGE and final response of its own SMB2 SessionId
+      (TODO.md #25), so several SESSION_SETUP exchanges on a connection are
+      tracked independently.
 
 Outcome semantics — a deliberate departure from every other detector here:
     Every other detector's "outcome" answers "was the submitted password
@@ -96,13 +97,14 @@ Finding extras:
                     "3221225581" for 0xC000006D LOGON_FAILURE).
 
 Correlation caveats:
-    - The ServerChallenge is the first NTLM CHALLENGE found in the first
-      4 KB of server_buf; it is removed only when a final status is consumed.
-      An AUTHENTICATE that follows a different (later) CHALLENGE, for example
-      on a re-authentication over the same connection, may be paired with the
-      stale first challenge and produce a hash that will not crack.
-    - The final status is the first non-MORE_PROCESSING SESSION_SETUP
-      response in server_buf, not matched by MessageId/SessionId.
+    - The ServerChallenge is taken from the CHALLENGE whose SMB2 SessionId
+      matches the AUTHENTICATE being processed, and the final status from
+      the SESSION_SETUP response with that same SessionId and the
+      AUTHENTICATE's MessageId (TODO.md #25), so a re-authentication on the
+      same connection no longer pairs an AUTHENTICATE with a stale challenge
+      or reads another exchange's status. The CHALLENGE must be within the
+      first 4 KB of server_buf and is consumed only when the final status
+      is.
     - Encrypted (SMB 3 transform header) or signed-and-sealed traffic hides
       later exchanges, but SESSION_SETUP itself is always in the clear.
 """
@@ -178,7 +180,8 @@ def _iter_smb2_messages(data: bytes):
         data: Raw bytes buffer to scan.
 
     Yields:
-        (header_start, is_response, command, status, payload_start):
+        (header_start, is_response, command, status, message_id,
+         session_id, payload_start):
             header_start:  Byte offset of the SMB2 magic (start of header).
             is_response:    True if SMB2_FLAGS_SERVER_TO_REDIR is set.
             command:        Command code (e.g. _CMD_SESSION_SETUP).
@@ -186,6 +189,13 @@ def _iter_smb2_messages(data: bytes):
                             is_response is True — for requests this is
                             ChannelSequence+Reserved or plain Reserved,
                             not a real status.
+            message_id:     Header's MessageId (offset 24); pairs a request
+                            with its response within a connection.
+            session_id:     Header's SessionId (offset 40). The server
+                            assigns it in the CHALLENGE response and the
+                            client echoes it, so one NTLM exchange's
+                            CHALLENGE, AUTHENTICATE and final response all
+                            share it (TODO.md #25).
             payload_start:  Byte offset immediately after the fixed header,
                             where the command-specific structure begins.
     """
@@ -201,8 +211,10 @@ def _iter_smb2_messages(data: bytes):
         command = struct.unpack_from("<H", data, idx + 12)[0]
         flags = struct.unpack_from("<I", data, idx + 16)[0]
         is_response = bool(flags & _FLAG_SERVER_TO_REDIR)
+        message_id = struct.unpack_from("<Q", data, idx + 24)[0]
+        session_id = struct.unpack_from("<Q", data, idx + 40)[0]
         payload_start = idx + _SMB2_HEADER_LEN
-        yield idx, is_response, command, status, payload_start
+        yield idx, is_response, command, status, message_id, session_id, payload_start
         i = idx + 4  # Advance past this magic; next find() picks up the rest.
 
 
@@ -251,20 +263,27 @@ def _extract_security_buffer(data: bytes, header_start: int,
     return data[buf_start:buf_end], buf_end
 
 
-def _find_ntlm_challenge(data: bytes):
+def _find_ntlm_challenge(data: bytes, session_id: int):
     """
-    Scan *data* (server_buf) for a SESSION_SETUP response carrying an
-    NTLMSSP CHALLENGE message, and extract its ServerChallenge.
+    Scan *data* (server_buf) for the SESSION_SETUP response of session
+    *session_id* carrying an NTLMSSP CHALLENGE, and extract its
+    ServerChallenge.
+
+    Matching the SessionId (rather than taking the first CHALLENGE in the
+    buffer) pairs the challenge with the AUTHENTICATE of the same exchange,
+    so a second authentication over one connection is not hashed against
+    the first exchange's challenge (TODO.md #25).
 
     Args:
-        data: Raw bytes from the server stream buffer (bounded to
-              _MAX_SCAN_SERVER by the caller).
+        data:       Raw bytes from the server stream buffer (bounded to
+                    _MAX_SCAN_SERVER by the caller).
+        session_id: SMB2 SessionId of the AUTHENTICATE to pair with.
 
     Returns:
-        8-byte ServerChallenge, or None if no CHALLENGE message is present.
+        8-byte ServerChallenge, or None if no matching CHALLENGE is present.
     """
-    for header_start, is_response, command, _status, payload_start in _iter_smb2_messages(data):
-        if not is_response or command != _CMD_SESSION_SETUP:
+    for header_start, is_response, command, _status, _msg_id, sess_id, payload_start in _iter_smb2_messages(data):
+        if not is_response or command != _CMD_SESSION_SETUP or sess_id != session_id:
             continue
         sec_buf, _buf_end = _extract_security_buffer(data, header_start, payload_start, True)
         if not sec_buf:
@@ -293,15 +312,17 @@ def _find_ntlm_authenticate(data: bytes):
               _MAX_SCAN_CLIENT by the caller).
 
     Returns:
-        (domain, username, workstation, nt_response, end_offset) if an
+        (domain, username, workstation, nt_response, session_id,
+        message_id, end_offset) if an
         AUTHENTICATE message is found, where nt_response is the raw
         NtChallengeResponse bytes (NTLMv2: 16-byte NTProofStr + variable
         blob) and end_offset points past this entire SMB2 message
         (header + SESSION_SETUP request structure + security buffer, which
-        is always the structure's last field). Returns (None, None, None,
-        None, None) if no AUTHENTICATE message is present.
+        is always the structure's last field); session_id/message_id come
+        from this request's SMB2 header (TODO.md #25). Returns a 7-tuple of
+        None if no AUTHENTICATE message is present.
     """
-    for header_start, is_response, command, _status, payload_start in _iter_smb2_messages(data):
+    for header_start, is_response, command, _status, msg_id, sess_id, payload_start in _iter_smb2_messages(data):
         if is_response or command != _CMD_SESSION_SETUP:
             continue
         sec_buf, buf_end = _extract_security_buffer(data, header_start, payload_start, False)
@@ -351,25 +372,28 @@ def _find_ntlm_authenticate(data: bytes):
             user_raw.decode(enc, "replace"),
             workstation_raw.decode(enc, "replace"),
             nt_response,
+            sess_id,
+            msg_id,
             buf_end,
         )
-    return None, None, None, None, None
+    return None, None, None, None, None, None, None
 
 
-def _find_final_status(data: bytes):
+def _find_final_status(data: bytes, session_id: int, message_id: int):
     """
-    Scan *data* (server_buf) for the first SESSION_SETUP response whose
-    status is not STATUS_MORE_PROCESSING_REQUIRED — i.e. the response to
-    the AUTHENTICATE message, not the earlier CHALLENGE.
+    Scan *data* (server_buf) for the SESSION_SETUP response that answers the
+    AUTHENTICATE of (session_id, message_id): same SessionId and MessageId,
+    and a status other than STATUS_MORE_PROCESSING_REQUIRED (that status is
+    the CHALLENGE, not the final reply).
 
-    Only the first NTLM auth attempt per connection is tracked (see module
-    docstring); a connection that re-authenticates would have multiple
-    CHALLENGE/final-status pairs, and this returns whichever non-more-
-    processing status appears first without trying to match it to a
-    specific AUTHENTICATE.
+    Matching both ids (rather than the first non-more-processing response)
+    keeps a second authentication over the same connection from reading the
+    first exchange's final status (TODO.md #25).
 
     Args:
-        data: Raw bytes from the server stream buffer.
+        data:       Raw bytes from the server stream buffer.
+        session_id: SMB2 SessionId of the AUTHENTICATE being resolved.
+        message_id: SMB2 MessageId of the AUTHENTICATE being resolved.
 
     Returns:
         (status, end_offset) if found, where end_offset points past this
@@ -380,8 +404,10 @@ def _find_final_status(data: bytes):
         for a straightforward failure response). Returns (None, None) if
         not yet present.
     """
-    for header_start, is_response, command, status, payload_start in _iter_smb2_messages(data):
-        if is_response and command == _CMD_SESSION_SETUP and status != _STATUS_MORE_PROCESSING_REQUIRED:
+    for header_start, is_response, command, status, msg_id, sess_id, payload_start in _iter_smb2_messages(data):
+        if (is_response and command == _CMD_SESSION_SETUP
+                and sess_id == session_id and msg_id == message_id
+                and status != _STATUS_MORE_PROCESSING_REQUIRED):
             _sec_buf, buf_end = _extract_security_buffer(data, header_start, payload_start, True)
             return status, (buf_end if buf_end is not None else payload_start + 8)
     return None, None
@@ -411,14 +437,13 @@ def detect_stream(session, ts: float) -> list:
     Only the first 4 KB of server_buf and 8 KB of client_buf are examined for
     the CHALLENGE and AUTHENTICATE respectively.
 
-    Requires both a CHALLENGE already present in session.server_buf and an
-    AUTHENTICATE present in session.client_buf before anything can be
-    detected — unlike every other detector here, the "request" alone
-    (AUTHENTICATE) is not self-contained; it only becomes a usable
-    credential once combined with the ServerChallenge from the earlier
-    CHALLENGE. If the CHALLENGE hasn't been seen yet, this returns
-    immediately without consuming anything, so it naturally retries on the
-    next packet once the CHALLENGE arrives.
+    Requires an AUTHENTICATE in session.client_buf and the CHALLENGE of its
+    own SMB2 SessionId in session.server_buf before anything can be detected
+    — unlike every other detector here, the "request" alone (AUTHENTICATE)
+    is not self-contained; it only becomes a usable credential once combined
+    with that exchange's ServerChallenge (TODO.md #25). If the matching
+    CHALLENGE hasn't been seen yet, this returns without consuming the
+    AUTHENTICATE, so it naturally retries once the CHALLENGE arrives.
 
     Args:
         session: Session object from session.SessionTable.
@@ -431,12 +456,9 @@ def detect_stream(session, ts: float) -> list:
     if not on_ports(session, _SMB_PORTS):
         return []
 
-    challenge = _find_ntlm_challenge(bytes(session.server_buf[:_MAX_SCAN_SERVER]))
-    if challenge is None:
-        return []
-
     client_bytes = bytes(session.client_buf[:_MAX_SCAN_CLIENT])
-    domain, username, workstation, nt_response, req_end = _find_ntlm_authenticate(client_bytes)
+    (domain, username, workstation, nt_response,
+     session_id, message_id, req_end) = _find_ntlm_authenticate(client_bytes)
     if username is None:
         return []
 
@@ -447,6 +469,14 @@ def detect_stream(session, ts: float) -> list:
         # Anonymous/NULL-session or NTLMv1 AUTHENTICATE: consume it so it is
         # not re-parsed on every subsequent packet, and emit nothing.
         del session.client_buf[:req_end]
+        return []
+
+    # Pair with the CHALLENGE of this AUTHENTICATE's own SMB2 session, not
+    # the first one in the buffer (TODO.md #25). If it has not been seen
+    # yet, leave the AUTHENTICATE in client_buf and retry once it arrives.
+    challenge = _find_ntlm_challenge(
+        bytes(session.server_buf[:_MAX_SCAN_SERVER]), session_id)
+    if challenge is None:
         return []
 
     # hashcat -m 5600 / John netntlmv2 line format:
@@ -461,8 +491,11 @@ def detect_stream(session, ts: float) -> list:
                         username=username,
                         workstation=workstation)
 
+    # _session_id/_message_id (private, stripped before output) let
+    # resolve() match the final response of this exact exchange.
     del session.client_buf[:req_end]
-    session.add_pending(base, ts_start=ts)
+    session.add_pending({**base, "_session_id": session_id, "_message_id": message_id},
+                        ts_start=ts)
     return []
 
 
@@ -480,7 +513,9 @@ def resolve(p, session):
     Returns:
         ({"status", "outcome"}, bytes to consume) or None if no reply yet.
     """
-    status, rsp_end = _find_final_status(bytes(session.server_buf))
+    status, rsp_end = _find_final_status(
+        bytes(session.server_buf),
+        p.finding.get("_session_id"), p.finding.get("_message_id"))
     if status is None:
         return None
     return {"status": str(status), "outcome": _outcome(status)}, rsp_end
