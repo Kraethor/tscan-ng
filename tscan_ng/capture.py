@@ -31,6 +31,7 @@ TODO.md #55.
 
 import ctypes, ctypes.util
 from tscan_ng.config import Config
+from tscan_ng import protocols
 
 libpcap_path = ctypes.util.find_library('pcap')
 if not libpcap_path:
@@ -131,16 +132,13 @@ def _build_port_filter(cfg: Config) -> str:
         "(tcp and (port 21 or port 25)) or (udp and (port 161))", or just
         "tcp and (port 21 or port 25)" if no UDP ports are configured.
     """
-    tcp_ports = set()
-    for port_set in (cfg.http_ports, cfg.ftp_ports, cfg.smtp_ports,
-                     cfg.imap_ports, cfg.pop3_ports, cfg.telnet_ports,
-                     cfg.ldap_ports, cfg.redis_ports, cfg.smb_ports,
-                     cfg.irc_ports, cfg.postgres_ports):
-        tcp_ports.update(port_set)
+    tcp_ports, udp_ports = set(), set()
+    for proto in protocols.PROTOCOLS:
+        (udp_ports if proto.transport == "udp" else tcp_ports).update(
+            cfg.ports(proto.name))
     tcp_terms = " or ".join(f"port {p}" for p in sorted(tcp_ports))
     tcp_clause = f"tcp and ({tcp_terms})"
 
-    udp_ports = set(cfg.snmp_ports)
     if not udp_ports:
         return tcp_clause
     udp_terms = " or ".join(f"port {p}" for p in sorted(udp_ports))

@@ -40,35 +40,19 @@ import time
 import logging
 from dataclasses import dataclass, field
 
+from tscan_ng import protocols
+
 # Ports on which servers are expected to initiate the conversation
 # (i.e. the server sends the first data packet — banner, greeting, etc.).
 # When a packet arrives whose *source* port is in this set and whose
 # *destination* port is not, we treat the packet as server->client and
 # store the session from the client's perspective by swapping src/dst.
-# This hardcoded list is only the DEFAULT for SessionTable(); the pipeline
-# passes Config.server_ports (the union of every detector's configured
-# [ports]) instead, so LDAP, Redis, SMB, SNMP, IRC, PostgreSQL and any
-# non-default configured port are covered too. Callers that use the default
-# get this older, partial list (TODO.md #12).
-_SERVER_PORTS: frozenset = frozenset({
-    21,    # FTP control
-    22,    # SSH
-    23,    # Telnet
-    25,    # SMTP
-    80,    # HTTP
-    110,   # POP3
-    143,   # IMAP
-    443,   # HTTPS
-    465,   # SMTPS
-    587,   # SMTP submission
-    993,   # IMAPS
-    995,   # POP3S
-    2121,  # FTP alternate
-    1430,  # IMAP alternate
-    1100,  # POP3 alternate
-    2323,  # Telnet alternate
-    2525,  # SMTP alternate
-})
+# This default is the union of every protocol's default ports (TODO.md #58,
+# one source via tscan_ng.protocols); it is only the DEFAULT for
+# SessionTable(). The pipeline passes Config.server_ports instead, which
+# reflects any non-default configured [ports] too (TODO.md #12).
+_SERVER_PORTS: frozenset = frozenset().union(
+    *(p.default_ports for p in protocols.PROTOCOLS))
 
 
 def _normalize_direction(pkt: dict, server_ports: frozenset = _SERVER_PORTS) -> dict:

@@ -7,6 +7,10 @@ with safe defaults for every setting.
 
 Default config path: /opt/tscan/tscan_ng/config/tscan_ng.conf
 
+The [ports] accessors are driven by the protocol registry in
+tscan_ng.protocols (TODO.md #58): Config.ports(name) and each
+Config.<name>_ports attribute cover exactly the protocols listed there.
+
 Nearly every section and key is optional — missing values fall back to
 defaults. The one exception is capture.iface, which has no usable default:
 Config() raises ValueError (see Config._validate) if it is unset or names
@@ -64,6 +68,8 @@ Config file format:
 
 import configparser
 import os
+
+from tscan_ng import protocols
 
 DEFAULT_CONFIG_PATH = "/opt/tscan/tscan_ng/config/tscan_ng.conf"
 
@@ -352,73 +358,42 @@ class Config:
     # [ports]
     # -------------------------------------------------------------------------
 
-    @property
-    def http_ports(self) -> frozenset:
-        """Frozenset of TCP ports to scan for HTTP Basic Auth credentials."""
-        return self._getports("ports", "http",
-                              fallback=frozenset({80, 8080, 8000, 8008, 8081, 8888, 3128}))
-
-    @property
-    def ftp_ports(self) -> frozenset:
-        """Frozenset of TCP ports to scan for FTP credentials."""
-        return self._getports("ports", "ftp", fallback=frozenset({21, 2121}))
-
-    @property
-    def smtp_ports(self) -> frozenset:
-        """Frozenset of TCP ports to scan for SMTP credentials."""
-        return self._getports("ports", "smtp", fallback=frozenset({25, 465, 587, 2525}))
-
-    @property
-    def imap_ports(self) -> frozenset:
-        """Frozenset of TCP ports to scan for IMAP credentials."""
-        return self._getports("ports", "imap", fallback=frozenset({143, 993, 1430}))
-
-    @property
-    def pop3_ports(self) -> frozenset:
-        """Frozenset of TCP ports to scan for POP3 credentials."""
-        return self._getports("ports", "pop3", fallback=frozenset({110, 995, 1100}))
-
-    @property
-    def telnet_ports(self) -> frozenset:
-        """Frozenset of TCP ports to scan for Telnet credentials."""
-        return self._getports("ports", "telnet", fallback=frozenset({23, 2323}))
-
-    @property
-    def ldap_ports(self) -> frozenset:
-        """Frozenset of TCP ports to scan for LDAP simple-bind credentials."""
-        return self._getports("ports", "ldap", fallback=frozenset({389, 3268}))
-
-    @property
-    def redis_ports(self) -> frozenset:
-        """Frozenset of TCP ports to scan for Redis AUTH credentials."""
-        return self._getports("ports", "redis", fallback=frozenset({6379, 6380}))
-
-    @property
-    def smb_ports(self) -> frozenset:
-        """Frozenset of TCP ports to scan for SMB2/3 NTLMv2 credentials."""
-        return self._getports("ports", "smb", fallback=frozenset({445, 139}))
-
-    @property
-    def snmp_ports(self) -> frozenset:
+    def ports(self, name: str) -> frozenset:
         """
-        Frozenset of UDP ports to scan for SNMPv1/v2c community strings.
+        Frozenset of ports to scan for protocol *name* (a tscan_ng.protocols
+        name, e.g. "http", "snmp").
 
-        Unlike every other port set here, these are UDP ports, not TCP —
-        see capture._build_port_filter, which treats this one property
-        specially to add a "udp and (...)" BPF clause alongside the
-        "tcp and (...)" clause every other detector's ports feed into.
+        Read from [ports] in the config file, falling back to the protocol's
+        default_ports in the registry. SNMP's are UDP ports; every other
+        protocol's are TCP (see tscan_ng.protocols and
+        capture._build_port_filter).
+
+        Args:
+            name: Protocol name from tscan_ng.protocols.BY_NAME.
+
+        Returns:
+            frozenset[int].
+
+        Raises:
+            KeyError: if *name* is not a known protocol.
         """
-        return self._getports("ports", "snmp", fallback=frozenset({161}))
+        proto = protocols.BY_NAME[name]
+        return self._getports("ports", proto.name, fallback=proto.default_ports)
 
-    @property
-    def irc_ports(self) -> frozenset:
-        """Frozenset of TCP ports to scan for IRC NickServ IDENTIFY credentials."""
-        return self._getports("ports", "irc", fallback=frozenset({6667, 6666, 6668, 6669}))
+    def __getattr__(self, attr: str) -> frozenset:
+        """
+        Expose each protocol's ports as cfg.<name>_ports.
 
-    @property
-    def postgres_ports(self) -> frozenset:
-        """Frozenset of TCP ports to scan for PostgreSQL cleartext passwords."""
-        return self._getports("ports", "postgres", fallback=frozenset({5432}))
+        Only <name>_ports attributes are served here; anything else raises
+        AttributeError as usual. __getattr__ runs only for attributes not
+        found normally, so it never shadows a real method or property.
+        """
+        if attr.endswith("_ports"):
+            name = attr[:-len("_ports")]
+            if name in protocols.BY_NAME:
+                return self.ports(name)
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {attr!r}")
 
     # -------------------------------------------------------------------------
     # [discord]
@@ -497,11 +472,8 @@ class Config:
         configured port, are covered (TODO.md #12).
         """
         ports = set()
-        for port_set in (self.http_ports, self.ftp_ports, self.smtp_ports,
-                         self.imap_ports, self.pop3_ports, self.telnet_ports,
-                         self.ldap_ports, self.redis_ports, self.smb_ports,
-                         self.snmp_ports, self.irc_ports, self.postgres_ports):
-            ports.update(port_set)
+        for proto in protocols.PROTOCOLS:
+            ports.update(self.ports(proto.name))
         return frozenset(ports)
 
     def _validate(self):
@@ -587,24 +559,11 @@ class Config:
 
         # --- ports -----------------------------------------------------------
 
-        for proto, ports in [
-            ("http",   self.http_ports),
-            ("ftp",    self.ftp_ports),
-            ("smtp",   self.smtp_ports),
-            ("imap",   self.imap_ports),
-            ("pop3",   self.pop3_ports),
-            ("telnet", self.telnet_ports),
-            ("ldap",   self.ldap_ports),
-            ("redis",  self.redis_ports),
-            ("smb",    self.smb_ports),
-            ("snmp",   self.snmp_ports),
-            ("irc",    self.irc_ports),
-            ("postgres", self.postgres_ports),
-        ]:
-            bad = [p for p in ports if not (0 < p < 65536)]
+        for proto in protocols.PROTOCOLS:
+            bad = [p for p in self.ports(proto.name) if not (0 < p < 65536)]
             if bad:
                 errors.append(
-                    f"ports.{proto} contains out-of-range port numbers: "
+                    f"ports.{proto.name} contains out-of-range port numbers: "
                     + ", ".join(str(p) for p in sorted(bad))
                 )
 
@@ -620,15 +579,7 @@ class Config:
             f"workers={self.workers}, "
             f"session_timeout={self.session_timeout}s, "
             f"expiry_interval={self.expiry_interval}s, "
-            f"ftp_ports={sorted(self.ftp_ports)}, "
-            f"smtp_ports={sorted(self.smtp_ports)}, "
-            f"imap_ports={sorted(self.imap_ports)}, "
-            f"pop3_ports={sorted(self.pop3_ports)}, "
-            f"telnet_ports={sorted(self.telnet_ports)}, "
-            f"ldap_ports={sorted(self.ldap_ports)}, "
-            f"redis_ports={sorted(self.redis_ports)}, "
-            f"smb_ports={sorted(self.smb_ports)}, "
-            f"snmp_ports={sorted(self.snmp_ports)}, "
-            f"irc_ports={sorted(self.irc_ports)}, "
-            f"postgres_ports={sorted(self.postgres_ports)})"
+            + "".join(f"{p.name}_ports={sorted(self.ports(p.name))}, "
+                       for p in protocols.PROTOCOLS).rstrip(", ")
+            + ")"
         )

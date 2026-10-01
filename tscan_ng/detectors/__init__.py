@@ -47,44 +47,41 @@ How detectors are driven (pipeline.py pipeline_worker(), per captured packet):
        already buffered is therefore matched on the same packet. Each
        protocol's response parsing lives only in its resolve() (TODO.md #56).
 
-Registration checklist for a NEW detector (every place in the current tree
-that enumerates the protocols; missing one causes a silent failure):
+Registration checklist for a NEW detector (TODO.md #58 collapsed most of
+the old list into one registry; tests/test_protocol_registry.py fails if a
+place below is missed):
     1. detectors/<proto>.py: module-level `_<PROTO>_PORTS` frozenset (the
-       name configure_all() overwrites), FINDING_TYPES, `detect_stream(session,
+       name configure_all() rebinds), FINDING_TYPES, `detect_stream(session,
        ts)` and `resolve(p, session)` as described above. Use the shared
-       helpers in detectors/common.py rather than copying them (TODO.md #57;
-       tests/test_common_helpers.py): on_ports() for the port gate,
-       base_finding() for the finding dict, and decode_b64() /
-       decode_sasl_plain() / parse_ber_tlv() where they apply.
-    2. This file: import the module, append it to DETECTOR_MODULES, and add a
-       `<proto>._<PROTO>_PORTS = cfg.<proto>_ports` line to configure_all().
-       tests/test_resolve.py checks every module has a resolver.
-    3. config.py: a `<proto>_ports` property (with default fallback), the
-       [ports] example in the module docstring, and the two places that list
-       every protocol (the ports summary tuple list and __repr__).
-    4. config/tscan_ng.conf: a `<proto> = ...` line under [ports].
-    5. capture.py _build_port_filter(): add cfg.<proto>_ports to the TCP port
-       union (or, for a UDP protocol, to the udp clause). Without this the
-       BPF filter drops the traffic before it reaches any detector.
-    6. scripts/watch.py: a colour/label entry (and display branch) for the new
-       finding type; docs (README.md, docs/REBUILD.md, docs/test_reference.md)
-       and tests.
-    Also add cfg.<proto>_ports to the union in Config.server_ports
-    (config.py): it tells SessionTable which side of a flow is the server when
-    a flow is first seen from the server side; without it such flows are
-    stored with client/server swapped. And check whether
-    DiscordSink._SUPPRESSED_OUTCOMES (and _SUPPRESSED_TYPE_OUTCOMES) give the
-    new outcome values the alerting behaviour you want.
+       helpers in detectors/common.py (on_ports(), base_finding(), the
+       decoders) rather than copying them (TODO.md #57).
+    2. tscan_ng/protocols.py: one Protocol(...) row in PROTOCOLS (config
+       name, module, transport, default ports). This alone wires up
+       DETECTOR_MODULES, configure_all() (below), every Config.<name>_ports
+       accessor, Config.server_ports, config validation and __repr__, the
+       capture.py BPF port filter and session.py's default server ports.
+    3. config/tscan_ng.conf and tscan_ng.conf.example: a `<proto> = ...`
+       line under [ports] (optional; the registry default is used if absent).
+    4. scripts/watch.py: a colour/label entry in _PROTO (and a display branch
+       if the finding carries protocol-specific fields); docs (README.md,
+       docs/REBUILD.md, docs/test_reference.md) and tests.
+    Also check whether DiscordSink._SUPPRESSED_OUTCOMES (and
+    _SUPPRESSED_TYPE_OUTCOMES) give the new outcome values the alerting
+    behaviour you want.
+
 """
 
 import logging
 
-from tscan_ng.detectors import (
-    http_basic, ftp, pop3, imap, smtp, telnet, ldap, redis, smb, snmp, irc, postgres,
-)
+import importlib
 
+from tscan_ng import protocols
+
+# One module per protocol, in tscan_ng.protocols.PROTOCOLS order. Imported
+# from the registry so adding a protocol there is enough (TODO.md #58); the
+# names still resolve to tscan_ng.detectors.<module>.
 DETECTOR_MODULES = [
-    http_basic, imap, ftp, smtp, pop3, telnet, ldap, redis, smb, snmp, irc, postgres,
+    importlib.import_module(f"tscan_ng.detectors.{p.module}") for p in protocols.PROTOCOLS
 ]
 
 STREAM_DETECTORS = [mod.detect_stream for mod in DETECTOR_MODULES]
@@ -143,15 +140,5 @@ def configure_all(cfg) -> None:
     Args:
         cfg: Loaded Config object (tscan_ng.config.Config).
     """
-    http_basic._HTTP_PORTS = cfg.http_ports
-    ftp._FTP_PORTS         = cfg.ftp_ports
-    smtp._SMTP_PORTS       = cfg.smtp_ports
-    imap._IMAP_PORTS       = cfg.imap_ports
-    pop3._POP3_PORTS       = cfg.pop3_ports
-    telnet._TELNET_PORTS   = cfg.telnet_ports
-    ldap._LDAP_PORTS       = cfg.ldap_ports
-    redis._REDIS_PORTS     = cfg.redis_ports
-    smb._SMB_PORTS         = cfg.smb_ports
-    snmp._SNMP_PORTS       = cfg.snmp_ports
-    irc._IRC_PORTS         = cfg.irc_ports
-    postgres._POSTGRES_PORTS = cfg.postgres_ports
+    for proto, mod in zip(protocols.PROTOCOLS, DETECTOR_MODULES):
+        setattr(mod, protocols.ports_attr(proto), cfg.ports(proto.name))
