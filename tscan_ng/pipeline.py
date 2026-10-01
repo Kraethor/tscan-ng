@@ -386,11 +386,9 @@ def _maybe_run_periodic(sock: socket.socket, sessions: SessionTable, sink: JSONL
     Run session expiry and log kernel-level packet drops, if expiry_interval
     has elapsed since the last run.
 
-    Called from both the recv() timeout branch (quiet periods) and after
-    every successfully processed packet, mirroring the old worker's expiry
-    timing exactly. (It is not called for packets parse_basic() rejects or
-    that raise during processing, so it is skipped for those.) Uses
-    time.monotonic() for the interval; returns early with no work
+    Called by _capture_loop() at the top of every pass, whatever happens
+    to the frame (TODO.md #19), so rejected or failing frames cannot starve
+    it. Uses time.monotonic() for the interval; returns early with no work
     otherwise.
 
     Also polls PACKET_STATISTICS for drops the kernel made before this
@@ -433,6 +431,94 @@ def _maybe_run_periodic(sock: socket.socket, sessions: SessionTable, sink: JSONL
             "pipeline[%d]: kernel dropped %d packet(s) -- socket recv buffer "
             "full, increase capture.buffer_bytes", pipeline_id, drops)
     return now
+
+
+def _capture_loop(sock, cfg, sessions: SessionTable, sink: JSONLSink, discord: DiscordSink,
+                  pipeline_id: int, finding_cooldown_sec: float, stop) -> str | None:
+    """
+    Receive and process packets until *stop* is set or something goes wrong.
+
+    Split out of pipeline_worker() so it can be driven by tests with a fake
+    socket. Per frame: parse_basic() -> SessionTable -> detectors ->
+    resolve_pending(), emitting every finding through _emit(), plus periodic
+    maintenance (_maybe_run_periodic()).
+
+    Args:
+        sock:                 Socket-like object with recv() and getsockopt().
+        cfg:                  Anything with .snaplen and .expiry_interval.
+        sessions, sink, discord, pipeline_id, finding_cooldown_sec:
+                              As in pipeline_worker().
+        stop:                 Flag with is_set(), set by the stop handlers.
+
+    Returns:
+        None on a normal stop, or a reason string when this process must exit
+        abnormally (recv() error, or 100 consecutive processing failures).
+    """
+    last_expiry = time.monotonic()
+    # Consecutive failure counter — reset to 0 on every successfully
+    # processed packet; hitting 100 (a persistent bug rather than one bad
+    # packet) makes this process give up instead of spinning on logged errors.
+    fail_count = 0
+    while not stop.is_set():
+        # Maintenance is checked on every pass, before the frame is even
+        # read, so no kind of traffic can starve it (TODO.md #19): it used to
+        # run only after a successfully processed frame or an idle 1 s
+        # timeout, so a steady stream of frames that parse_basic() rejects or
+        # that raise below stopped sessions from ever expiring. It returns
+        # at once unless expiry_interval has passed. A failure here is
+        # logged and retried next interval rather than ending the worker.
+        try:
+            last_expiry = _maybe_run_periodic(
+                sock, sessions, sink, discord, pipeline_id, last_expiry, cfg.expiry_interval,
+                finding_cooldown_sec)
+        except Exception:
+            logging.exception("pipeline[%d]: periodic maintenance failed", pipeline_id)
+            last_expiry = time.monotonic()
+
+        try:
+            frame = sock.recv(cfg.snaplen)
+        except socket.timeout:
+            continue  # idle link; maintenance runs at the top of the loop
+        except OSError as exc:
+            logging.exception("pipeline[%d]: recv error, exiting", pipeline_id)
+            return f"pipeline[{pipeline_id}] pid={os.getpid()} exiting: recv() error ({exc}) -- capture interface may be down"
+
+        ts = time.time()
+        pkt = parse_basic(DLT_EN10MB, frame)
+        if not pkt:
+            # Expected for non-IP or non-TCP/UDP traffic that still matched
+            # the BPF filter's link-layer scope (e.g. ARP is never seen
+            # here since the auto-built filter only admits tcp/udp on the
+            # configured ports, but an explicit capture.bpf_filter may let
+            # anything through, so this stays as a cheap guard rather than
+            # assuming the filter is infallible).
+            continue
+
+        try:
+            session, closed = sessions.add_packet(pkt, ts)
+            for f in closed:
+                _emit(sink, discord, {"ts": f["ts_start"], **f}, finding_cooldown_sec)
+            # Detectors park credentials as pending (they return nothing
+            # today; the loop keeps the interface open); resolve_pending()
+            # then matches any reply already buffered, on this same packet.
+            for det in STREAM_DETECTORS:
+                for f in det(session, ts):
+                    _emit(sink, discord, {"ts": ts, **f}, finding_cooldown_sec)
+            if session.pending:
+                for resolved in resolve_pending(session, ts):
+                    _emit(sink, discord, _stamp_resolved(resolved, ts),
+                          finding_cooldown_sec)
+            fail_count = 0  # Reset on success
+        except Exception:
+            logging.exception(
+                "pipeline[%d]: unhandled exception processing packet", pipeline_id)
+            fail_count += 1
+            if fail_count >= 100:
+                logging.error("pipeline[%d]: %d consecutive failures, exiting",
+                              pipeline_id, fail_count)
+                return f"pipeline[{pipeline_id}] pid={os.getpid()} exiting: {fail_count} consecutive processing failures"
+
+    return None
 
 
 def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
@@ -514,15 +600,10 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
         max_sessions=cfg.max_sessions,
         server_ports=cfg.server_ports,
     )
-    last_expiry = time.monotonic()
     logging.info("pipeline started, iface=%s filter=%r", cfg.iface, bpf_filter)
 
-    # Consecutive failure counter — reset to 0 on every successfully
-    # processed packet; hitting 100 (a persistent bug rather than one bad
-    # packet) makes this process give up instead of spinning on logged errors.
-    fail_count = 0
     stop = _install_worker_stop_handlers()
-    # Set to a reason string on abnormal exit, checked after the loop to
+    # _capture_loop() returns a reason string on abnormal exit, checked here to
     # decide this process's exit code. A worker dying is only ever supposed
     # to happen via KeyboardInterrupt/terminate() from main() during
     # shutdown (SIGTERM/SIGINT, see _install_worker_stop_handlers); recv()
@@ -532,59 +613,8 @@ def pipeline_worker(pipeline_id: int, cfg: Config, group_id: int):
     # from a clean shutdown to both systemd (exit code 0 never triggers
     # Restart=on-failure) and to anyone watching (nothing said why). Both
     # get an exit code and a Discord alert now.
-    abnormal_exit = None
-    while not stop.is_set():
-        try:
-            frame = sock.recv(cfg.snaplen)
-        except socket.timeout:
-            # No packets for 1 second. Run session expiry and loop.
-            last_expiry = _maybe_run_periodic(
-                sock, sessions, sink, discord, pipeline_id, last_expiry, cfg.expiry_interval,
-                finding_cooldown_sec)
-            continue
-        except OSError as exc:
-            logging.exception("pipeline[%d]: recv error, exiting", pipeline_id)
-            abnormal_exit = f"pipeline[{pipeline_id}] pid={os.getpid()} exiting: recv() error ({exc}) -- capture interface may be down"
-            break
-
-        ts = time.time()
-        pkt = parse_basic(DLT_EN10MB, frame)
-        if not pkt:
-            # Expected for non-IP or non-TCP/UDP traffic that still matched
-            # the BPF filter's link-layer scope (e.g. ARP is never seen
-            # here since the auto-built filter only admits tcp/udp on the
-            # configured ports, but an explicit capture.bpf_filter may let
-            # anything through, so this stays as a cheap guard rather than
-            # assuming the filter is infallible).
-            continue
-
-        try:
-            session, closed = sessions.add_packet(pkt, ts)
-            for f in closed:
-                _emit(sink, discord, {"ts": f["ts_start"], **f}, finding_cooldown_sec)
-            # Detectors park credentials as pending (they return nothing
-            # today; the loop keeps the interface open); resolve_pending()
-            # then matches any reply already buffered, on this same packet.
-            for det in STREAM_DETECTORS:
-                for f in det(session, ts):
-                    _emit(sink, discord, {"ts": ts, **f}, finding_cooldown_sec)
-            if session.pending:
-                for resolved in resolve_pending(session, ts):
-                    _emit(sink, discord, _stamp_resolved(resolved, ts),
-                          finding_cooldown_sec)
-            last_expiry = _maybe_run_periodic(
-                sock, sessions, sink, discord, pipeline_id, last_expiry, cfg.expiry_interval,
-                finding_cooldown_sec)
-            fail_count = 0  # Reset on success
-        except Exception:
-            logging.exception(
-                "pipeline[%d]: unhandled exception processing packet", pipeline_id)
-            fail_count += 1
-            if fail_count >= 100:
-                logging.error("pipeline[%d]: %d consecutive failures, exiting",
-                              pipeline_id, fail_count)
-                abnormal_exit = f"pipeline[{pipeline_id}] pid={os.getpid()} exiting: {fail_count} consecutive processing failures"
-                break
+    abnormal_exit = _capture_loop(sock, cfg, sessions, sink, discord, pipeline_id,
+                                  finding_cooldown_sec, stop)
 
     if stop.is_set():
         logging.info("pipeline[%d]: stop signal received, flushing sessions", pipeline_id)
