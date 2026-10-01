@@ -158,7 +158,8 @@ def _close_finding(p: "PendingFinding", last_ts: float) -> dict:
 def _make_filter(src: str, dst: str, sport: int, dport: int) -> str:
     """
     Build a Wireshark/tcpdump display filter string for this flow.
-    Every detector stores it as the finding's "filter" field. It always says
+    detectors.common.base_finding() stores it as every finding's "filter"
+    field. It always says
     "tcp port", which is wrong for SNMP (UDP); see TODO.md #28.
 
     The resulting filter can be used directly with tcpdump -r or as a

@@ -80,7 +80,7 @@ Known limitations:
 """
 
 import struct
-from tscan_ng.session import _make_filter
+from tscan_ng.detectors.common import base_finding, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("postgres_creds",)
@@ -371,7 +371,7 @@ def detect_stream(session, ts: float) -> list:
         Always an empty list; findings are registered on the session as
         pending and emitted by tscan_ng.resolve once resolved.
     """
-    if session.dport not in _POSTGRES_PORTS and session.sport not in _POSTGRES_PORTS:
+    if not on_ports(session, _POSTGRES_PORTS):
         return []
 
     server_bytes_bounded = bytes(session.server_buf[:_MAX_SCAN_SERVER])
@@ -392,18 +392,7 @@ def detect_stream(session, ts: float) -> list:
     user = _find_startup_user(client_bytes)
     creds_str = f"{user}:{password}" if user else f":{password}"
 
-    base = {
-        "type":       "postgres_creds",
-        "session_id": session.session_id,
-        "src":        session.src,
-        "dst":        session.dst,
-        "sport":      session.sport,
-        "dport":      session.dport,
-        "user":       user,
-        "creds":      creds_str,
-        "filter":     _make_filter(session.src, session.dst,
-                                   session.sport, session.dport),
-    }
+    base = base_finding(session, "postgres_creds", creds_str, user=user)
 
     del session.client_buf[:req_end]
     session.add_pending(base, ts_start=ts)

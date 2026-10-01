@@ -58,7 +58,7 @@ Known limitations:
 
 import logging
 import re
-from tscan_ng.session import _make_filter
+from tscan_ng.detectors.common import base_finding, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("pop3_creds",)
@@ -141,7 +141,7 @@ def detect_stream(session, ts: float) -> list:
         pending and emitted by tscan_ng.resolve once resolved.
     """
     # Skip sessions that are not on a known POP3 port.
-    if session.dport not in _POP3_PORTS and session.sport not in _POP3_PORTS:
+    if not on_ports(session, _POP3_PORTS):
         return []
 
     # Cap the scan to _MAX_SCAN_CLIENT bytes to bound per-packet CPU cost.
@@ -168,17 +168,7 @@ def detect_stream(session, ts: float) -> list:
         del session.client_buf[:pass_match.end()]
         return []
 
-    base = {
-        "type":       "pop3_creds",
-        "session_id": session.session_id,
-        "src":        session.src,
-        "dst":        session.dst,
-        "sport":      session.sport,
-        "dport":      session.dport,
-        "creds":      f"{user}:{passwd}",
-        "filter":     _make_filter(session.src, session.dst,
-                                   session.sport, session.dport),
-    }
+    base = base_finding(session, "pop3_creds", f"{user}:{passwd}")
 
     session.add_pending(base, ts_start=ts)
     del session.client_buf[:pass_match.end()]

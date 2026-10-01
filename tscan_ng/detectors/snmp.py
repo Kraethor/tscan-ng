@@ -38,11 +38,10 @@ waits for a Response-PDU with a matching request-id, purely to populate
 "outcome" for consistency with the rest of the codebase (see below for why
 that's a much weaker signal here than elsewhere).
 
-BER parsing is a minimal, self-contained duplicate of the same technique
-ldap.py uses for its own BER/ASN.1 message (short-form and definite long-
-form lengths only; SNMP doesn't use indefinite form or multi-byte tags
-either) -- kept independent rather than imported, matching every other
-detector module's self-contained style in this package.
+BER parsing uses the minimal reader in detectors/common.py
+(parse_ber_len/parse_ber_tlv, shared with ldap.py since TODO.md #57):
+short-form and definite long-form lengths only; SNMP doesn't use indefinite
+form or multi-byte tags either.
 
 Outcome semantics -- weaker than every other detector here:
     SNMPv1/v2c's PDU error-status field (RFC 1157/1901) has no
@@ -110,7 +109,7 @@ Known limitations:
     - A datagram whose community is empty is dropped silently (no log).
 """
 
-from tscan_ng.session import _make_filter
+from tscan_ng.detectors.common import base_finding, on_ports, parse_ber_len, parse_ber_tlv
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("snmp_creds",)
@@ -148,66 +147,6 @@ _REQUEST_PDU_NAMES = {
 # different message structure; it would not parse as the SEQUENCE layout used
 # here and would be reported by its raw number only if it did.)
 _VERSION_NAMES = {0: "v1", 1: "v2c"}
-
-
-def _parse_ber_len(data: bytes, offset: int):
-    """
-    Parse a BER-encoded length value starting at *offset* in *data*.
-
-    Supports short form and definite long form only, identical to
-    ldap._parse_ber_len -- see that module for the full rationale.
-
-    Args:
-        data:   Raw bytes buffer containing the BER stream.
-        offset: Byte position of the first length byte.
-
-    Returns:
-        (length, new_offset), or (None, None) on error or truncation.
-    """
-    if offset >= len(data):
-        return None, None
-    first = data[offset]
-    offset += 1
-    if first & 0x80 == 0:
-        return first, offset
-    num_bytes = first & 0x7F
-    if num_bytes == 0 or num_bytes > 4 or offset + num_bytes > len(data):
-        return None, None
-    length = 0
-    for _ in range(num_bytes):
-        length = (length << 8) | data[offset]
-        offset += 1
-    return length, offset
-
-
-def _parse_ber_tlv(data: bytes, offset: int):
-    """
-    Parse one BER TLV (tag-length-value) triple at *offset* in *data*.
-
-    Identical approach to ldap._parse_ber_tlv -- see that module for the
-    full rationale (multi-byte tags not supported; not needed for SNMP).
-
-    Args:
-        data:   Raw bytes buffer containing the BER stream.
-        offset: Byte position of the tag byte.
-
-    Returns:
-        (tag, value_bytes, new_offset), or (None, None, None) on error or
-        truncation (value extends beyond available bytes).
-    """
-    if offset >= len(data):
-        return None, None, None
-    tag = data[offset]
-    offset += 1
-    if (tag & 0x1F) == 0x1F:
-        return None, None, None
-    length, offset = _parse_ber_len(data, offset)
-    if length is None:
-        return None, None, None
-    if offset + length > len(data):
-        return None, None, None
-    value = data[offset:offset + length]
-    return tag, value, offset + length
 
 
 def _parse_ber_integer(value: bytes) -> int:
@@ -251,23 +190,23 @@ def _find_snmp_request(data: bytes):
             i += 1
             continue
 
-        outer_tag, msg_value, msg_end = _parse_ber_tlv(data, i)
+        outer_tag, msg_value, msg_end = parse_ber_tlv(data, i)
         if outer_tag is None:
             break  # Truncated -- wait for more data.
 
         off = 0
-        ver_tag, ver_val, off = _parse_ber_tlv(msg_value, off)
+        ver_tag, ver_val, off = parse_ber_tlv(msg_value, off)
         if ver_tag != _TAG_INTEGER:
             i += 1
             continue
 
-        comm_tag, comm_val, off = _parse_ber_tlv(msg_value, off)
+        comm_tag, comm_val, off = parse_ber_tlv(msg_value, off)
         if comm_tag != _TAG_OCTET:
             i += 1
             continue
 
         # The PDU is the third element of the message; its tag selects the type.
-        pdu_tag, pdu_val, _pdu_end = _parse_ber_tlv(msg_value, off)
+        pdu_tag, pdu_val, _pdu_end = parse_ber_tlv(msg_value, off)
         pdu_name = _REQUEST_PDU_NAMES.get(pdu_tag)
         if pdu_name is None:
             # Not a request PDU we track (Response-PDU, Trap, etc.) -- skip.
@@ -275,7 +214,7 @@ def _find_snmp_request(data: bytes):
             continue
 
         # First field of every PDU body is request-id INTEGER.
-        rid_tag, rid_val, _ = _parse_ber_tlv(pdu_val, 0)
+        rid_tag, rid_val, _ = parse_ber_tlv(pdu_val, 0)
         if rid_tag != _TAG_INTEGER:
             i += 1
             continue
@@ -312,28 +251,28 @@ def _find_snmp_response(data: bytes, request_id: int):
             i += 1
             continue
 
-        outer_tag, msg_value, msg_end = _parse_ber_tlv(data, i)
+        outer_tag, msg_value, msg_end = parse_ber_tlv(data, i)
         if outer_tag is None:
             break
 
         off = 0
-        ver_tag, _ver_val, off = _parse_ber_tlv(msg_value, off)
+        ver_tag, _ver_val, off = parse_ber_tlv(msg_value, off)
         if ver_tag != _TAG_INTEGER:
             i += 1
             continue
 
-        comm_tag, _comm_val, off = _parse_ber_tlv(msg_value, off)
+        comm_tag, _comm_val, off = parse_ber_tlv(msg_value, off)
         if comm_tag != _TAG_OCTET:
             i += 1
             continue
 
-        pdu_tag, pdu_val, _ = _parse_ber_tlv(msg_value, off)
+        pdu_tag, pdu_val, _ = parse_ber_tlv(msg_value, off)
         if pdu_tag != _PDU_GET_RESPONSE:
             i = msg_end
             continue
 
         poff = 0
-        rid_tag, rid_val, poff = _parse_ber_tlv(pdu_val, poff)
+        rid_tag, rid_val, poff = parse_ber_tlv(pdu_val, poff)
         if rid_tag != _TAG_INTEGER:
             i = msg_end
             continue
@@ -342,7 +281,7 @@ def _find_snmp_response(data: bytes, request_id: int):
             continue
 
         # Second field is error-status INTEGER (poff is now just past request-id).
-        err_tag, err_val, _ = _parse_ber_tlv(pdu_val, poff)
+        err_tag, err_val, _ = parse_ber_tlv(pdu_val, poff)
         if err_tag != _TAG_INTEGER:
             i = msg_end
             continue
@@ -393,7 +332,7 @@ def detect_stream(session, ts: float) -> list:
         Always an empty list; findings are registered on the session as
         pending and emitted by tscan_ng.resolve once resolved.
     """
-    if session.dport not in _SNMP_PORTS and session.sport not in _SNMP_PORTS:
+    if not on_ports(session, _SNMP_PORTS):
         return []
 
     client_bytes = bytes(session.client_buf[:_MAX_SCAN_CLIENT])
@@ -408,19 +347,9 @@ def detect_stream(session, ts: float) -> list:
         del session.client_buf[:req_end]
         return []
 
-    base = {
-        "type":       "snmp_creds",
-        "session_id": session.session_id,
-        "src":        session.src,
-        "dst":        session.dst,
-        "sport":      session.sport,
-        "dport":      session.dport,
-        "version":    _VERSION_NAMES.get(version, str(version)),
-        "pdu_type":   pdu_name,
-        "creds":      community,
-        "filter":     _make_filter(session.src, session.dst,
-                                   session.sport, session.dport),
-    }
+    base = base_finding(session, "snmp_creds", community,
+                        version=_VERSION_NAMES.get(version, str(version)),
+                        pdu_type=pdu_name)
 
     del session.client_buf[:req_end]
     # _request_id is private (stripped before output by tscan_ng.resolve and

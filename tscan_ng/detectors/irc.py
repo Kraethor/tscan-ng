@@ -66,7 +66,7 @@ Known limitations:
 """
 
 import re
-from tscan_ng.session import _make_filter
+from tscan_ng.detectors.common import base_finding, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("irc_creds",)
@@ -213,7 +213,7 @@ def detect_stream(session, ts: float) -> list:
         Always an empty list; findings are registered on the session as
         pending and emitted by tscan_ng.resolve once resolved.
     """
-    if session.dport not in _IRC_PORTS and session.sport not in _IRC_PORTS:
+    if not on_ports(session, _IRC_PORTS):
         return []
 
     client_bytes = bytes(session.client_buf[:_MAX_SCAN_CLIENT])
@@ -230,18 +230,7 @@ def detect_stream(session, ts: float) -> list:
 
     creds_str = f"{nick}:{password}" if nick else f":{password}"
 
-    base = {
-        "type":       "irc_creds",
-        "session_id": session.session_id,
-        "src":        session.src,
-        "dst":        session.dst,
-        "sport":      session.sport,
-        "dport":      session.dport,
-        "nick":       nick,
-        "creds":      creds_str,
-        "filter":     _make_filter(session.src, session.dst,
-                                   session.sport, session.dport),
-    }
+    base = base_finding(session, "irc_creds", creds_str, nick=nick)
 
     del session.client_buf[:req_end]
     session.add_pending(base, ts_start=ts)

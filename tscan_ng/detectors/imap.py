@@ -64,10 +64,9 @@ Known limitations:
       that port is actually cleartext.
 """
 
-import base64
 import logging
 import re
-from tscan_ng.session import _make_filter
+from tscan_ng.detectors.common import base_finding, decode_sasl_plain, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("imap_creds",)
@@ -172,36 +171,6 @@ def _outcome(status: str) -> str:
     return "unknown"
 
 
-def _decode_plain(blob: bytes) -> tuple | None:
-    """
-    Decode a SASL PLAIN base64 blob into (username, password).
-
-    SASL PLAIN format after base64 decode: \x00username\x00password
-    or: authzid\x00username\x00password (with optional authorization id).
-    Same mechanism and wire format as SMTP/POP3 AUTH PLAIN — see
-    detectors/smtp.py's _decode_plain for the shared rationale. This is a
-    byte-for-byte copy of smtp._decode_plain (each detector is kept
-    self-contained). Only two- or three-field payloads are accepted; the
-    authorization id in the three-field form is discarded.
-
-    Args:
-        blob: Raw base64 encoded bytes.
-
-    Returns:
-        (username, password) tuple, or None if decoding fails.
-    """
-    try:
-        decoded = base64.b64decode(blob)
-        parts = decoded.split(b"\x00")
-        if len(parts) == 3:
-            return parts[1].decode("utf-8", "replace"), parts[2].decode("utf-8", "replace")
-        elif len(parts) == 2:
-            return parts[0].decode("utf-8", "replace"), parts[1].decode("utf-8", "replace")
-    except Exception:
-        pass
-    return None
-
-
 def detect_stream(session, ts: float) -> list[dict]:
     """
     Stream-aware IMAP credential detector — LOGIN and AUTHENTICATE PLAIN.
@@ -239,7 +208,7 @@ def detect_stream(session, ts: float) -> list[dict]:
         pending and emitted by tscan_ng.resolve once resolved.
     """
     # Skip sessions that are not on a known IMAP port.
-    if session.dport not in _IMAP_PORTS and session.sport not in _IMAP_PORTS:
+    if not on_ports(session, _IMAP_PORTS):
         return []
 
     # Cap the scan to _MAX_SCAN_CLIENT bytes to bound per-packet CPU cost.
@@ -279,20 +248,11 @@ def detect_stream(session, ts: float) -> list[dict]:
                 session.session_id)
             continue
 
-        session.add_pending({
-            "type":       "imap_creds",
-            "session_id": session.session_id,
-            "src":        session.src,
-            "dst":        session.dst,
-            "sport":      session.sport,
-            "dport":      session.dport,
-            "tag":        tag,  # Pairs the request with its response in resolve()
-                                # (unlike snmp's "_request_id" it is NOT
-                                # underscore-prefixed, so it is also emitted.)
-            "creds":      f"{user}:{passwd}",
-            "filter":     _make_filter(session.src, session.dst,
-                                       session.sport, session.dport),
-        }, ts_start=ts)
+        # "tag" pairs the request with its response in resolve(). Unlike
+        # snmp's "_request_id" it is NOT underscore-prefixed, so it is also
+        # emitted.
+        base = base_finding(session, "imap_creds", f"{user}:{passwd}", tag=tag)
+        session.add_pending(base, ts_start=ts)
 
     if login_last_match is not None:
         consume_end = login_last_match.end()
@@ -308,7 +268,7 @@ def detect_stream(session, ts: float) -> list[dict]:
         inline_blob = auth_match.group(2)
 
         if inline_blob:
-            result = _decode_plain(inline_blob)
+            result = decode_sasl_plain(inline_blob)
             auth_end = auth_match.end()
         else:
             # No inline response — credentials are on the next line, sent
@@ -318,7 +278,7 @@ def detect_stream(session, ts: float) -> list[dict]:
             # call, the same way detectors/smtp.py's AUTH LOGIN handling
             # waits for both base64 lines before consuming anything.
             next_line = _BASE64_LINE_RE.search(scan, auth_match.end())
-            result = _decode_plain(next_line.group(1)) if next_line else None
+            result = decode_sasl_plain(next_line.group(1)) if next_line else None
             auth_end = next_line.end() if next_line else None
 
         # auth_end is None only when the continuation line has not arrived yet.
@@ -328,19 +288,9 @@ def detect_stream(session, ts: float) -> list[dict]:
             if result is not None:
                 user, passwd = result
                 if user or passwd:
-                    session.add_pending({
-                        "type":       "imap_creds",
-                        "mechanism":  "AUTHENTICATE_PLAIN",
-                        "session_id": session.session_id,
-                        "src":        session.src,
-                        "dst":        session.dst,
-                        "sport":      session.sport,
-                        "dport":      session.dport,
-                        "tag":        tag,
-                        "creds":      f"{user}:{passwd}",
-                        "filter":     _make_filter(session.src, session.dst,
-                                                   session.sport, session.dport),
-                    }, ts_start=ts)
+                    base = base_finding(session, "imap_creds", f"{user}:{passwd}",
+                                        mechanism="AUTHENTICATE_PLAIN", tag=tag)
+                    session.add_pending(base, ts_start=ts)
                 else:
                     logging.debug(
                         "imap: session %s: AUTHENTICATE PLAIN decoded empty credentials",

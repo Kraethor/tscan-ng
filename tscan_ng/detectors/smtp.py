@@ -74,9 +74,8 @@ Known limitations:
 
 import logging
 import re
-import base64
 from tscan_ng.detectors.common import decode_b64 as _decode_b64
-from tscan_ng.session import _make_filter
+from tscan_ng.detectors.common import base_finding, decode_sasl_plain, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("smtp_creds",)
@@ -161,34 +160,6 @@ def _outcome(code: bytes) -> str:
     return "unknown"
 
 
-def _decode_plain(blob: bytes) -> tuple | None:
-    """
-    Decode an AUTH PLAIN base64 blob into (username, password).
-
-    AUTH PLAIN format after base64 decode: \x00username\x00password
-    or: authzid\x00username\x00password (with optional authorization id)
-    (RFC 4616: authzid NUL authcid NUL passwd). The authzid is discarded.
-    imap.py carries an identical copy of this function.
-
-    Args:
-        blob: Raw base64 encoded bytes.
-
-    Returns:
-        (username, password) tuple, or None if decoding fails or the decoded
-        payload does not split into two or three NUL-separated fields.
-    """
-    try:
-        decoded = base64.b64decode(blob)
-        parts = decoded.split(b"\x00")
-        if len(parts) == 3:
-            return parts[1].decode("utf-8", "replace"), parts[2].decode("utf-8", "replace")
-        elif len(parts) == 2:
-            return parts[0].decode("utf-8", "replace"), parts[1].decode("utf-8", "replace")
-    except Exception:
-        pass
-    return None
-
-
 def detect_stream(session, ts: float) -> list:
     """
     Stream-aware SMTP AUTH credential detector.
@@ -220,7 +191,7 @@ def detect_stream(session, ts: float) -> list:
         pending and emitted by tscan_ng.resolve once resolved.
     """
     # Skip sessions that are not on a known SMTP port.
-    if session.sport not in _SMTP_PORTS and session.dport not in _SMTP_PORTS:
+    if not on_ports(session, _SMTP_PORTS):
         return []
 
     # Cap the scan to _MAX_SCAN_CLIENT bytes to bound per-packet CPU cost.
@@ -245,18 +216,7 @@ def detect_stream(session, ts: float) -> list:
             user   = _decode_b64(b64_matches[0].group(1))
             passwd = _decode_b64(b64_matches[1].group(1))
 
-            base = {
-                "type":       "smtp_creds",
-                "mechanism":  "LOGIN",
-                "session_id": session.session_id,
-                "src":        session.src,
-                "dst":        session.dst,
-                "sport":      session.sport,
-                "dport":      session.dport,
-                "creds":      f"{user}:{passwd}",
-                "filter":     _make_filter(session.src, session.dst,
-                                           session.sport, session.dport),
-            }
+            base = base_finding(session, "smtp_creds", f"{user}:{passwd}", mechanism="LOGIN")
 
             session.add_pending(base, ts_start=ts)
 
@@ -279,16 +239,16 @@ def detect_stream(session, ts: float) -> list:
 
         if blob:
             # Credentials inline on the AUTH PLAIN line
-            result = _decode_plain(blob)
+            result = decode_sasl_plain(blob)
             end = plain_match.end()
         else:
             # Credentials on the next line (after server 334 challenge)
             next_line = _BASE64_LINE_RE.search(client_bytes, plain_match.end())
-            result = _decode_plain(next_line.group(1)) if next_line else None
+            result = decode_sasl_plain(next_line.group(1)) if next_line else None
             end = next_line.end() if next_line else plain_match.end()
 
         # Use `is not None` rather than truthiness: a valid result is always a
-        # 2-tuple, but an explicit None check is more robust if _decode_plain()
+        # 2-tuple, but an explicit None check is more robust if decode_sasl_plain()
         # is ever extended to return other falsy values. (When the inline blob
         # exists but fails to decode, result is None and nothing is consumed,
         # so the same line is re-examined on every subsequent packet.)
@@ -302,18 +262,7 @@ def detect_stream(session, ts: float) -> list:
                     session.session_id)
                 del session.client_buf[:end]
                 return []
-            base = {
-                "type":       "smtp_creds",
-                "mechanism":  "PLAIN",
-                "session_id": session.session_id,
-                "src":        session.src,
-                "dst":        session.dst,
-                "sport":      session.sport,
-                "dport":      session.dport,
-                "creds":      f"{user}:{passwd}",
-                "filter":     _make_filter(session.src, session.dst,
-                                           session.sport, session.dport),
-            }
+            base = base_finding(session, "smtp_creds", f"{user}:{passwd}", mechanism="PLAIN")
 
             session.add_pending(base, ts_start=ts)
 

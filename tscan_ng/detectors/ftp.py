@@ -62,7 +62,7 @@ Known limitations:
 
 import logging
 import re
-from tscan_ng.session import _make_filter
+from tscan_ng.detectors.common import base_finding, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("ftp_creds", "ftp_anonymous")
@@ -157,7 +157,7 @@ def detect_stream(session, ts: float) -> list:
     """
     # Skip sessions that are not on a known FTP control port.
     # Neither dport nor sport in _FTP_PORTS means this is definitely not FTP.
-    if session.dport not in _FTP_PORTS and session.sport not in _FTP_PORTS:
+    if not on_ports(session, _FTP_PORTS):
         return []
 
     # Cap the scan to _MAX_SCAN_CLIENT bytes to bound per-packet CPU cost.
@@ -190,17 +190,8 @@ def detect_stream(session, ts: float) -> list:
 
     is_anonymous = user.lower() == "anonymous"
 
-    base = {
-        "type":       "ftp_anonymous" if is_anonymous else "ftp_creds",
-        "session_id": session.session_id,
-        "src":        session.src,
-        "dst":        session.dst,
-        "sport":      session.sport,
-        "dport":      session.dport,
-        "creds":      f"{user}:{passwd}",
-        "filter":     _make_filter(session.src, session.dst,
-                                   session.sport, session.dport),
-    }
+    base = base_finding(session, "ftp_anonymous" if is_anonymous else "ftp_creds",
+                        f"{user}:{passwd}")
 
     session.add_pending(base, ts_start=ts)
 

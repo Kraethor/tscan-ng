@@ -108,7 +108,7 @@ Correlation caveats:
 """
 
 import struct
-from tscan_ng.session import _make_filter
+from tscan_ng.detectors.common import base_finding, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("smb_creds",)
@@ -428,7 +428,7 @@ def detect_stream(session, ts: float) -> list:
         Always an empty list; findings are registered on the session as
         pending and emitted by tscan_ng.resolve once resolved.
     """
-    if session.dport not in _SMB_PORTS and session.sport not in _SMB_PORTS:
+    if not on_ports(session, _SMB_PORTS):
         return []
 
     challenge = _find_ntlm_challenge(bytes(session.server_buf[:_MAX_SCAN_SERVER]))
@@ -456,20 +456,10 @@ def detect_stream(session, ts: float) -> list:
     server_challenge_hex = challenge.hex()
     creds_hash = f"{username}::{domain}:{server_challenge_hex}:{ntproofstr_hex}:{blob_hex}"
 
-    base = {
-        "type":        "smb_creds",
-        "session_id":  session.session_id,
-        "src":         session.src,
-        "dst":         session.dst,
-        "sport":       session.sport,
-        "dport":       session.dport,
-        "domain":      domain,
-        "username":    username,
-        "workstation": workstation,
-        "creds":       creds_hash,
-        "filter":      _make_filter(session.src, session.dst,
-                                    session.sport, session.dport),
-    }
+    base = base_finding(session, "smb_creds", creds_hash,
+                        domain=domain,
+                        username=username,
+                        workstation=workstation)
 
     del session.client_buf[:req_end]
     session.add_pending(base, ts_start=ts)

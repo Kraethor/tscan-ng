@@ -68,7 +68,7 @@ Known limitations:
 
 import re
 import logging
-from tscan_ng.session import _make_filter
+from tscan_ng.detectors.common import base_finding, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("telnet_creds",)
@@ -293,7 +293,7 @@ def detect_stream(session, ts: float) -> list:
         pending and emitted by tscan_ng.resolve once resolved.
     """
     # Gate: only scan sessions on known Telnet ports.
-    if session.dport not in _TELNET_PORTS and session.sport not in _TELNET_PORTS:
+    if not on_ports(session, _TELNET_PORTS):
         return []
 
     # Need data in both directions to detect a login exchange.
@@ -336,17 +336,7 @@ def detect_stream(session, ts: float) -> list:
     # if more client data arrives before the session expires.
     del session.client_buf[:len(client_bytes)]
 
-    base = {
-        "type":       "telnet_creds",
-        "session_id": session.session_id,
-        "src":        session.src,
-        "dst":        session.dst,
-        "sport":      session.sport,
-        "dport":      session.dport,
-        "creds":      f"{user}:{passwd}",
-        "filter":     _make_filter(session.src, session.dst,
-                                   session.sport, session.dport),
-    }
+    base = base_finding(session, "telnet_creds", f"{user}:{passwd}")
 
     # Only text after the password prompt can answer the password, so that
     # is the floor resolve() searches from.

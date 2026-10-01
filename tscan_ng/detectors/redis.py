@@ -58,7 +58,7 @@ Known limitations:
 
 import logging
 import re
-from tscan_ng.session import _make_filter
+from tscan_ng.detectors.common import base_finding, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("redis_creds",)
@@ -273,7 +273,7 @@ def detect_stream(session, ts: float) -> list:
         pending and emitted by tscan_ng.resolve once resolved.
     """
     # Gate: only inspect sessions on known Redis ports.
-    if session.dport not in _REDIS_PORTS and session.sport not in _REDIS_PORTS:
+    if not on_ports(session, _REDIS_PORTS):
         return []
 
     # Bound the scan to avoid O(n) work on very deep buffers.
@@ -296,18 +296,7 @@ def detect_stream(session, ts: float) -> list:
     # the leading ":" keeps the "user:password" shape sinks split on.
     creds_str = f"{username}:{password}" if username else f":{password}"
 
-    base = {
-        "type":       "redis_creds",
-        "session_id": session.session_id,
-        "src":        session.src,
-        "dst":        session.dst,
-        "sport":      session.sport,
-        "dport":      session.dport,
-        "username":   username,
-        "creds":      creds_str,
-        "filter":     _make_filter(session.src, session.dst,
-                                   session.sport, session.dport),
-    }
+    base = base_finding(session, "redis_creds", creds_str, username=username)
 
     session.add_pending(base, ts_start=ts)
     del session.client_buf[:cmd_end]

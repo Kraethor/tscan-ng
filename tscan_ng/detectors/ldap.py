@@ -57,7 +57,7 @@ Known limitations:
 """
 
 import logging
-from tscan_ng.session import _make_filter
+from tscan_ng.detectors.common import base_finding, on_ports, parse_ber_len, parse_ber_tlv
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("ldap_creds",)
@@ -84,79 +84,6 @@ _TAG_SEQUENCE = 0x30   # Universal constructed: SEQUENCE (LDAPMessage wrapper)
 _TAG_BIND_REQ = 0x60   # Application[0] constructed: BindRequest
 _TAG_BIND_RSP = 0x61   # Application[1] constructed: BindResponse
 _TAG_SIMPLE   = 0x80   # Context[0] primitive: simple authentication password
-
-
-def _parse_ber_len(data: bytes, offset: int):
-    """
-    Parse a BER-encoded length value starting at *offset* in *data*.
-
-    Supports short form (single byte, high bit clear) and definite long form
-    (high bit set; low 7 bits give the count of subsequent length bytes).
-    Indefinite form (first byte == 0x80) is not used by LDAP and is treated
-    as an error. More than 4 length bytes (lengths above 4 GiB) is also
-    treated as an error.
-
-    Args:
-        data:   Raw bytes buffer containing the BER stream.
-        offset: Byte position of the first length byte.
-
-    Returns:
-        (length, new_offset) where length is the decoded integer length and
-        new_offset points to the first byte of the value field.
-        Returns (None, None) on any error or if data is truncated.
-    """
-    if offset >= len(data):
-        return None, None
-    first = data[offset]
-    offset += 1
-    if first & 0x80 == 0:
-        # Short form: the byte itself is the length.
-        return first, offset
-    # Long form: low 7 bits = number of length bytes that follow.
-    num_bytes = first & 0x7F
-    if num_bytes == 0 or num_bytes > 4 or offset + num_bytes > len(data):
-        # Indefinite form (num_bytes==0), oversized, or truncated.
-        return None, None
-    length = 0
-    for _ in range(num_bytes):
-        length = (length << 8) | data[offset]
-        offset += 1
-    return length, offset
-
-
-def _parse_ber_tlv(data: bytes, offset: int):
-    """
-    Parse one BER TLV (tag-length-value) triple at *offset* in *data*.
-
-    Multi-byte tags (low 5 bits all set in the first tag byte, i.e. 0x1F)
-    are not supported — standard LDAP v3 messages do not use them.
-
-    Args:
-        data:   Raw bytes buffer containing the BER stream.
-        offset: Byte position of the tag byte.
-
-    Returns:
-        (tag, value_bytes, new_offset) on success, where value_bytes is a
-        bytes slice of the TLV value field and new_offset points past the end
-        of this TLV.  Returns (None, None, None) on any error or if the data
-        is truncated (value extends beyond available bytes). Malformed and
-        merely-incomplete input are indistinguishable to the caller.
-    """
-    if offset >= len(data):
-        return None, None, None
-    tag = data[offset]
-    offset += 1
-    # Multi-byte tags are not used in standard LDAPv3 messages.
-    if (tag & 0x1F) == 0x1F:
-        return None, None, None
-    length, offset = _parse_ber_len(data, offset)
-    if length is None:
-        return None, None, None
-    if offset + length > len(data):
-        # Value not yet fully received — wait for more data.
-        return None, None, None
-    value = data[offset:offset + length]
-    return tag, value, offset + length
 
 
 def _find_bind_request(data: bytes):
@@ -201,7 +128,7 @@ def _find_bind_request(data: bytes):
             i += 1
             continue
 
-        outer_tag, msg_value, msg_end = _parse_ber_tlv(data, i)
+        outer_tag, msg_value, msg_end = parse_ber_tlv(data, i)
         if outer_tag is None:
             # Data is truncated — wait for more bytes.
             break
@@ -210,13 +137,13 @@ def _find_bind_request(data: bytes):
         # relative to msg_value / req_value, not to the whole buffer.) The
         # value is kept so resolve() can match the BindResponse by it.
         off = 0
-        id_tag, id_val, off = _parse_ber_tlv(msg_value, off)
+        id_tag, id_val, off = parse_ber_tlv(msg_value, off)
         if id_tag != _TAG_INTEGER:
             i += 1
             continue
 
         # Parse the second field: BindRequest APPLICATION[0].
-        req_tag, req_value, off = _parse_ber_tlv(msg_value, off)
+        req_tag, req_value, off = parse_ber_tlv(msg_value, off)
         if req_tag != _TAG_BIND_REQ:
             # Not a BindRequest (could be any other LDAP operation) — skip.
             i = msg_end
@@ -226,19 +153,19 @@ def _find_bind_request(data: bytes):
         roff = 0
 
         # version INTEGER (always 3 for LDAPv3; we accept any value).
-        v_tag, _v_val, roff = _parse_ber_tlv(req_value, roff)
+        v_tag, _v_val, roff = parse_ber_tlv(req_value, roff)
         if v_tag != _TAG_INTEGER:
             i += 1
             continue
 
         # name OCTET STRING — the Distinguished Name of the binding entity.
-        n_tag, n_val, roff = _parse_ber_tlv(req_value, roff)
+        n_tag, n_val, roff = parse_ber_tlv(req_value, roff)
         if n_tag != _TAG_OCTET:
             i += 1
             continue
 
         # authentication CHOICE — expect [0] (simple password).
-        a_tag, a_val, roff = _parse_ber_tlv(req_value, roff)
+        a_tag, a_val, roff = parse_ber_tlv(req_value, roff)
         if a_tag != _TAG_SIMPLE:
             # SASL or other mechanism — not supported; skip this message.
             i = msg_end
@@ -294,18 +221,18 @@ def _find_bind_response(data: bytes, message_id: int | None = None):
             i += 1
             continue
 
-        outer_tag, msg_value, msg_end = _parse_ber_tlv(data, i)
+        outer_tag, msg_value, msg_end = parse_ber_tlv(data, i)
         if outer_tag is None:
             # Truncated — wait for more bytes.
             break
 
         off = 0
-        id_tag, id_val, off = _parse_ber_tlv(msg_value, off)
+        id_tag, id_val, off = parse_ber_tlv(msg_value, off)
         if id_tag != _TAG_INTEGER:
             i += 1
             continue
 
-        rsp_tag, rsp_value, off = _parse_ber_tlv(msg_value, off)
+        rsp_tag, rsp_value, off = parse_ber_tlv(msg_value, off)
         if rsp_tag != _TAG_BIND_RSP:
             # Not a BindResponse — skip to next message.
             i = msg_end
@@ -319,7 +246,7 @@ def _find_bind_response(data: bytes, message_id: int | None = None):
         # First field inside BindResponse is always the resultCode ENUMERATED
         # (LDAPResult: resultCode, matchedDN, diagnosticMessage, referral...).
         roff = 0
-        rc_tag, rc_val, roff = _parse_ber_tlv(rsp_value, roff)
+        rc_tag, rc_val, roff = parse_ber_tlv(rsp_value, roff)
         if rc_tag != _TAG_ENUM or not rc_val:
             i += 1
             continue
@@ -381,7 +308,7 @@ def detect_stream(session, ts: float) -> list:
         pending and emitted by tscan_ng.resolve once resolved.
     """
     # Gate: only inspect sessions on known LDAP ports.
-    if session.dport not in _LDAP_PORTS and session.sport not in _LDAP_PORTS:
+    if not on_ports(session, _LDAP_PORTS):
         return []
 
     # Bound the scan to avoid O(n) work on very deep buffers.
@@ -401,18 +328,7 @@ def detect_stream(session, ts: float) -> list:
         del session.client_buf[:req_end]
         return []
 
-    base = {
-        "type":       "ldap_creds",
-        "session_id": session.session_id,
-        "src":        session.src,
-        "dst":        session.dst,
-        "sport":      session.sport,
-        "dport":      session.dport,
-        "dn":         dn,
-        "creds":      f"{dn}:{password}",
-        "filter":     _make_filter(session.src, session.dst,
-                                   session.sport, session.dport),
-    }
+    base = base_finding(session, "ldap_creds", f"{dn}:{password}", dn=dn)
 
     # "_message_id" is private (stripped before output, like snmp's
     # "_request_id"); resolve() matches the BindResponse on it.

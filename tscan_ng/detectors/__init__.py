@@ -51,7 +51,11 @@ Registration checklist for a NEW detector (every place in the current tree
 that enumerates the protocols; missing one causes a silent failure):
     1. detectors/<proto>.py: module-level `_<PROTO>_PORTS` frozenset (the
        name configure_all() overwrites), FINDING_TYPES, `detect_stream(session,
-       ts)` and `resolve(p, session)` as described above.
+       ts)` and `resolve(p, session)` as described above. Use the shared
+       helpers in detectors/common.py rather than copying them (TODO.md #57;
+       tests/test_common_helpers.py): on_ports() for the port gate,
+       base_finding() for the finding dict, and decode_b64() /
+       decode_sasl_plain() / parse_ber_tlv() where they apply.
     2. This file: import the module, append it to DETECTOR_MODULES, and add a
        `<proto>._<PROTO>_PORTS = cfg.<proto>_ports` line to configure_all().
        tests/test_resolve.py checks every module has a resolver.

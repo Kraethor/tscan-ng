@@ -100,8 +100,7 @@ Known limitations:
 
 import logging
 import re
-from tscan_ng.detectors.common import decode_b64
-from tscan_ng.session import _make_filter
+from tscan_ng.detectors.common import base_finding, decode_b64, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("http_basic",)
@@ -248,7 +247,7 @@ def detect_stream(session, ts: float) -> list[dict]:
     """
     # Skip sessions that are not on a known HTTP/proxy port.
     # Neither dport nor sport in _HTTP_PORTS means this is definitely not HTTP.
-    if session.dport not in _HTTP_PORTS and session.sport not in _HTTP_PORTS:
+    if not on_ports(session, _HTTP_PORTS):
         return []
 
 
@@ -313,20 +312,7 @@ def detect_stream(session, ts: float) -> list[dict]:
                 session.session_id)
             continue
 
-        base = {
-            "type":       "http_basic",
-            "session_id": session.session_id,
-            "src":        session.src,
-            "dst":        session.dst,
-            "sport":      session.sport,
-            "dport":      session.dport,
-            "host":       host,
-            "method":     method,
-            "uri":        uri,
-            "creds":      creds,
-            "filter":     _make_filter(session.src, session.dst,
-                                       session.sport, session.dport),
-        }
+        base = base_finding(session, "http_basic", creds, host=host, method=method, uri=uri)
 
         # "_rsp_index" (underscore fields are stripped before output) tells
         # resolve() which response belongs to this request.
