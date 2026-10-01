@@ -225,6 +225,11 @@ class Session:
                     front of server_buf (matched or skipped). Together with
                     http_req_seen this converts "the Nth response on the
                     flow" into an index into the current server_buf.
+        http_body_remaining: Bytes of a request body still to be skipped from
+                    the front of client_buf before the next request header
+                    block (detectors/http_basic.py, TODO.md #22). Set from a
+                    consumed request's Content-Length; drained as the body
+                    arrives so the body is never mistaken for the next request.
         failed_detectors: detect_stream functions that raised on this flow
                     (TODO.md #59). detectors.run_detectors() does not offer
                     the flow to them again: the buffer is in a state they
@@ -248,6 +253,7 @@ class Session:
     last_ts:    float     = 0.0
     http_req_seen: int = 0
     http_rsp_gone: int = 0
+    http_body_remaining: int = 0
     failed_detectors: set = field(default_factory=set, repr=False)
     # Trim warning suppression: warn once per direction, then go silent.
     # Prevents log flooding on high-volume persistent connections.

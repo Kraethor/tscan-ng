@@ -72,9 +72,13 @@ Credentials extracted:
     to decode, or decode to just ":" / nothing, are dropped.
 
 Request framing:
-    A request is delimited only by the first blank line (CRLF CRLF). Request
-    bodies are NOT skipped: a POST body remains in client_buf and is treated as
-    the start of the next request's header block.
+    A request header block is delimited by the first blank line (CRLF CRLF).
+    A request body is skipped using its Content-Length (TODO.md #22), so a
+    POST/PUT payload is not treated as the start of the next request. The body
+    bytes to skip are tracked across packets in Session.http_body_remaining.
+    A chunked request body (Transfer-Encoding: chunked, no Content-Length) is
+    not skipped; it is uncommon for credentialed requests and is left as a
+    known limitation below.
 
 Response correlation:
     HTTP/1.x returns exactly one response per request, in request order. Every
@@ -92,15 +96,20 @@ Response correlation:
 
 Known limitations:
     - HTTPS is opaque; only cleartext HTTP on the configured ports is seen.
-    - A header block longer than _MAX_SCAN_CLIENT, or a large body with no
-      CRLF CRLF in it, prevents progress: nothing is consumed until enough
-      data arrives to find a boundary inside the scan window.
+    - A header block longer than _MAX_SCAN_CLIENT bytes cannot be matched: when
+      the buffer grows past the window with no CRLF CRLF in it, the scanned
+      prefix is dropped (advance_scan_window(), TODO.md #22b) so the connection
+      is not stalled forever; that one oversized request is lost, later ones are
+      recovered. (Request bodies no longer cause this since they are skipped by
+      Content-Length.)
+    - A chunked request body is not skipped (no Content-Length); its bytes can
+      still glue onto the following request. Uncommon for credentialed requests.
     - Digest, NTLM and Bearer authentication are not handled.
 """
 
 import logging
 import re
-from tscan_ng.detectors.common import base_finding, decode_b64, on_ports
+from tscan_ng.detectors.common import advance_scan_window, base_finding, decode_b64, on_ports
 
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("http_basic",)
@@ -143,6 +152,31 @@ _AUTH_HEADER_RE = re.compile(rb"Authorization:\s*Basic\s+(\S+)", re.IGNORECASE)
 
 # Matches Host: header. Group 1: host[:port] token.
 _HOST_HEADER_RE = re.compile(rb"Host:\s*(\S+)", re.IGNORECASE)
+
+# Matches Content-Length header. Group 1: the decimal length.
+_CONTENT_LENGTH_RE = re.compile(rb"^Content-Length:\s*(\d+)", re.IGNORECASE | re.MULTILINE)
+
+
+def _body_length(headers: bytes) -> int:
+    """
+    Bytes of request body to skip after this header block (TODO.md #22).
+
+    Reads Content-Length so a request body (a POST/PUT payload) is skipped
+    rather than glued onto the next request's header block, which otherwise
+    makes the body's bytes parse as the next request (empty/wrong method and
+    URI, and a shifted response pairing).
+
+    Args:
+        headers: The request header block, including the terminating CRLFCRLF.
+
+    Returns:
+        The Content-Length value, or 0 when there is none. A chunked body has
+        no Content-Length and returns 0 (not skipped; see the module docstring).
+    """
+    m = _CONTENT_LENGTH_RE.search(headers)
+    if m:
+        return int(m.group(1))
+    return 0
 
 
 def _outcome(status: int) -> str:
@@ -252,12 +286,30 @@ def detect_stream(session, ts: float) -> list[dict]:
 
 
     while True:
+        # Skip any request body left over from the previous request before
+        # looking for the next header block, so a POST/PUT payload is never
+        # parsed as the next request (TODO.md #22). Drain whatever has arrived;
+        # if the body is not all here yet, wait for more data.
+        if session.http_body_remaining:
+            drop = min(session.http_body_remaining, len(session.client_buf))
+            del session.client_buf[:drop]
+            session.http_body_remaining -= drop
+            if session.http_body_remaining:
+                break
+
         # Limit the scan to _MAX_SCAN_CLIENT bytes to keep per-packet work
         # O(1). If no complete header is found within this window, wait for
         # more data to arrive.
         scan = bytes(session.client_buf[:_MAX_SCAN_CLIENT + 4])
         header_end = scan.find(b"\r\n\r\n")
         if header_end == -1:
+            # No header boundary in the window. If the buffer has grown past the
+            # window, drop the scanned prefix so a header block larger than the
+            # window (or a bodiless stream with no boundary) cannot stall the
+            # session forever (TODO.md #22b, same mechanism as #16). A request
+            # whose header block exceeds the window is lost, but later requests
+            # on the connection are recovered.
+            advance_scan_window(session, _MAX_SCAN_CLIENT, line_oriented=True)
             break
 
         # Consume the request headers from the session buffer NOW, before any
@@ -267,6 +319,10 @@ def detect_stream(session, ts: float) -> list[dict]:
         consume = header_end + 4
         headers = bytes(session.client_buf[:consume])
         del session.client_buf[:consume]
+
+        # Record this request's body length so the next loop iteration skips it
+        # before scanning for the following request (TODO.md #22a).
+        session.http_body_remaining = _body_length(headers)
 
         # Number this request (every request gets a slot, credentialed or
         # not) so its response can be found by position later -- the response
