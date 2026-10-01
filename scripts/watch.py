@@ -18,9 +18,11 @@ Purpose:
     same (dst, dport) inside the cooldown window (default 1800 s) never
     reach this display either.
 
-    Log rotation is handled transparently: the file is reopened when its
-    inode changes or its size drops below the current read position
-    (logrotate's copytruncate, see logrotate/tscan, is the normal case).
+    Log rotation is handled transparently: when the file at the path is a
+    new one (logrotate renames results.jsonl and creates a new file, see
+    logrotate/tscan), the rest of the old file is read first and the new
+    one is then read from its start; a file truncated in place is re-read
+    from its start (TODO.md #47).
 
     This is a read-only viewer. Logging and Discord alerting both happen inside
     tscan-pipeline.service itself (see tscan_ng/sinks/jsonl.py and
@@ -329,9 +331,13 @@ def _tail(path: str):
     """
     Tail *path* from its current end and yield new lines as they arrive.
 
-    Handles log rotation transparently: if the file's inode changes (logrotate
-    replaced it) or its size shrinks (truncation), the file is reopened from
-    the beginning of the new file so no lines are missed.
+    Handles log rotation without losing lines (TODO.md #47): if the path now
+    names a different file (logrotate renamed the old one and created a new
+    one), the lines still unread in the old file are yielded first and the
+    new file is then read from its start; if the same file shrank below the
+    read position (truncated in place), it is re-read from its start. Only
+    the first open seeks to the end, so lines written before the viewer
+    started are not replayed.
 
     Args:
         path: Path to the file to tail.
@@ -339,13 +345,14 @@ def _tail(path: str):
     Yields:
         Raw text lines (including the trailing newline) as they are written.
     """
-    def _open():
-        """Open *path*, seek to end, return (filehandle, inode)."""
+    def _open(at_end: bool):
+        """Open *path* (at its end if *at_end*), return (filehandle, inode)."""
         fh = open(path, "r", encoding="utf-8", errors="replace")
-        fh.seek(0, 2)
+        if at_end:
+            fh.seek(0, 2)
         return fh, os.fstat(fh.fileno()).st_ino
 
-    fh, inode = _open()
+    fh, inode = _open(at_end=True)
     try:
         while True:
             line = fh.readline()
@@ -362,10 +369,16 @@ def _tail(path: str):
                 time.sleep(1)
                 continue
 
-            if st.st_ino != inode or st.st_size < fh.tell():
-                # Inode changed or file was truncated — reopen.
+            if st.st_ino != inode:
+                # Rotated: finish the old file (a worker may have written to
+                # it after the last read), then read the new one from its start.
+                for line in iter(fh.readline, ""):
+                    yield line
                 fh.close()
-                fh, inode = _open()
+                fh, inode = _open(at_end=False)
+            elif st.st_size < fh.tell():
+                # Truncated in place: read again from the start.
+                fh.seek(0)
     finally:
         fh.close()
 

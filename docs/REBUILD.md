@@ -327,9 +327,9 @@ every start systemd creates `/var/log/tscan` if missing, makes it
 and members of the `tscan` group may read it; `watch.py` and `dashboard.py`
 therefore need `tscan` group membership (`thoward` has it) or `sudo`.
 
-Files that already exist keep their mode (`results.jsonl` is never
-recreated, because logrotate uses copytruncate), and logrotate copies that
-mode onto the rotated `.gz` files. When migrating a host whose files were
+Files that already exist keep their mode: logrotate renames
+`results.jsonl` (the rotated copies keep its mode) and creates the new one
+as `0640 tscan:tscan` (`create 0640 tscan tscan`, TODO.md #47). When migrating a host whose files were
 created before this policy, fix them once:
 ```bash
 sudo chmod 640 /var/log/tscan/results.jsonl*
@@ -392,7 +392,16 @@ sudo logrotate -v /etc/logrotate.d/tscan
 The logrotate config must include:
 ```
 su tscan tscan
+create 0640 tscan tscan
+delaycompress
 ```
+and must **not** use `copytruncate` (it loses lines written during the
+copy). Rotation is by rename: each pipeline worker reopens `results.jsonl`
+on its next write after the rename, and a line written in that moment goes
+to `results.jsonl.1`, which `delaycompress` keeps uncompressed until the
+next rotation. Install this file only with pipeline code that has the
+reopen (TODO.md #47, 2026-10-01 or later); older code would keep writing
+to `results.jsonl.1`.
 
 ---
 
@@ -601,6 +610,9 @@ sudo tcpdump -ni <capture-interface> -c 10
 ### Logs stop updating after rotation
 - logrotate missing `su tscan tscan`
 - Fix ownership and rerun logrotate
+- New findings keep going to `results.jsonl.1`: the running pipeline
+  predates the reopen-after-rotation code (TODO.md #47). Restart it on
+  current code; the rename-rotation config needs that code.
 
 ### Repeated test credentials produce no new finding / alert
 - This is the `[dedup] finding_cooldown_sec` cooldown working as designed

@@ -35,7 +35,8 @@ RuntimeDirectory=tscan
 # only tscan and members of the tscan group (thoward, for watch.py and
 # dashboard.py) can reach the files. UMask=0027 makes files the service
 # creates 0640 (results.jsonl when it is first created, cooldown markers);
-# logrotate's copytruncate/compress copy that mode onto rotated files.
+# logrotate renames the file (keeping its mode) and creates the new one
+# 0640 tscan:tscan (logrotate/tscan, TODO.md #47).
 # LogsDirectory also makes this path writable under ProtectSystem=strict
 # below, so a non-default [output] out outside /var/log/tscan needs a
 # ReadWritePaths= line here.

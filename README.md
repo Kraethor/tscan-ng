@@ -245,8 +245,11 @@ privileges and exit codes.
 - `systemd/tscan-pipeline-healthcheck.service` / `.timer` — oneshot check run
   every 2 minutes (`OnBootSec=2min`, `OnUnitActiveSec=2min`); state lives in
   `/var/lib/tscan-healthcheck` (`StateDirectory=`).
-- `logrotate/tscan` — daily, keep 14, compressed, `copytruncate` and
-  `su tscan tscan` (both required; see the comments in the file).
+- `logrotate/tscan` — daily (or past 100 MB), keep 14, compressed with
+  `delaycompress`, rotated by rename with `create 0640 tscan tscan`, and
+  `su tscan tscan` (required; see the comments in the file). The pipeline
+  reopens the file after a rotation, and `watch.py`/`dashboard.py` follow
+  it, so no lines are lost (TODO.md #47).
 - `systemd/tscan-monitor.network.example` — template
   systemd-networkd match for the capture NIC. Without a `.network` file
   matching its MAC, nothing brings that NIC up after boot or USB

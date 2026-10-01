@@ -1,28 +1,38 @@
 # Rotates the JSONL findings log (see tscan_ng/sinks/jsonl.py).
 #
-# copytruncate is required, not just preferred: every pipeline_worker
-# process holds results.jsonl open for the life of the service, with no
-# signal-driven reopen-on-rotate logic, so a create-and-reopen rotation
-# strategy would leave writers appending to a now-unlinked inode forever.
-# copytruncate instead truncates the same inode in place, so existing
-# writers keep working across rotation with no coordination needed.
+# Rename rotation (TODO.md #47). This used copytruncate, which loses any
+# line written between logrotate's copy and its truncate. Now the file is
+# renamed to results.jsonl.1 and a new results.jsonl is created:
+#   - every pipeline_worker's JSONLSink checks before each write that it
+#     still holds the file at the path, and reopens it if not, so workers
+#     move to the new file on their next finding;
+#   - a line written in the moment between the rename and that check lands
+#     in results.jsonl.1, which delaycompress leaves uncompressed until the
+#     next rotation, so it is still kept (no worker writes to it by then);
+#   - scripts/watch.py and scripts/dashboard.py's FindingsTailer finish the
+#     old file and then read the new one from its start.
+# The pipeline code must support this BEFORE this file is installed: an
+# older JSONLSink would keep appending to results.jsonl.1.
 #
-# scripts/watch.py and scripts/dashboard.py's FindingsTailer both depend on
-# this too -- their rotation handling specifically detects a same-inode
-# size shrink (copytruncate's signature) rather than watching for a new
-# inode. Switching this to a create/rename strategy would silently break
-# both without any error, since they'd keep reading from a moved-away file.
+# create 0640 tscan tscan: the new file gets the same mode and owner the
+# service would give it (UMask=0027, see TODO.md #6); if it is missing, the
+# next write creates it anyway.
+#
+# maxsize 100M: rotate early if the file grows past 100 MB, checked when
+# logrotate runs (logrotate.timer, daily on ser8), so it caps one day's
+# growth rather than enforcing a hard limit.
 #
 # su tscan tscan: performs the rotation as the tscan user/group instead of
-# logrotate's default (root), so the compressed rotated files end up owned
-# by the same account that owns and writes /var/log/tscan. Required --
-# see docs/REBUILD.md's "Logs stop updating after rotation" failure mode
-# for what breaks without it.
+# logrotate's default (root), so the rotated files end up owned by the same
+# account that owns and writes /var/log/tscan. Required -- see
+# docs/REBUILD.md's "Logs stop updating after rotation" failure mode.
 /var/log/tscan/*.jsonl {
     daily
+    maxsize 100M
     rotate 14
     compress
-    copytruncate
+    delaycompress
+    create 0640 tscan tscan
     missingok
     notifempty
     su tscan tscan

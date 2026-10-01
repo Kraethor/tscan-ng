@@ -16,6 +16,14 @@ Platform notes:
     lines larger than PIPE_BUF to a shared pipe could interleave.
   - The file is opened with buffering=0 (unbuffered) so that flock boundaries
     coincide with kernel write boundaries, preventing interleaved lines.
+
+Rotation (TODO.md #47): logrotate renames results.jsonl and creates a new
+one (logrotate/tscan). Before each write the sink checks that the file it
+holds is still the one at its path (same device and inode) and reopens the
+path if not, so every worker moves to the new file on its next finding. A
+line written in the moment between the rename and that check still lands in
+the rotated file, which delaycompress keeps uncompressed until the next
+rotation, so nothing is lost.
 """
 
 import os
@@ -34,10 +42,8 @@ class JSONLSink:
     Args:
         path: Filesystem path to the output file, or None to write to stdout.
 
-    The file handle is opened once and never closed or reopened; log
-    rotation must therefore be copytruncate-style (as /etc/logrotate.d/tscan
-    is), since a rename-style rotation would leave writers appending to the
-    rotated file.
+    The file is reopened when it has been rotated away (renamed or
+    deleted) since it was opened; see the module docstring.
     """
 
     def __init__(self, path: str | None):
@@ -53,16 +59,40 @@ class JSONLSink:
         Raises:
             OSError: If the file cannot be opened for append.
         """
+        self._path = path
         self._fd = None
         if path:
             self._fd = open(path, "ab", buffering=0)
+
+    def _reopen_if_rotated(self):
+        """
+        Reopen self._path if the open file is no longer the one at that path.
+
+        True after logrotate has renamed it (whether or not the new file has
+        been created yet) or after it was deleted; the reopen creates the
+        file if it is missing. Costs one stat() and one fstat() per write,
+        which is negligible at the rate findings are written.
+
+        Raises:
+            OSError: If the path cannot be reopened.
+        """
+        try:
+            st = os.stat(self._path)
+        except FileNotFoundError:
+            st = None
+        held = os.fstat(self._fd.fileno())
+        if st is not None and (st.st_dev, st.st_ino) == (held.st_dev, held.st_ino):
+            return
+        old, self._fd = self._fd, open(self._path, "ab", buffering=0)
+        old.close()
 
     def write(self, obj: dict):
         """
         Serialize obj to JSON and write it as a single line.
 
-        For file output, an exclusive flock is held for the duration of the
-        write to prevent workers from interleaving partial lines.
+        For file output, the file is first reopened if it was rotated away
+        (TODO.md #47), then an exclusive flock is held for the duration of
+        the write to prevent workers from interleaving partial lines.
 
         For stdout output, a write loop ensures all bytes are written even
         if the underlying fd returns a short write (e.g. stdout connected
@@ -77,6 +107,7 @@ class JSONLSink:
         """
         line = json.dumps(obj) + b"\n"
         if self._fd:
+            self._reopen_if_rotated()
             fcntl.flock(self._fd, fcntl.LOCK_EX)
             try:
                 self._fd.write(line)

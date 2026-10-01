@@ -225,11 +225,13 @@ def snapshot_iface(iface: str) -> dict:
 
 class FindingsTailer:
     """Tracks success-finding count/last-seen in RESULTS_PATH, tailing new
-    lines each poll. Handles logrotate's copytruncate (size shrinks in place,
-    inode stays the same). Counters are reset by neither rotation nor
-    truncation: they keep accumulating for the life of the dashboard process,
-    so "since last log rotation" is accurate only for a dashboard started
-    after the most recent rotation.
+    lines each poll. Keeps the file open so a rotation loses nothing
+    (TODO.md #47): when logrotate renames the file and creates a new one,
+    the rest of the old file is read first, then the new one from its
+    start; a file truncated in place is re-read from its start. Counters
+    are reset by neither rotation nor truncation: they keep accumulating for
+    the life of the dashboard process, so "since last log rotation" is
+    accurate only for a dashboard started after the most recent rotation.
 
     Attributes:
         path:       Path of the JSONL file being tailed.
@@ -246,19 +248,25 @@ class FindingsTailer:
         self.total = 0
         self.by_proto: dict[str, int] = {}
         self.last_line = None
-        self._pos = 0
-        self._prime()
+        self._fh = None
+        self._ino = None
+        self._open_and_read()
 
-    def _prime(self):
-        """Consume every existing line in *path* once at startup and record
-        the read position to resume from on the next poll()."""
+    def _open_and_read(self):
+        """Open *path*, consume every line in it, and keep it open for the
+        next poll(). Leaves the tailer closed if the file cannot be opened."""
         try:
-            with open(self.path, "r", encoding="utf-8", errors="replace") as f:
-                for raw in f:
-                    self._consume(raw)
-                self._pos = f.tell()
+            self._fh = open(self.path, "r", encoding="utf-8", errors="replace")
+            self._ino = os.fstat(self._fh.fileno()).st_ino
         except OSError:
-            self._pos = 0
+            self._fh = self._ino = None
+            return
+        self._read_new()
+
+    def _read_new(self):
+        """Consume the lines appended to the open file since the last read."""
+        for raw in iter(self._fh.readline, ""):
+            self._consume(raw)
 
     def _consume(self, raw: str):
         """Parse one JSONL line and fold it into total/by_proto/last_line if
@@ -279,20 +287,23 @@ class FindingsTailer:
         self.last_line = finding
 
     def poll(self):
-        """Consume any lines appended to *path* since the last poll/prime.
-
-        Detects logrotate's copytruncate (file shrinks in place, same inode)
-        by comparing the current size to the last read position, and resumes
-        from the start when that happens rather than seeking past EOF."""
+        """Consume any lines appended to *path* since the last poll/prime,
+        following a rotation (new file at the path) or an in-place truncation
+        without skipping lines."""
         try:
-            size = os.path.getsize(self.path)
-            if size < self._pos:
-                self._pos = 0  # truncated by copytruncate rotation
-            with open(self.path, "r", encoding="utf-8", errors="replace") as f:
-                f.seek(self._pos)
-                for raw in f:
-                    self._consume(raw)
-                self._pos = f.tell()
+            if self._fh is None:
+                self._open_and_read()
+                return
+            self._read_new()
+            st = os.stat(self.path)
+            if st.st_ino != self._ino:
+                # Rotated: the old file was finished just above; switch.
+                self._fh.close()
+                self._open_and_read()
+            elif st.st_size < self._fh.tell():
+                # Truncated in place: read again from the start.
+                self._fh.seek(0)
+                self._read_new()
         except OSError:
             pass
 
