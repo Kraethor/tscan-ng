@@ -1,19 +1,30 @@
 #!/usr/bin/env bash
-# scripts/update.sh - Deploy the latest tscan-ng code and restart the service.
+# scripts/update.sh - Deploy the latest tscan-ng code and restart the service,
+# rolling back if the new code does not come up (TODO.md #20).
 #
-# Steps, in order:
-#   1. Stop tscan-pipeline.service if it is active.
+# The pipeline keeps running until the new code has been pulled and checked,
+# and is only restarted once. Steps, in order:
+#   1. Record the current commit (HEAD) as the rollback point.
 #   2. `git pull --ff-only` as the tscan user (deploy key via the repo's own
-#      core.sshCommand). A diverged or dirty tree aborts the script here.
-#   3. If requirements.txt exists and /opt/tscan/venv exists, run
-#      `pip install --upgrade -r requirements.txt` inside the venv as tscan
-#      (a missing venv only prints a warning and skips this step).
-#   4. Copy each unit in UNITS (tscan-pipeline.service,
-#      tscan-pipeline-healthcheck.service, tscan-pipeline-healthcheck.timer)
-#      from /opt/tscan/systemd/ to /etc/systemd/system/ if missing or
-#      different, then `systemctl daemon-reload` only if any were copied.
-#   5. Start the pipeline and `systemctl enable --now` the healthcheck timer.
-#   6. Print whether each is active.
+#      core.sshCommand). The service keeps running.
+#   3. If requirements.txt and the venv exist, `pip install --upgrade -r
+#      requirements.txt` as tscan (venv/bin/pip directly, no login shell).
+#   4. Pre-flight against the new code, as tscan: the unit tests, then import
+#      the pipeline and load + validate the live config (tscan_ng.config).
+#      If any of 2-4 fails, the checkout and venv are put back to the
+#      rollback point and the script exits 2. The running service was never
+#      touched.
+#   5. Install each unit in UNITS from systemd/ into the unit dir if missing
+#      or different (`install -m 0644`; old copies are kept for rollback),
+#      then `systemctl daemon-reload` if any changed.
+#   6. `systemctl restart` the pipeline and `enable --now` the healthcheck timer.
+#   7. Verify: after HEALTH_WAIT seconds the pipeline must be "active" and
+#      systemd must not have auto-restarted it (NRestarts unchanged). A
+#      Type=simple service reports active the moment it is started, so only
+#      a later check shows whether it stayed up.
+#      If verification fails, the checkout, venv and units are rolled back,
+#      the pipeline is restarted on the old code and verified again.
+#   Any unexpected failure after step 2 also triggers the rollback (EXIT trap).
 #
 # NOT handled by this script (do these by hand, see docs/REBUILD.md):
 #   - logrotate/tscan -> /etc/logrotate.d/tscan
@@ -22,114 +33,189 @@
 #
 # Usage:  sudo /opt/tscan/scripts/update.sh        (no arguments)
 #
-# Environment: none read. SERVICE_USER, APP_DIR and the unit names are set
-#   below. pip runs with PIP_NO_CACHE_DIR=1 in a `bash -lc` login shell as
-#   tscan.
+# Environment (all optional; for tests/tests/test_update_sh.py, which runs
+# the script against stubs):
+#   TSCAN_APP_DIR      repo checkout             (default /opt/tscan)
+#   TSCAN_UNIT_DIR     systemd unit directory    (default /etc/systemd/system)
+#   TSCAN_HEALTH_WAIT  seconds to wait before verifying (default 15)
 #
-# Privileges: must be root (checked at start): it stops/starts services,
-#   writes into /etc/systemd/system and calls `sudo -u tscan` for git/pip.
+# Privileges: must be root (checked with `id -u`): it restarts services,
+#   writes into the unit directory and runs git/pip/python as tscan via sudo.
+#   pip runs as tscan, so if the venv is not writable by tscan an install
+#   that actually changes a package fails (and is rolled back).
 #
 # Exit codes:
-#   0  finished (even if the pipeline or timer then reports "NOT active" --
-#      the final status lines are informational, not asserted).
+#   0  updated, and the pipeline stayed up.
 #   1  not run as root.
-#   other non-zero: `set -e` aborts on the first failing command (git pull,
-#      pip, cp, daemon-reload, systemctl start/enable). Because the service
-#      is stopped in step 1, a failure in steps 2-4 leaves the pipeline
-#      STOPPED; fix the cause and re-run, or `systemctl start tscan-pipeline`.
-set -euo pipefail
+#   2  pull, pip or pre-flight failed; checkout restored, service untouched.
+#   3  the new code did not stay up; rolled back and the old code is running.
+#   4  rollback failed too: the pipeline is DOWN. Check `journalctl -u tscan-pipeline`.
+set -uo pipefail
 
-# Must be run as root (we call systemctl, copy into /etc/systemd, etc.)
-if [[ $EUID -ne 0 ]]; then
+if [[ "$(id -u)" -ne 0 ]]; then
   echo "[-] This script must be run as root" >&2
   exit 1
 fi
 
 SERVICE_USER="tscan"
-APP_DIR="/opt/tscan"
+APP_DIR="${TSCAN_APP_DIR:-/opt/tscan}"
+UNIT_DIR="${TSCAN_UNIT_DIR:-/etc/systemd/system}"
+HEALTH_WAIT="${TSCAN_HEALTH_WAIT:-15}"
 PIPELINE_SERVICE="tscan-pipeline"
 HEALTHCHECK_TIMER="tscan-pipeline-healthcheck.timer"
-# Units installed from ${APP_DIR}/systemd/ into /etc/systemd/system/. The
+# Units installed from ${APP_DIR}/systemd/ into the unit directory. The
 # healthcheck .service is oneshot and only ever started by its .timer, so it
 # is installed but never enabled or started directly here.
 UNITS=("tscan-pipeline.service" "tscan-pipeline-healthcheck.service" "tscan-pipeline-healthcheck.timer")
+PYTHON="${APP_DIR}/venv/bin/python"
 
-# ---------------------------------------------------------------------------
-# Stop the pipeline
-# ---------------------------------------------------------------------------
-echo "[+] Stopping ${PIPELINE_SERVICE}..."
-if systemctl is-active --quiet "${PIPELINE_SERVICE}"; then
-  systemctl stop "${PIPELINE_SERVICE}"
-fi
+as_tscan() { sudo -u "${SERVICE_USER}" -H "$@"; }
+git_tscan() { as_tscan git -C "${APP_DIR}" "$@"; }
 
-# ---------------------------------------------------------------------------
-# Pull latest code
-# ---------------------------------------------------------------------------
-echo "[+] Updating repository as ${SERVICE_USER} in ${APP_DIR}..."
-sudo -u "${SERVICE_USER}" -H git -C "${APP_DIR}" pull --ff-only
+# State for rollback. CODE_CHANGED: the checkout may differ from OLD_HEAD.
+# INSTALLED_UNITS: units replaced in UNIT_DIR (originals in UNIT_BACKUP,
+# or marked missing). FINISHED: a deliberate exit; the EXIT trap does nothing.
+CODE_CHANGED=0
+FINISHED=0
+INSTALLED_UNITS=()
+UNIT_BACKUP="$(mktemp -d)"
 
-# ---------------------------------------------------------------------------
-# Update Python dependencies if requirements.txt exists
-# ---------------------------------------------------------------------------
-if [ -f "${APP_DIR}/requirements.txt" ]; then
-  echo "[+] requirements.txt found, updating virtualenv..."
-  sudo -u "${SERVICE_USER}" -H bash -lc "
-    cd '${APP_DIR}'
-    if [ -d 'venv' ]; then
-      source venv/bin/activate
-      PIP_NO_CACHE_DIR=1 pip install --upgrade -r requirements.txt
-      deactivate
-    else
-      echo '[!] venv not found, skipping pip install' >&2
-    fi
-  "
-else
-  echo "[+] No requirements.txt found, skipping dependency update."
-fi
-
-# ---------------------------------------------------------------------------
-# Reinstall systemd units if they changed
-# ---------------------------------------------------------------------------
-UNITS_CHANGED=0
-for UNIT in "${UNITS[@]}"; do
-  REPO_UNIT="${APP_DIR}/systemd/${UNIT}"
-  SYSTEM_UNIT="/etc/systemd/system/${UNIT}"
-  # `diff -q` exits non-zero when the files differ; inside `||` / `!` that
-  # does not trip `set -e`, it just selects the reinstall branch.
-  if [ ! -f "${SYSTEM_UNIT}" ] || ! diff -q "${REPO_UNIT}" "${SYSTEM_UNIT}" &>/dev/null; then
-    echo "[+] ${UNIT} changed or missing, reinstalling..."
-    cp "${REPO_UNIT}" "${SYSTEM_UNIT}"
-    UNITS_CHANGED=1
+pip_install() {
+  if [[ -f "${APP_DIR}/requirements.txt" && -x "${APP_DIR}/venv/bin/pip" ]]; then
+    echo "[+] Installing requirements into the venv as ${SERVICE_USER}..."
+    as_tscan env PIP_NO_CACHE_DIR=1 "${APP_DIR}/venv/bin/pip" install --quiet \
+      --upgrade -r "${APP_DIR}/requirements.txt"
+  else
+    echo "[+] No requirements.txt or venv, skipping dependency update."
   fi
-done
+}
 
-if [ "${UNITS_CHANGED}" -eq 1 ]; then
-  echo "[+] Reloading systemd daemon..."
+preflight() {
+  echo "[+] Pre-flight: unit tests..."
+  as_tscan env --chdir="${APP_DIR}" PYTHONDONTWRITEBYTECODE=1 \
+    "${PYTHON}" -m unittest discover -s tests -t . -q || return 1
+  echo "[+] Pre-flight: import pipeline, load and validate config..."
+  as_tscan env --chdir="${APP_DIR}" PYTHONDONTWRITEBYTECODE=1 \
+    "${PYTHON}" -c 'import tscan_ng.pipeline; from tscan_ng.config import Config; Config()' \
+    || return 1
+}
+
+install_units() {
+  local unit repo_unit system_unit
+  for unit in "${UNITS[@]}"; do
+    repo_unit="${APP_DIR}/systemd/${unit}"
+    system_unit="${UNIT_DIR}/${unit}"
+    if [[ -f "${system_unit}" ]] && cmp -s "${repo_unit}" "${system_unit}"; then
+      continue
+    fi
+    echo "[+] ${unit} changed or missing, installing..."
+    if [[ -f "${system_unit}" ]]; then
+      cp -p "${system_unit}" "${UNIT_BACKUP}/${unit}" || return 1
+    else
+      : > "${UNIT_BACKUP}/${unit}.missing"
+    fi
+    INSTALLED_UNITS+=("${unit}")
+    install -m 0644 "${repo_unit}" "${system_unit}" || return 1
+  done
+  if (( ${#INSTALLED_UNITS[@]} )); then
+    echo "[+] Reloading systemd..."
+    systemctl daemon-reload || return 1
+  else
+    echo "[+] systemd units unchanged."
+  fi
+}
+
+restore_units() {
+  local unit
+  (( ${#INSTALLED_UNITS[@]} )) || return 0
+  for unit in "${INSTALLED_UNITS[@]}"; do
+    if [[ -e "${UNIT_BACKUP}/${unit}.missing" ]]; then
+      rm -f "${UNIT_DIR}/${unit}"
+    elif ! cmp -s "${UNIT_BACKUP}/${unit}" "${UNIT_DIR}/${unit}"; then
+      # (Skipped when the install never replaced it, e.g. it failed.)
+      install -m 0644 "${UNIT_BACKUP}/${unit}" "${UNIT_DIR}/${unit}" || return 1
+    fi
+  done
+  INSTALLED_UNITS=()
   systemctl daemon-reload
-else
-  echo "[+] systemd units unchanged, skipping daemon-reload."
-fi
+}
+
+# Restart the pipeline and check it stays up for HEALTH_WAIT seconds.
+restart_and_verify() {
+  local before after state
+  systemctl restart "${PIPELINE_SERVICE}" || return 1
+  before="$(systemctl show -p NRestarts --value "${PIPELINE_SERVICE}")"
+  sleep "${HEALTH_WAIT}"
+  state="$(systemctl is-active "${PIPELINE_SERVICE}")"
+  after="$(systemctl show -p NRestarts --value "${PIPELINE_SERVICE}")"
+  echo "  - ${PIPELINE_SERVICE}: ${state} after ${HEALTH_WAIT}s (automatic restarts: ${before} -> ${after})"
+  [[ "${state}" == "active" && "${after}" == "${before}" ]]
+}
+
+# Put the checkout (and venv) back to OLD_HEAD. `reset --keep` refuses to
+# discard local modifications, unlike --hard.
+restore_code() {
+  (( CODE_CHANGED )) || return 0
+  echo "[!] Restoring checkout to ${OLD_HEAD}..."
+  git_tscan reset --keep "${OLD_HEAD}" || return 1
+  CODE_CHANGED=0
+  pip_install
+}
+
+finish() { FINISHED=1; rm -rf "${UNIT_BACKUP}"; exit "$1"; }
+
+abort_preflight() {
+  echo "[-] $1; the running service was not touched." >&2
+  if ! restore_code; then
+    echo "[-] Could not restore the checkout to ${OLD_HEAD}; the service still runs the old code, but the next restart would load what is on disk." >&2
+  fi
+  finish 2
+}
+
+rollback_after_restart() {
+  echo "[-] $1. Rolling back to ${OLD_HEAD}..." >&2
+  if restore_code && restore_units && restart_and_verify; then
+    echo "[!] Rolled back: ${PIPELINE_SERVICE} is running the previous code (${OLD_HEAD})." >&2
+    finish 3
+  fi
+  echo "[-] ROLLBACK FAILED: ${PIPELINE_SERVICE} is DOWN or unstable. Check: journalctl -u ${PIPELINE_SERVICE}" >&2
+  finish 4
+}
+
+# Unexpected failure (a command not checked below) after the pull: roll back.
+on_exit() {
+  local rc=$?
+  (( FINISHED )) && return
+  rm -rf "${UNIT_BACKUP}"
+  if (( CODE_CHANGED )) || (( ${#INSTALLED_UNITS[@]} )); then
+    echo "[-] update.sh stopped unexpectedly (exit ${rc}); rolling back..." >&2
+    FINISHED=1
+    restore_code && restore_units && restart_and_verify && exit 3
+    echo "[-] ROLLBACK FAILED: ${PIPELINE_SERVICE} may be DOWN. Check: journalctl -u ${PIPELINE_SERVICE}" >&2
+    exit 4
+  fi
+}
+trap on_exit EXIT
 
 # ---------------------------------------------------------------------------
-# Start the pipeline and make sure the healthcheck timer is enabled
-# ---------------------------------------------------------------------------
-echo "[+] Starting ${PIPELINE_SERVICE}..."
-systemctl start "${PIPELINE_SERVICE}"
-systemctl enable --now "${HEALTHCHECK_TIMER}" >/dev/null
+OLD_HEAD="$(git_tscan rev-parse HEAD)" || { echo "[-] git rev-parse failed" >&2; finish 2; }
+echo "[+] Current commit: ${OLD_HEAD}"
 
-# ---------------------------------------------------------------------------
-# Report status
-# ---------------------------------------------------------------------------
-echo "[+] Current status:"
-if systemctl --no-pager --quiet is-active "${PIPELINE_SERVICE}"; then
-  echo "  - ${PIPELINE_SERVICE}: active"
-else
-  echo "  - ${PIPELINE_SERVICE}: NOT active"
-fi
-if systemctl --no-pager --quiet is-active "${HEALTHCHECK_TIMER}"; then
-  echo "  - ${HEALTHCHECK_TIMER}: active"
-else
-  echo "  - ${HEALTHCHECK_TIMER}: NOT active"
-fi
+echo "[+] Updating repository as ${SERVICE_USER} in ${APP_DIR}..."
+CODE_CHANGED=1
+git_tscan pull --ff-only || abort_preflight "git pull failed"
+NEW_HEAD="$(git_tscan rev-parse HEAD)"
+echo "[+] Now at: ${NEW_HEAD}"
 
-echo "[+] Done."
+pip_install || abort_preflight "pip install failed"
+preflight || abort_preflight "pre-flight checks failed"
+
+install_units || rollback_after_restart "installing systemd units failed"
+
+echo "[+] Restarting ${PIPELINE_SERVICE}..."
+restart_and_verify || rollback_after_restart "${PIPELINE_SERVICE} did not stay up on ${NEW_HEAD}"
+systemctl enable --now "${HEALTHCHECK_TIMER}" >/dev/null || \
+  echo "[!] Could not enable ${HEALTHCHECK_TIMER}; the pipeline itself is up." >&2
+
+echo "[+] Done: ${PIPELINE_SERVICE} is up on ${NEW_HEAD}."
+finish 0

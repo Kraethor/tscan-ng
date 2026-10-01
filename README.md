@@ -229,7 +229,7 @@ bash /opt/tscan/scripts/status.sh
 | `scripts/dashboard.py` | any user | Full-screen curses status dashboard (see above) |
 | `scripts/status.sh` | any user with the NOPASSWD sudo grants | One-shot text status snapshot |
 | `scripts/pipeline_healthcheck.py` | `tscan`, via `tscan-pipeline-healthcheck.service` | Out-of-process up/down check; alerts on Discord on each transition |
-| `scripts/update.sh` | root | Stop service, `git pull --ff-only`, pip install, reinstall changed systemd units, restart. Does **not** install `logrotate/tscan` or the networkd file |
+| `scripts/update.sh` | root | `git pull --ff-only`, pip install, pre-flight (tests + config), install changed systemd units, restart, verify it stays up; rolls back to the previous commit if anything fails (exit 0 up, 2 nothing changed, 3 rolled back, 4 down). Does **not** install `logrotate/tscan` or the networkd file |
 | `scripts/push.sh "msg" [file ...]` | root | Stage, commit and push as the `tscan` user |
 | `scripts/fake_smtp.py`, `fake_imap.py`, `fake_pop3.py`, `fake_telnet.py` | any non-root user, on a test host | Cleartext fake servers on TCP 2525 / 1430 / 1100 / 2323 that accept `testuser` / `hunter2` and reject everything else; used to generate traffic for the detectors (see `docs/test_reference.md`) |
 

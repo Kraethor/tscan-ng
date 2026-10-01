@@ -401,27 +401,34 @@ For subsequent updates after initial deployment, use the update script:
 sudo /opt/tscan/scripts/update.sh
 ```
 
-The script will:
-- Stop `tscan-pipeline`
-- Pull the latest code from the repository (as `tscan`, over the deploy key)
-- Run `pip install --upgrade -r requirements.txt` in the venv (whenever the
-  file exists and `/opt/tscan/venv` exists; it does not check whether the
-  file changed)
-- Reinstall systemd units if they changed (`tscan-pipeline.service` and
-  the healthcheck `.service`/`.timer` pair)
-- Reload systemd if needed
-- Start `tscan-pipeline` and ensure the healthcheck timer is enabled
-- Report final status
+The pipeline keeps running while the new code is pulled and checked, and is
+restarted only once (TODO.md #20). The script will:
+- Note the current commit as the rollback point
+- Pull the latest code (as `tscan`, over the deploy key)
+- Run `pip install --upgrade -r requirements.txt` in the venv as `tscan`
+  (whenever the file and `/opt/tscan/venv` exist)
+- **Pre-flight** against the new code, as `tscan`: the unit tests, then import
+  the pipeline and load and validate the live config
+- Install systemd units that changed (`tscan-pipeline.service` and the
+  healthcheck `.service`/`.timer` pair), keeping the old copies, and reload
+  systemd if needed
+- Restart `tscan-pipeline`, then check 15 s later that it is still active and
+  systemd has not auto-restarted it; enable the healthcheck timer
+
+If the pull, pip or pre-flight fails, the checkout is put back and the running
+service is never touched (exit 2). If the new code does not stay up, the
+checkout, venv and units are rolled back and the old code is restarted
+(exit 3). Exit 4 means the rollback failed too and the pipeline is **down**:
+`journalctl -u tscan-pipeline`. Exit 0 means it is up on the new commit.
 
 It does **not** install `logrotate/tscan` or the capture-NIC networkd file;
-repeat those steps by hand if they change. The script uses `set -e`, and the
-service is stopped first, so a failure in the pull/pip/unit-copy steps leaves
-the pipeline **stopped** — fix the cause and re-run, or
-`sudo systemctl start tscan-pipeline`.
+repeat those steps by hand if they change. pip runs as `tscan`, so a
+requirements change that needs a package install fails unless the venv is
+writable by `tscan` (it is owned by `thoward` on ser8); that failure is
+rolled back like any other.
 
 **Important:**
-The update script must be run as root. It handles stop/start ordering
-automatically.
+The update script must be run as root.
 
 `scripts/push.sh "commit message" [file ...]` (root) is the counterpart for
 sending local changes upstream; it runs every git command as `tscan`.
