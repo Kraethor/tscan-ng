@@ -71,7 +71,7 @@ _REDIS_PORTS: frozenset = frozenset({
 
 # Maximum bytes of the client buffer to scan per call.
 # Redis AUTH commands are short; 4 KB is well above any realistic exchange.
-_MAX_SCAN = 4096
+_MAX_SCAN_CLIENT = 4096
 
 # Regex for inline AUTH commands (fallback for non-RESP clients).
 # Captures optional username and mandatory password.
@@ -158,13 +158,12 @@ def _find_auth_command(data: bytes):
 
     Tries RESP array format first at each position; falls back to the inline
     regex for clients that use raw text commands. Walks the buffer one byte
-    at a time (bounded by _MAX_SCAN), so an AUTH does not have to be the first
+    at a time (bounded by _MAX_SCAN_CLIENT), so an AUTH does not have to be the first
     command; complete non-AUTH RESP arrays are skipped over whole. An AUTH
     array with an element count other than 2 or 3 is skipped as a non-match.
-    Text is decoded with errors="replace" (other detectors use "ignore").
 
     Args:
-        data: Raw bytes from the client stream buffer (bounded to _MAX_SCAN).
+        data: Raw bytes from the client stream buffer (bounded to _MAX_SCAN_CLIENT).
 
     Returns:
         (username, password, end_offset) where username is an empty string for
@@ -262,7 +261,7 @@ def detect_stream(session, ts: float) -> list:
     registered; resolve() matches the reply (on the same packet if it is
     already buffered).
 
-    The scan is bounded to _MAX_SCAN bytes per call to keep per-packet CPU
+    The scan is bounded to _MAX_SCAN_CLIENT bytes per call to keep per-packet CPU
     cost O(1) regardless of buffer depth.
 
     Args:
@@ -278,7 +277,7 @@ def detect_stream(session, ts: float) -> list:
         return []
 
     # Bound the scan to avoid O(n) work on very deep buffers.
-    client_bytes = bytes(session.client_buf[:_MAX_SCAN])
+    client_bytes = bytes(session.client_buf[:_MAX_SCAN_CLIENT])
     username, password, cmd_end = _find_auth_command(client_bytes)
 
     if username is None:

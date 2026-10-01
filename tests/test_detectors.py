@@ -132,7 +132,7 @@ class HttpBasicTests(unittest.TestCase):
         s.server_buf.extend(RSP_200)
         done = resolve_pending(s)
         self.assertEqual([(f["status"], f["outcome"]) for f in done],
-                         [(200, "success")])
+                         [("200", "success")])
         self.assertEqual(done[0]["creds"], "alice:hunter2")
         self.assertNotIn("_rsp_index", done[0])
 
@@ -142,7 +142,7 @@ class HttpBasicTests(unittest.TestCase):
         s.server_buf.extend(RSP_401 + RSP_200)
         out = detect(http_basic, s, TS)
         self.assertEqual([(f["status"], f["outcome"]) for f in out],
-                         [(200, "success")])
+                         [("200", "success")])
         self.assertNotIn("_rsp_index", out[0])
 
     def test_responses_arrive_after_both_requests(self):
@@ -161,7 +161,7 @@ class HttpBasicTests(unittest.TestCase):
         s.server_buf.extend(RSP_401)
         out = detect(http_basic, s, TS)
         self.assertEqual([(f["status"], f["outcome"]) for f in out],
-                         [(401, "failed")])
+                         [("401", "failed")])
 
     def test_two_credentialed_requests_keep_alive(self):
         s = make_session(80)

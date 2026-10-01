@@ -19,7 +19,7 @@ Port handling:
     Sessions where neither endpoint port is in the set are skipped immediately,
     keeping per-packet overhead negligible for non-IMAP traffic.
 
-    The scan for LOGIN/AUTHENTICATE commands is bounded to _MAX_CMD_SCAN bytes
+    The scan for LOGIN/AUTHENTICATE commands is bounded to _MAX_SCAN_CLIENT bytes
     so that a large client buffer does not cause O(n) work on every arriving
     packet.
 
@@ -84,7 +84,7 @@ _IMAP_PORTS: frozenset = frozenset({
 # per call. IMAP auth exchanges are short; 4 KB is well above any realistic
 # auth exchange. Bounding the scan keeps per-packet work O(1) regardless of
 # buffer lifetime.
-_MAX_CMD_SCAN = 4096
+_MAX_SCAN_CLIENT = 4096
 
 # Matches IMAP LOGIN command as bytes to avoid UTF-8 decode-with-ignore
 # shifting byte positions used for buffer consumption.
@@ -194,9 +194,9 @@ def _decode_plain(blob: bytes) -> tuple | None:
         decoded = base64.b64decode(blob)
         parts = decoded.split(b"\x00")
         if len(parts) == 3:
-            return parts[1].decode("utf-8", "ignore"), parts[2].decode("utf-8", "ignore")
+            return parts[1].decode("utf-8", "replace"), parts[2].decode("utf-8", "replace")
         elif len(parts) == 2:
-            return parts[0].decode("utf-8", "ignore"), parts[1].decode("utf-8", "ignore")
+            return parts[0].decode("utf-8", "replace"), parts[1].decode("utf-8", "replace")
     except Exception:
         pass
     return None
@@ -242,11 +242,11 @@ def detect_stream(session, ts: float) -> list[dict]:
     if session.dport not in _IMAP_PORTS and session.sport not in _IMAP_PORTS:
         return []
 
-    # Cap the scan to _MAX_CMD_SCAN bytes to bound per-packet CPU cost.
+    # Cap the scan to _MAX_SCAN_CLIENT bytes to bound per-packet CPU cost.
     # The regexes run on raw bytes — no decode needed, no byte positions lost.
     # This snapshot is not mutated until the single consumption point at the
     # end, so offsets computed against it stay valid for both mechanisms.
-    scan = bytes(session.client_buf[:_MAX_CMD_SCAN])
+    scan = bytes(session.client_buf[:_MAX_SCAN_CLIENT])
 
     consume_end = None  # Furthest offset into `scan` consumed by either mechanism.
 
@@ -260,7 +260,7 @@ def detect_stream(session, ts: float) -> list[dict]:
     for match in _IMAP_LOGIN_RE.finditer(scan):
         login_last_match = match
 
-        tag = match.group(1).decode("utf-8", "ignore")
+        tag = match.group(1).decode("utf-8", "replace")
 
         # Prefer the quoted group; fall back to unquoted. Use explicit None
         # checks rather than `or` — group(2) can be b"" (empty quoted string)
@@ -268,8 +268,8 @@ def detect_stream(session, ts: float) -> list[dict]:
         user_bytes   = match.group(2) if match.group(2) is not None else match.group(3)
         passwd_bytes = match.group(4) if match.group(4) is not None else match.group(5)
 
-        user   = user_bytes.decode("utf-8", "ignore")   if user_bytes   is not None else ""
-        passwd = passwd_bytes.decode("utf-8", "ignore") if passwd_bytes is not None else ""
+        user   = user_bytes.decode("utf-8", "replace")   if user_bytes   is not None else ""
+        passwd = passwd_bytes.decode("utf-8", "replace") if passwd_bytes is not None else ""
 
         # Guard against empty credentials — emit nothing rather than noise.
         # (Only both-empty is dropped; e.g. LOGIN "" secret is still reported.)
@@ -304,7 +304,7 @@ def detect_stream(session, ts: float) -> list[dict]:
     # -----------------------------------------------------------------------
     auth_match = _IMAP_AUTH_PLAIN_RE.search(scan)
     if auth_match:
-        tag = auth_match.group(1).decode("utf-8", "ignore")
+        tag = auth_match.group(1).decode("utf-8", "replace")
         inline_blob = auth_match.group(2)
 
         if inline_blob:
@@ -377,6 +377,6 @@ def resolve(p, session):
     tag = p.finding.get("tag", "").upper().encode("utf-8", "ignore")
     for match in _IMAP_RESPONSE_RE.finditer(bytes(session.server_buf)):
         if match.group(1).upper() == tag:
-            status = match.group(2).upper().decode("utf-8", "ignore")
+            status = match.group(2).upper().decode("utf-8", "replace")
             return {"status": status, "outcome": _outcome(status)}, match.end()
     return None

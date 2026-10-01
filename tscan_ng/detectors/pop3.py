@@ -20,7 +20,7 @@ Port handling:
     Sessions where neither endpoint port is in the set are skipped immediately,
     keeping per-packet overhead negligible for non-POP3 traffic.
 
-    The scan for USER and PASS is bounded to _MAX_CMD_SCAN bytes so that a
+    The scan for USER and PASS is bounded to _MAX_SCAN_CLIENT bytes so that a
     large client buffer does not cause O(n) work on every arriving packet.
 
 Finding outcomes:
@@ -74,7 +74,7 @@ _POP3_PORTS: frozenset = frozenset({
 # Maximum bytes of the client buffer to scan for USER and PASS commands.
 # POP3 commands are short; 4 KB is well above any realistic auth exchange.
 # Bounding the scan keeps per-packet work O(1) regardless of buffer lifetime.
-_MAX_CMD_SCAN = 4096
+_MAX_SCAN_CLIENT = 4096
 
 # Matches POP3 USER command at the start of any line (MULTILINE).
 #   Group 1: username token. \s+ can cross a line break ("USER\r\nPASS x").
@@ -129,7 +129,7 @@ def detect_stream(session, ts: float) -> list:
     the server's reply) and consumes the matched commands from the client
     buffer to avoid re-detection on subsequent packets.
 
-    The scan is bounded to _MAX_CMD_SCAN bytes per call to keep per-packet
+    The scan is bounded to _MAX_SCAN_CLIENT bytes per call to keep per-packet
     work O(1) regardless of buffer lifetime.
 
     Args:
@@ -144,8 +144,8 @@ def detect_stream(session, ts: float) -> list:
     if session.dport not in _POP3_PORTS and session.sport not in _POP3_PORTS:
         return []
 
-    # Cap the scan to _MAX_CMD_SCAN bytes to bound per-packet CPU cost.
-    client_bytes = bytes(session.client_buf[:_MAX_CMD_SCAN])
+    # Cap the scan to _MAX_SCAN_CLIENT bytes to bound per-packet CPU cost.
+    client_bytes = bytes(session.client_buf[:_MAX_SCAN_CLIENT])
 
     user_match = _POP3_USER_RE.search(client_bytes)
     if not user_match:
@@ -155,8 +155,8 @@ def detect_stream(session, ts: float) -> list:
     if not pass_match:
         return []
 
-    user   = user_match.group(1).decode("utf-8", "ignore")
-    passwd = pass_match.group(1).decode("utf-8", "ignore")
+    user   = user_match.group(1).decode("utf-8", "replace")
+    passwd = pass_match.group(1).decode("utf-8", "replace")
 
     # Defensive guard against empty captures. Both patterns capture (\S+),
     # which cannot be empty, so this branch is currently unreachable; it stops
@@ -210,6 +210,6 @@ def resolve(p, session):
         if response.start() < p.server_buf_floor:
             continue
         code = response.group(1)
-        return ({"status": code.decode("utf-8", "ignore"), "outcome": _outcome(code)},
+        return ({"status": code.decode("utf-8", "replace"), "outcome": _outcome(code)},
                 response.end())
     return None

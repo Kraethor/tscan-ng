@@ -28,7 +28,8 @@ def decode_b64(token: bytes) -> str:
     characters outside the base64 alphabet are discarded, and missing or
     extra "=" padding is tolerated (the padding is recomputed from the
     remaining length; some clients omit it). Non-UTF-8 bytes in the decoded
-    data are silently dropped ("ignore").
+    data become U+FFFD ("replace", the detector-wide convention; see
+    detectors/__init__.py).
 
     A token that cannot be valid base64 at any padding (4n+1 significant
     characters) returns the empty string, so callers cannot tell "bad token"
@@ -42,6 +43,6 @@ def decode_b64(token: bytes) -> str:
     """
     data = _NON_B64_RE.sub(b"", token)
     try:
-        return base64.b64decode(data + b"=" * (-len(data) % 4)).decode("utf-8", "ignore")
+        return base64.b64decode(data + b"=" * (-len(data) % 4)).decode("utf-8", "replace")
     except Exception:
         return ""

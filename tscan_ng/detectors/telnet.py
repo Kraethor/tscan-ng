@@ -21,8 +21,8 @@ IAC negotiation:
 
 Port handling:
     The detector gates on _TELNET_PORTS. Sessions where neither endpoint is
-    in the set are skipped immediately. The scan is bounded to _MAX_CMD_SCAN
-    bytes to keep per-packet work O(1).
+    in the set are skipped immediately. The scan is bounded to _MAX_SCAN_CLIENT /
+    _MAX_SCAN_SERVER bytes to keep per-packet work O(1).
 
 Credential extraction:
     The detector waits until the server buffer shows both a login prompt
@@ -83,7 +83,8 @@ _TELNET_PORTS: frozenset = frozenset({
 # Maximum bytes of each buffer to scan per call.
 # Telnet login exchanges are short; 4 KB is well above any realistic auth
 # exchange including banner and IAC negotiation overhead.
-_MAX_CMD_SCAN = 4096
+_MAX_SCAN_CLIENT = 4096
+_MAX_SCAN_SERVER = 4096
 
 # ── Telnet IAC constants (RFC 854) ────────────────────────────────────────────
 
@@ -107,7 +108,7 @@ _LOGIN_PROMPT_RE = re.compile(
 
 # Matches password prompts sent by the server.
 # Must appear in server_buf (detect_stream only checks that it is present
-# somewhere in the first _MAX_CMD_SCAN bytes; it does NOT verify the ordering
+# somewhere in the first _MAX_SCAN_SERVER bytes; it does NOT verify the ordering
 # relative to the login prompt). IGNORECASE makes the [Pp] class redundant.
 _PASS_PROMPT_RE = re.compile(
     rb'[Pp]assword\s*:\s*',
@@ -271,7 +272,7 @@ def detect_stream(session, ts: float) -> list:
     Stream-aware Telnet credential detector.
 
     Waits until the server has sent both a login prompt and a password
-    prompt (both within the first _MAX_CMD_SCAN bytes of server_buf, in either
+    prompt (both within the first _MAX_SCAN_SERVER bytes of server_buf, in either
     order), then extracts the first two non-empty lines from the
     (IAC-stripped) client buffer as username and password. Sessions where
     either buffer is empty are skipped.
@@ -296,8 +297,8 @@ def detect_stream(session, ts: float) -> list:
         return []
 
     # Need data in both directions to detect a login exchange.
-    client_bytes = bytes(session.client_buf[:_MAX_CMD_SCAN])
-    server_bytes = bytes(session.server_buf[:_MAX_CMD_SCAN])
+    client_bytes = bytes(session.client_buf[:_MAX_SCAN_CLIENT])
+    server_bytes = bytes(session.server_buf[:_MAX_SCAN_SERVER])
 
     if not client_bytes or not server_bytes:
         return []
@@ -319,8 +320,8 @@ def detect_stream(session, ts: float) -> list:
         # Username and/or password not yet in the buffer — wait.
         return []
 
-    user   = lines[0].decode("utf-8", "ignore")
-    passwd = lines[1].decode("utf-8", "ignore")
+    user   = lines[0].decode("utf-8", "replace")
+    passwd = lines[1].decode("utf-8", "replace")
 
     # Defensive: _extract_lines() drops empty lines, so both values are
     # normally non-empty; this only fires if a line decodes to nothing.

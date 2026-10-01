@@ -36,7 +36,7 @@ Port handling:
     The detector gates on _SMTP_PORTS (a frozenset of known SMTP ports).
     Sessions where neither endpoint port is in the set are skipped immediately.
 
-    The scan for AUTH commands is bounded to _MAX_CMD_SCAN bytes so that a
+    The scan for AUTH commands is bounded to _MAX_SCAN_CLIENT bytes so that a
     large client buffer does not cause O(n) work on every arriving packet.
 
 Finding outcomes:
@@ -137,7 +137,7 @@ _SMTP_PORTS: frozenset = frozenset({
 # Maximum bytes of the client buffer to scan for AUTH commands per call.
 # SMTP auth exchanges are short; 4 KB is well above any realistic exchange.
 # Bounding the scan keeps per-packet work O(1) regardless of buffer lifetime.
-_MAX_CMD_SCAN = 4096
+_MAX_SCAN_CLIENT = 4096
 
 
 def _outcome(code: bytes) -> str:
@@ -181,9 +181,9 @@ def _decode_plain(blob: bytes) -> tuple | None:
         decoded = base64.b64decode(blob)
         parts = decoded.split(b"\x00")
         if len(parts) == 3:
-            return parts[1].decode("utf-8", "ignore"), parts[2].decode("utf-8", "ignore")
+            return parts[1].decode("utf-8", "replace"), parts[2].decode("utf-8", "replace")
         elif len(parts) == 2:
-            return parts[0].decode("utf-8", "ignore"), parts[1].decode("utf-8", "ignore")
+            return parts[0].decode("utf-8", "replace"), parts[1].decode("utf-8", "replace")
     except Exception:
         pass
     return None
@@ -223,8 +223,8 @@ def detect_stream(session, ts: float) -> list:
     if session.sport not in _SMTP_PORTS and session.dport not in _SMTP_PORTS:
         return []
 
-    # Cap the scan to _MAX_CMD_SCAN bytes to bound per-packet CPU cost.
-    client_bytes = bytes(session.client_buf[:_MAX_CMD_SCAN])
+    # Cap the scan to _MAX_SCAN_CLIENT bytes to bound per-packet CPU cost.
+    client_bytes = bytes(session.client_buf[:_MAX_SCAN_CLIENT])
 
     # -----------------------------------------------------------------------
     # AUTH LOGIN
@@ -341,6 +341,6 @@ def resolve(p, session):
         if response.start() < p.server_buf_floor:
             continue
         code = response.group(1)
-        return ({"status": code.decode("utf-8", "ignore"), "outcome": _outcome(code)},
+        return ({"status": code.decode("utf-8", "replace"), "outcome": _outcome(code)},
                 response.end())
     return None

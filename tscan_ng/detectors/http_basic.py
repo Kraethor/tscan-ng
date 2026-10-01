@@ -25,7 +25,7 @@ Port handling:
     reverting to unconditional scanning.
 
 Buffer handling:
-    The scan for HTTP header boundaries is capped at _MAX_HEADER_SCAN bytes
+    The scan for HTTP header boundaries is capped at _MAX_SCAN_CLIENT bytes
     per call. This keeps per-packet work O(1) regardless of buffer size, and
     avoids O(n²) behaviour at high line speed where detect_stream() is called
     on every arriving packet.
@@ -92,7 +92,7 @@ Response correlation:
 
 Known limitations:
     - HTTPS is opaque; only cleartext HTTP on the configured ports is seen.
-    - A header block longer than _MAX_HEADER_SCAN, or a large body with no
+    - A header block longer than _MAX_SCAN_CLIENT, or a large body with no
       CRLF CRLF in it, prevents progress: nothing is consumed until enough
       data arrives to find a boundary inside the scan window.
     - Digest, NTLM and Bearer authentication are not handled.
@@ -122,9 +122,9 @@ _HTTP_PORTS: frozenset = frozenset({
 # Maximum bytes to scan for an HTTP header boundary (\r\n\r\n) per call.
 # 16 KB is well above any realistic HTTP request header. Capping the scan
 # here bounds per-packet CPU to O(1) rather than O(n) over buffer lifetime.
-# (The scan window is _MAX_HEADER_SCAN + 4 bytes so a boundary that ends
+# (The scan window is _MAX_SCAN_CLIENT + 4 bytes so a boundary that ends
 # exactly at the limit is still found.)
-_MAX_HEADER_SCAN = 16384
+_MAX_SCAN_CLIENT = 16384
 
 # Matches the HTTP request line e.g. "GET /path HTTP/1.1".
 #   Group 1: method (upper-case letters only), Group 2: request target.
@@ -203,7 +203,8 @@ def resolve(p, session):
 
     Returns:
         ({"status", "status_text", "outcome"}, bytes to consume) or None if
-        that response is not buffered yet.
+        that response is not buffered yet. "status" is the 3-digit code as a
+        str ("200"), like every other detector's status.
     """
     rsp_index = p.finding.get("_rsp_index")
     want = 0 if rsp_index is None else rsp_index - session.http_rsp_gone
@@ -213,8 +214,8 @@ def resolve(p, session):
         if n == want:
             session.http_rsp_gone += want + 1
             status = int(match.group(1))
-            return ({"status": status,
-                     "status_text": match.group(2).decode("utf-8", "ignore").strip(),
+            return ({"status": str(status),
+                     "status_text": match.group(2).decode("utf-8", "replace").strip(),
                      "outcome": _outcome(status)},
                     match.end())
     return None
@@ -232,7 +233,7 @@ def detect_stream(session, ts: float) -> list[dict]:
     subsequent packets. Each request block is numbered (Session.http_req_seen)
     so resolve() can pick its own response.
 
-    The scan is bounded to _MAX_HEADER_SCAN bytes per call to prevent O(n²)
+    The scan is bounded to _MAX_SCAN_CLIENT bytes per call to prevent O(n²)
     CPU usage at high line speed. The client buffer is consumed before
     per-request processing so the buffer always advances, even if processing
     raises an exception.
@@ -252,10 +253,10 @@ def detect_stream(session, ts: float) -> list[dict]:
 
 
     while True:
-        # Limit the scan to _MAX_HEADER_SCAN bytes to keep per-packet work
+        # Limit the scan to _MAX_SCAN_CLIENT bytes to keep per-packet work
         # O(1). If no complete header is found within this window, wait for
         # more data to arrive.
-        scan = bytes(session.client_buf[:_MAX_HEADER_SCAN + 4])
+        scan = bytes(session.client_buf[:_MAX_SCAN_CLIENT + 4])
         header_end = scan.find(b"\r\n\r\n")
         if header_end == -1:
             break
@@ -282,8 +283,8 @@ def detect_stream(session, ts: float) -> list[dict]:
 
         # Extract request line (method + URI)
         req_match = _REQUEST_LINE_RE.search(headers)
-        method = req_match.group(1).decode("utf-8", "ignore") if req_match else ""
-        uri    = req_match.group(2).decode("utf-8", "ignore") if req_match else ""
+        method = req_match.group(1).decode("utf-8", "replace") if req_match else ""
+        uri    = req_match.group(2).decode("utf-8", "replace") if req_match else ""
 
         if not method:
             # Authorization header present but no parseable request line.
@@ -295,7 +296,7 @@ def detect_stream(session, ts: float) -> list[dict]:
 
         # Extract Host header
         host_match = _HOST_HEADER_RE.search(headers)
-        host = host_match.group(1).decode("utf-8", "ignore") if host_match else ""
+        host = host_match.group(1).decode("utf-8", "replace") if host_match else ""
 
         # Decode Base64 credentials
         creds = decode_b64(auth_match.group(1))

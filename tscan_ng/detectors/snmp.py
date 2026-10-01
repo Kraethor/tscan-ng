@@ -121,7 +121,7 @@ _SNMP_PORTS: frozenset = frozenset({161})
 # Maximum bytes to scan per call. SNMP GetRequest/SetRequest messages for a
 # handful of OIDs are well under a few hundred bytes; this is generous
 # headroom while still bounding worst-case scan cost.
-_MAX_SCAN = 2048
+_MAX_SCAN_CLIENT = 2048
 
 # BER tag bytes. A PDU tag is Context-specific, constructed (0xA0 | n), where
 # n is the PDU type from RFC 1157 / RFC 3416 (n=4, the v1 Trap, is 0xA4 and
@@ -238,7 +238,7 @@ def _find_snmp_request(data: bytes):
 
     Args:
         data: Raw bytes from the client stream buffer (bounded to
-              _MAX_SCAN by the caller).
+              _MAX_SCAN_CLIENT by the caller).
 
     Returns:
         (version, community, request_id, pdu_name, end_offset) if found,
@@ -396,7 +396,7 @@ def detect_stream(session, ts: float) -> list:
     if session.dport not in _SNMP_PORTS and session.sport not in _SNMP_PORTS:
         return []
 
-    client_bytes = bytes(session.client_buf[:_MAX_SCAN])
+    client_bytes = bytes(session.client_buf[:_MAX_SCAN_CLIENT])
     version, community, request_id, pdu_name, req_end = _find_snmp_request(client_bytes)
 
     if community is None:

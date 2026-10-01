@@ -54,8 +54,6 @@ Known limitations:
       message still being received.
     - resultCode is read from a single byte, so values above 127 (two-byte
       ENUMERATED) would be misread; standard codes are all below 128.
-    - Text is decoded with errors="replace" (most other detectors use
-      "ignore").
 """
 
 import logging
@@ -73,7 +71,7 @@ _LDAP_PORTS: frozenset = frozenset({
 
 # Maximum bytes of the client buffer to scan per call.
 # LDAP BindRequests are modest in size; 8 KB covers any realistic auth exchange.
-_MAX_SCAN = 8192
+_MAX_SCAN_CLIENT = 8192
 
 # BER/ASN.1 tag constants used in LDAPMessage (RFC 4511). A tag byte is
 # class (top 2 bits) | constructed flag (0x20) | tag number (low 5 bits), so
@@ -186,7 +184,7 @@ def _find_bind_request(data: bytes):
     buffer here; the caller deletes up to end_offset only on a match.
 
     Args:
-        data: Raw bytes from the client stream buffer (bounded to _MAX_SCAN).
+        data: Raw bytes from the client stream buffer (bounded to _MAX_SCAN_CLIENT).
 
     Returns:
         (dn, password, message_id, end_offset) if a simple BindRequest is
@@ -371,7 +369,7 @@ def detect_stream(session, ts: float) -> list:
     Every simple bind is registered as pending; resolve() matches the
     BindResponse (on the same packet if it is already buffered).
 
-    The scan is bounded to _MAX_SCAN bytes per call to keep per-packet CPU
+    The scan is bounded to _MAX_SCAN_CLIENT bytes per call to keep per-packet CPU
     cost O(1) regardless of buffer depth.
 
     Args:
@@ -387,7 +385,7 @@ def detect_stream(session, ts: float) -> list:
         return []
 
     # Bound the scan to avoid O(n) work on very deep buffers.
-    client_bytes = bytes(session.client_buf[:_MAX_SCAN])
+    client_bytes = bytes(session.client_buf[:_MAX_SCAN_CLIENT])
     dn, password, message_id, req_end = _find_bind_request(client_bytes)
 
     if dn is None:

@@ -119,7 +119,7 @@ class AlreadyBufferedTests(unittest.TestCase):
         self.check(80, b"GET / HTTP/1.1\r\nHost: x\r\nAuthorization: Basic "
                    + base64.b64encode(b"bob:pw1") + b"\r\n\r\n",
                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", "success",
-                   status=200, status_text="OK")
+                   status="200", status_text="OK")
 
     def test_telnet_searches_only_after_password_prompt(self):
         self.check(23, b"admin\r\npw1\r\n",

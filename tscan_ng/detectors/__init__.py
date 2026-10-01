@@ -18,6 +18,16 @@ returns ({"status", "outcome", ...}, bytes_to_consume) once the reply is
 in server_buf, else None; tscan_ng.resolve consumes the bytes and shifts
 the other pending findings' floors. It must not modify server_buf itself.
 
+Conventions every detector follows (TODO.md #61; tests/test_conventions.py):
+    - Bytes are decoded with errors="replace", never "ignore": a credential
+      containing a non-UTF-8 byte shows U+FFFD in its place rather than
+      silently losing the byte.
+    - "status" in resolve()'s fields is always a str: the protocol's own
+      reply code where it has one ("230", "401", "49", "OK", a SQLSTATE),
+      otherwise the outcome word (irc, redis, telnet).
+    - The per-call scan windows are module constants named _MAX_SCAN_CLIENT
+      (client_buf) and, where server_buf is windowed too, _MAX_SCAN_SERVER.
+
 Call configure_all(cfg) once in each worker process after loading Config to
 apply the port sets from the config file to every protocol detector.
 
