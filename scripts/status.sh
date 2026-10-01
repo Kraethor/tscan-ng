@@ -3,21 +3,20 @@
 #
 # Read-only. Prints, in order: `systemctl status` of the pipeline service
 # (first 12 lines), of the healthcheck timer (first 6 lines), the capture
-# interface's link state, the number of processes matching the pipeline's
-# main command line, and the last 15 journal lines of the pipeline unit.
+# interface's link state, the main PID and number of worker processes, and
+# the last 15 journal lines of the pipeline unit.
 #
 # Usage:  bash /opt/tscan/scripts/status.sh      (no arguments)
 #
 # Environment: none read. Unit names and the capture interface name are
 #   hard-coded below (IFACE must be edited if the NIC changes).
 #
-# Privileges: runs as the invoking (non-root) user and calls
-#   `sudo systemctl`, `sudo ip` and `sudo journalctl`, which rely on the
-#   NOPASSWD grants in /etc/sudoers.d for exactly those binaries. No root
-#   login needed, but it will prompt for a password if the grants are absent.
-#   (Inference: `systemctl status` and `ip link show` do not require root by
-#   themselves; sudo matters mainly for journalctl on a user outside the
-#   adm/systemd-journal groups.)
+# Privileges: runs as the invoking (non-root) user. `systemctl status`,
+#   `systemctl show`, `ip link show` and `pgrep` work for any user and are
+#   run without sudo (TODO.md #45). Only journalctl uses `sudo`, relying on
+#   the NOPASSWD grant in /etc/sudoers.d, because a user outside the
+#   adm/systemd-journal groups cannot read the unit's journal; it will
+#   prompt for a password if that grant is absent.
 #
 # Exit codes: deliberately NOT `set -e` -- a stopped service or missing
 #   interface must not abort the snapshot, so individual command failures are
@@ -33,30 +32,30 @@ IFACE="enx00242788e34c"
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 
 bold "== ${PIPELINE} =="
-sudo systemctl status "${PIPELINE}" --no-pager -l | head -n 12
+systemctl status "${PIPELINE}" --no-pager -l | head -n 12
 echo
 
 bold "== healthcheck timer =="
-sudo systemctl status "${HEALTHCHECK_TIMER}" --no-pager -l | head -n 6
+systemctl status "${HEALTHCHECK_TIMER}" --no-pager -l | head -n 6
 echo
 
 bold "== capture interface (${IFACE}) =="
-sudo ip -brief link show "${IFACE}" 2>/dev/null || echo "  ${IFACE} not found"
+ip -brief link show "${IFACE}" 2>/dev/null || echo "  ${IFACE} not found"
 echo
 
 bold "== worker processes =="
-# Counts processes whose full command line matches "tscan_ng.pipeline", i.e.
-# the main process (`python -m tscan_ng.pipeline`). The worker children
-# are started with multiprocessing's "spawn" start method (pinned in
-# pipeline.main()); their command lines are `python -c 'from
-# multiprocessing.spawn import spawn_main ...'`, which this pattern does not
-# match, so on a healthy host this prints 1 -- use
-# `systemctl status` (CGroup section) to see the workers.
-count=$(pgrep -cf "tscan_ng\.pipeline")
-if [[ "${count}" -gt 0 ]]; then
-  echo "  ${count} process(es) (1 main; spawned workers are not counted here)"
+# The workers are multiprocessing "spawn" children of the service's main
+# process (pinned in pipeline.main()). Their command lines are `python -c
+# 'from multiprocessing.spawn import spawn_main ...'` and do not mention
+# tscan_ng, so they are counted as children of systemd's MainPID whose
+# command line names multiprocessing.spawn. The resource tracker, also a
+# child, is not counted. Expect [dispatcher] workers (default one per CPU).
+main_pid=$(systemctl show "${PIPELINE}" -p MainPID --value 2>/dev/null)
+if [[ -n "${main_pid}" && "${main_pid}" != "0" ]]; then
+  workers=$(pgrep -c -P "${main_pid}" -f 'multiprocessing\.spawn')
+  echo "  main PID ${main_pid}, ${workers:-0} worker process(es)"
 else
-  echo "  none running"
+  echo "  pipeline not running"
 fi
 echo
 

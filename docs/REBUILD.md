@@ -500,9 +500,11 @@ bash /opt/tscan/scripts/status.sh
 ```
 
 A non-interactive, one-shot version of the same status information —
-useful for a quick check or piping into something else. Uses the
-NOPASSWD sudo grants for `systemctl`/`journalctl`/`ip` (see
-`/etc/sudoers.d/`) rather than requiring a root login.
+useful for a quick check or piping into something else. It shows the main
+PID and the number of worker processes (spawn children of the main
+process; expect `[dispatcher] workers`). Only `journalctl` uses sudo, via
+the NOPASSWD grant (see `/etc/sudoers.d/`), rather than requiring a root
+login; `systemctl` and `ip` run as the invoking user.
 
 ### Fake protocol servers (generating test traffic)
 ```bash

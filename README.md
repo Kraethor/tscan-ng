@@ -205,11 +205,11 @@ Three read-only tools:
   world-readable except the results JSONL, which needs `tscan` group
   membership like `watch.py`; without it the findings panel stays at zero.
 - `scripts/status.sh` — a quick, non-interactive snapshot of the same
-  service/interface/log state for a single glance or piping elsewhere.
-  Unlike the two above, this one does run `systemctl`/`journalctl`/`ip` via
-  `sudo` — passwordless (NOPASSWD, see `/etc/sudoers.d/`) so it needs no
-  interactive root login, but it is genuinely running those specific calls
-  as root.
+  service/interface/log state for a single glance or piping elsewhere,
+  including the main PID and the number of worker processes. Unlike the two
+  above, it runs `journalctl` via `sudo` — passwordless (NOPASSWD, see
+  `/etc/sudoers.d/`) so it needs no interactive root login, but that one
+  call genuinely runs as root. `systemctl` and `ip` run as the invoking user.
 
 None of these affect logging or alerting — both already happen inside
 `tscan-pipeline.service` regardless of whether any viewer is running, so
