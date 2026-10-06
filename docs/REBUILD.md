@@ -211,6 +211,15 @@ then fix ownership/mode as above) and set at minimum:
 iface = <your capture interface name>
 ```
 
+The read-only monitoring scripts (`scripts/status.sh`, `scripts/dashboard.py`)
+do **not** read this config; they take the interface names from the
+`TSCAN_IFACE` / `TSCAN_MONITOR_IFACE` / `TSCAN_ADMIN_IFACE` environment
+variables (defaulting to `eth1`/`eth0`). Export them for the operator account
+(e.g. in `~/.bashrc`) so those tools resolve the capture and admin NICs:
+```bash
+export TSCAN_IFACE=<capture-nic> TSCAN_MONITOR_IFACE=<capture-nic> TSCAN_ADMIN_IFACE=<admin-nic>
+```
+
 All other values have safe defaults. See the config file itself and
 `tscan_ng/config.py` for documentation of every setting. Sections:
 `[capture]` (iface, snaplen, buffer_bytes, bpf_filter), `[dispatcher]`

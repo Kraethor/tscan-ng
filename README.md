@@ -205,8 +205,9 @@ Three read-only tools:
 - `scripts/dashboard.py` — live full-screen status dashboard (service
   state, monitor/admin interface health, capture throughput, recent
   findings — again counting only `outcome == "success"` — and worker/load
-  info), refreshing once a second. Interface names and the worker count are
-  constants at the top of the script, not read from the config. Everything it
+  info), refreshing once a second. The worker count is a constant at the top of
+  the script; the monitor/admin interface names come from environment variables
+  (see below), not the config. Everything it
   reads (systemd unit properties, `/sys/class/net` statistics) is
   world-readable except the results JSONL, which needs `tscan` group
   membership like `watch.py`; without it the findings panel stays at zero.
@@ -216,6 +217,17 @@ Three read-only tools:
   above, it runs `journalctl` via `sudo` — passwordless (NOPASSWD, see
   `/etc/sudoers.d/`) so it needs no interactive root login, but that one
   call genuinely runs as root. `systemctl` and `ip` run as the invoking user.
+
+**Capture-interface names.** `status.sh` reads `TSCAN_IFACE`, and
+`dashboard.py` reads `TSCAN_MONITOR_IFACE` (capture) and `TSCAN_ADMIN_IFACE`
+(management), each defaulting to a generic `eth1`/`eth0`. Export them (e.g. in
+your shell's rc file) to match this host's NICs, or the tools report the
+interface as "not found":
+```bash
+export TSCAN_IFACE=<capture-nic> TSCAN_MONITOR_IFACE=<capture-nic> TSCAN_ADMIN_IFACE=<admin-nic>
+```
+The pipeline service itself is unaffected — it reads the capture NIC from
+`tscan_ng.conf`.
 
 None of these affect logging or alerting — both already happen inside
 `tscan-pipeline.service` regardless of whether any viewer is running, so

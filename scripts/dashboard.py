@@ -219,7 +219,7 @@ def read_operstate(iface: str) -> str:
 
 
 def read_iface_ipv4(iface: str) -> str:
-    """Return iface's first IPv4 address in CIDR form (e.g. '192.168.20.216/24'),
+    """Return iface's first IPv4 address in CIDR form (e.g. '192.168.1.42/24'),
     or '-' if it has none or `ip` fails. Shells out rather than parsing
     /sys/class/net since the kernel exposes no sysfs file for IP addresses."""
     try:
