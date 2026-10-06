@@ -9,8 +9,9 @@
 #   sudo systemctl restart tscan-pipeline
 
 [capture]
-# Network interface to capture from (SPAN/mirror destination)
-iface               = enx00242788e34c
+# Network interface to capture from (SPAN/mirror destination).
+# Set this to your capture NIC, e.g. eth1 or enx<MAC> for a USB NIC.
+iface               = eth1
 
 # Maximum bytes captured per packet
 snaplen             = 65535

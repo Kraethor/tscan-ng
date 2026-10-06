@@ -71,8 +71,11 @@ PIPELINE_UNIT = "tscan-pipeline.service"
 HEALTHCHECK_TIMER = "tscan-pipeline-healthcheck.timer"
 DOWN_MARKER = "/var/lib/tscan-healthcheck/down"
 
-MONITOR_IFACE = "enx00242788e34c"   # SPAN/mirror capture interface
-ADMIN_IFACE = "enp2s0"              # management/SSH interface
+# Capture/management interfaces. Override per host via the environment
+# (e.g. export TSCAN_MONITOR_IFACE=enx001122334455) so no deployment-specific
+# device name is baked into the repo.
+MONITOR_IFACE = os.environ.get("TSCAN_MONITOR_IFACE", "eth1")   # SPAN/mirror capture interface
+ADMIN_IFACE = os.environ.get("TSCAN_ADMIN_IFACE", "eth0")       # management/SSH interface
 
 RESULTS_PATH = "/var/log/tscan/results.jsonl"
 # Display-only: NOT read from tscan_ng.conf. Update by hand if [dispatcher]

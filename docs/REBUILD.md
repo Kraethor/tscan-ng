@@ -1,6 +1,6 @@
 # REBUILD.md
 **tscan-ng – Rebuild & Deployment Guide**
-**Applies to any tscan-ng deployment (e.g. U01, ser8)**
+**Applies to any tscan-ng deployment**
 
 ## Purpose
 
@@ -325,7 +325,7 @@ every start systemd creates `/var/log/tscan` if missing, makes it
 `tscan:tscan` and resets it to `0750`, and files the service creates are
 `0640`. The JSONL holds captured credentials in the clear, so only `tscan`
 and members of the `tscan` group may read it; `watch.py` and `dashboard.py`
-therefore need `tscan` group membership (`thoward` has it) or `sudo`.
+therefore need `tscan` group membership (add your operator user to it) or `sudo`.
 
 Files that already exist keep their mode: logrotate renames
 `results.jsonl` (the rotated copies keep its mode) and creates the new one
@@ -435,7 +435,7 @@ checkout, venv and units are rolled back and the old code is restarted
 It does **not** install `logrotate/tscan` or the capture-NIC networkd file;
 repeat those steps by hand if they change. pip runs as `tscan`, so a
 requirements change that needs a package install fails unless the venv is
-writable by `tscan` (it is owned by `thoward` on ser8); that failure is
+writable by `tscan` (on some hosts the checkout is owned by the deploy user, not `tscan`); that failure is
 rolled back like any other.
 
 **Important:**

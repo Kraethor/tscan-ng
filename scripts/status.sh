@@ -8,8 +8,9 @@
 #
 # Usage:  bash /opt/tscan/scripts/status.sh      (no arguments)
 #
-# Environment: none read. Unit names and the capture interface name are
-#   hard-coded below (IFACE must be edited if the NIC changes).
+# Environment: TSCAN_IFACE overrides the capture interface name (defaults to
+#   a generic placeholder; set it per host, e.g. export TSCAN_IFACE=enx...).
+#   Unit names are hard-coded below.
 #
 # Privileges: runs as the invoking (non-root) user. `systemctl status`,
 #   `systemctl show`, `ip link show` and `pgrep` work for any user and are
@@ -27,7 +28,7 @@ set -uo pipefail
 
 PIPELINE="tscan-pipeline.service"
 HEALTHCHECK_TIMER="tscan-pipeline-healthcheck.timer"
-IFACE="enx00242788e34c"
+IFACE="${TSCAN_IFACE:-eth1}"
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 

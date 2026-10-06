@@ -4,7 +4,7 @@ After=network.target
 Documentation=file:/opt/tscan/docs/REBUILD.md
 # Unlimited restart attempts. The default (5 starts per 10s) exists to stop
 # a genuinely broken unit from spinning forever, but the main failure mode
-# here -- the capture interface (enx00242788e34c, a USB NIC) going down --
+# here -- the capture interface (a USB NIC) going down --
 # is exactly the case where retrying forever is correct: every RestartSec
 # tick is another chance to notice the NIC came back, and pipeline.py now
 # exits non-zero specifically so these retries happen instead of the
@@ -32,8 +32,8 @@ RuntimeDirectory=tscan
 # /var/log/tscan holds results.jsonl, which contains captured credentials in
 # the clear (TODO.md #6). systemd creates the directory if it is missing,
 # makes it owned by tscan:tscan and resets it to 0750 on every start, so
-# only tscan and members of the tscan group (thoward, for watch.py and
-# dashboard.py) can reach the files. UMask=0027 makes files the service
+# only tscan and members of the tscan group (your operator user, for
+# watch.py and dashboard.py) can reach the files. UMask=0027 makes files the service
 # creates 0640 (results.jsonl when it is first created, cooldown markers);
 # logrotate renames the file (keeping its mode) and creates the new one
 # 0640 tscan:tscan (logrotate/tscan, TODO.md #47).
@@ -103,10 +103,10 @@ SystemCallErrorNumber=EPERM
 # and tscan-dispatcher.service's 4G separately; this single service now
 # does both jobs, so it adopts the larger of the two as its ceiling.
 #
-# Raised 2026-07-13 on ser8: workers=12 (vs U01's smaller worker count) x
-# capture.buffer_bytes=256M alone is ~3G of AF_PACKET recv-buffer allocation,
-# leaving no headroom under the original 3G/4G limits sized for fewer
-# workers. ser8 has 57G RAM, so bumped proportionally.
+# Sized for a high-core-count host: workers=12 x capture.buffer_bytes=256M
+# alone is ~3G of AF_PACKET recv-buffer allocation, leaving no headroom under
+# the original 3G/4G limits sized for fewer workers. On a host with ample RAM
+# (tens of GB) these were bumped proportionally; lower them for a smaller box.
 MemoryHigh=6G
 MemoryMax=8G
 MemorySwapMax=512M

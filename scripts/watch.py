@@ -45,7 +45,7 @@ Privileges:
     Read access to the results file. /var/log/tscan is 0750 tscan:tscan and
     the service creates files 0640 (LogsDirectoryMode= and UMask= in
     tscan-pipeline.service, TODO.md #6), so the user must be in the tscan
-    group (thoward is) or use `sudo`.
+    group or use `sudo`.
 
 Untrusted input:
     Nearly every field of a finding comes from captured traffic. Control and

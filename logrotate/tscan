@@ -19,7 +19,7 @@
 # next write creates it anyway.
 #
 # maxsize 100M: rotate early if the file grows past 100 MB, checked when
-# logrotate runs (logrotate.timer, daily on ser8), so it caps one day's
+# logrotate runs (logrotate.timer, daily), so it caps one day's
 # growth rather than enforcing a hard limit.
 #
 # su tscan tscan: performs the rotation as the tscan user/group instead of

@@ -1,6 +1,6 @@
 # tscan-ng Protocol Test Reference
 
-**Test server:** cloud.sisypheansecurity.com
+**Test server:** testhost.example.com
 **Valid credentials:** `testuser` / `hunter2` — any other credentials will fail
 
 ---
@@ -58,12 +58,12 @@ Fake SMTP server running on the test host. Supports `AUTH PLAIN` and `AUTH LOGIN
 
 | Test | Command | Expected result |
 |------|---------|-----------------|
-| AUTH PLAIN — good | `curl -v --url "smtp://cloud.sisypheansecurity.com:2525" --mail-from "from@test.com" --mail-rcpt "to@test.com" --user "testuser:hunter2" --no-ssl` | `235 Authentication successful` |
-| AUTH PLAIN — bad | `curl -v --url "smtp://cloud.sisypheansecurity.com:2525" --mail-from "from@test.com" --mail-rcpt "to@test.com" --user "baduser:wrongpass" --no-ssl` | `535 5.7.8 Authentication credentials invalid` |
+| AUTH PLAIN — good | `curl -v --url "smtp://testhost.example.com:2525" --mail-from "from@test.com" --mail-rcpt "to@test.com" --user "testuser:hunter2" --no-ssl` | `235 Authentication successful` |
+| AUTH PLAIN — bad | `curl -v --url "smtp://testhost.example.com:2525" --mail-from "from@test.com" --mail-rcpt "to@test.com" --user "baduser:wrongpass" --no-ssl` | `535 5.7.8 Authentication credentials invalid` |
 
 ### nc manual session
 
-Connect with: `nc cloud.sisypheansecurity.com 2525`
+Connect with: `nc testhost.example.com 2525`
 
 | Step | You type | Server replies |
 |------|----------|----------------|
@@ -91,12 +91,12 @@ Fake IMAP server. Supports `LOGIN` command, `AUTHENTICATE PLAIN`, and `AUTHENTIC
 
 | Test | Command | Expected result |
 |------|---------|-----------------|
-| LOGIN — good | `curl -v "imap://cloud.sisypheansecurity.com:1430/INBOX" --user "testuser:hunter2" --no-ssl` | `OK LOGIN completed` |
-| LOGIN — bad | `curl -v "imap://cloud.sisypheansecurity.com:1430/INBOX" --user "baduser:wrongpass" --no-ssl` | `NO [AUTHENTICATIONFAILED]` |
+| LOGIN — good | `curl -v "imap://testhost.example.com:1430/INBOX" --user "testuser:hunter2" --no-ssl` | `OK LOGIN completed` |
+| LOGIN — bad | `curl -v "imap://testhost.example.com:1430/INBOX" --user "baduser:wrongpass" --no-ssl` | `NO [AUTHENTICATIONFAILED]` |
 
 ### nc manual session
 
-Connect with: `nc cloud.sisypheansecurity.com 1430`
+Connect with: `nc testhost.example.com 1430`
 
 | Step | You type | Server replies |
 |------|----------|----------------|
@@ -121,12 +121,12 @@ Fake POP3 server. Supports `USER`/`PASS` (fully plaintext, no encoding) and `AUT
 
 | Test | Command | Expected result |
 |------|---------|-----------------|
-| USER/PASS — good | `curl -v "pop3://cloud.sisypheansecurity.com:1100" --user "testuser:hunter2" --no-ssl` | `+OK mailbox locked and ready` |
-| USER/PASS — bad | `curl -v "pop3://cloud.sisypheansecurity.com:1100" --user "baduser:wrongpass" --no-ssl` | `-ERR [AUTH] Invalid credentials` |
+| USER/PASS — good | `curl -v "pop3://testhost.example.com:1100" --user "testuser:hunter2" --no-ssl` | `+OK mailbox locked and ready` |
+| USER/PASS — bad | `curl -v "pop3://testhost.example.com:1100" --user "baduser:wrongpass" --no-ssl` | `-ERR [AUTH] Invalid credentials` |
 
 ### nc manual session
 
-Connect with: `nc cloud.sisypheansecurity.com 1100`
+Connect with: `nc testhost.example.com 1100`
 
 | Step | You type | Server replies |
 |------|----------|----------------|
@@ -201,12 +201,12 @@ Fake Telnet server running on the test host. Telnet sends all data including cre
 
 | Test | Command | Expected result |
 |------|---------|-----------------|
-| Connect | `telnet cloud.sisypheansecurity.com 2323` | Login prompt |
-| nc connect | `nc cloud.sisypheansecurity.com 2323` | Type username/password at prompts — fully plaintext |
+| Connect | `telnet testhost.example.com 2323` | Login prompt |
+| nc connect | `nc testhost.example.com 2323` | Type username/password at prompts — fully plaintext |
 
 ### nc manual session
 
-Connect with: `nc cloud.sisypheansecurity.com 2323`
+Connect with: `nc testhost.example.com 2323`
 
 | Step | You type | Server replies |
 |------|----------|----------------|
@@ -368,12 +368,12 @@ Requires a test server/database with `pg_hba.conf` set to `password` (not
 
 | Protocol | Port | Auth method | Encoding | Server | Notes |
 |----------|------|-------------|----------|--------|-------|
-| SMTP | 2525 | AUTH PLAIN / LOGIN | base64 | cloud.sisypheansecurity.com | Fake server |
-| IMAP | 1430 | LOGIN / AUTHENTICATE PLAIN | plaintext (LOGIN) / base64 (PLAIN) | cloud.sisypheansecurity.com | Fake server |
-| POP3 | 1100 | USER/PASS / AUTH PLAIN | Plaintext / base64 | cloud.sisypheansecurity.com | Fake server |
+| SMTP | 2525 | AUTH PLAIN / LOGIN | base64 | testhost.example.com | Fake server |
+| IMAP | 1430 | LOGIN / AUTHENTICATE PLAIN | plaintext (LOGIN) / base64 (PLAIN) | testhost.example.com | Fake server |
+| POP3 | 1100 | USER/PASS / AUTH PLAIN | Plaintext / base64 | testhost.example.com | Fake server |
 | FTP | 21 | USER / PASS | Plaintext | ftp.freebsd.org | Public server |
 | HTTP | 80 | Basic Auth | base64 | neverssl.com | No TLS guaranteed |
-| Telnet | 2323 | Login prompt | Plaintext | cloud.sisypheansecurity.com | Raw ASCII on wire |
+| Telnet | 2323 | Login prompt | Plaintext | testhost.example.com | Raw ASCII on wire |
 | LDAP | 389, 3268 | Simple bind | Plaintext BER | Local test instance | 636/3269 are TLS — not captured |
 | Redis | 6379, 6380 | AUTH command | Plaintext RESP | Local test instance | Redis 6+ supports ACL username |
 | SMB | 445, 139 | NTLM SESSION_SETUP | NTLMv2 challenge/response (hashcat -m 5600) | Real SMB server / local Samba | Captures a crackable hash, not a password |
