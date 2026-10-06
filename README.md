@@ -3,6 +3,12 @@
 `tscan-ng` is a line-speed network traffic scanner designed for passive
 monitoring via SPAN / mirror ports.
 
+> **Authorized use only.** tscan-ng passively captures credentials and other
+> authentication material from network traffic. Run it only on networks you
+> own or are explicitly authorized to monitor. You are responsible for
+> complying with all applicable laws and policies; the authors accept no
+> liability for misuse (see the warranty disclaimer in the GNU GPL).
+
 ## Repository layout
 - `tscan_ng/` – Python capture pipeline, detectors, and output sinks
 - `scripts/` – operational scripts (live viewer, dashboard, status snapshot,
@@ -285,3 +291,19 @@ see `docs/test_reference.md`.
 - Designed to run with a non-login service account
 - Capture NIC is RX-only (no default route)
 - Management NIC handles SSH, Git, and admin
+
+## License
+
+Copyright (C) 2026 Kraethor.
+
+tscan-ng is free software, licensed under the **GNU General Public License,
+version 3** (`GPL-3.0-only`). You may use, study, modify, and redistribute it
+under those terms; any distributed derivative must also be released under the
+GPL-3.0 with complete source. See [`LICENSE`](LICENSE) for the full text. It is
+distributed WITH NO WARRANTY, to the extent permitted by law.
+
+**Attribution (GPLv3 section 7(b)).** As an additional term permitted by
+section 7(b) of the GPL, any conveyed copy or modified version must preserve
+the attribution "Based on tscan-ng by Kraethor
+(https://github.com/Kraethor/tscan-ng)" in the source and in any user-facing
+output or accompanying documentation.
