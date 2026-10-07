@@ -37,14 +37,29 @@ Port handling:
     immediately, keeping per-packet overhead negligible for non-matching
     traffic — the same pattern every other detector in this package uses.
 
+    _HTTP_PORTS below is only the default. detectors.configure_all(cfg)
+    rebinds this module's _HTTP_PORTS to the configured set once per worker
+    process at startup, so the frozenset in this file is what applies only
+    when configure_all() is never called (e.g. in unit tests) — editing it
+    does not change the gate in a running deployment. The default the
+    pipeline actually falls back to is declared in the registry, the "http"
+    row of tscan_ng.protocols.PROTOCOLS, which _HTTP_PORTS mirrors; see
+    detectors/__init__.py configure_all() for the rebinding.
+
+    To change the ports in a deployment, set ports.http in tscan_ng.conf.
+    That one list does double duty: capture._build_port_filter() unions the
+    configured ports of every protocol into the BPF filter attached to the
+    capture socket, so a port missing from it is never captured at all and
+    no detector-side gate can recover it.
+
     This is a deliberate coverage/cost tradeoff: Basic Auth on a port
-    outside this list will not be detected. Previously this detector had no
-    port gate at all and scanned every session on the wire regardless of
-    port, which was the single largest per-packet CPU cost in the pipeline
-    on a full SPAN/mirror feed (every non-HTTP session — bulk HTTPS, video,
-    everything — still paid for a 16 KB buffer scan on every packet). Add
-    site-specific alternate ports to ports.http in tscan_ng.conf rather than
-    reverting to unconditional scanning.
+    outside the configured list will not be detected. Previously this
+    detector had no port gate at all and scanned every session on the wire
+    regardless of port, which was the single largest per-packet CPU cost in
+    the pipeline on a full SPAN/mirror feed (every non-HTTP session — bulk
+    HTTPS, video, everything — still paid for a 16 KB buffer scan on every
+    packet). Add site-specific alternate ports to ports.http in
+    tscan_ng.conf rather than reverting to unconditional scanning.
 
 Buffer handling:
     The scan for HTTP header boundaries is capped at _MAX_SCAN_CLIENT bytes
@@ -136,9 +151,16 @@ from tscan_ng.detectors.common import advance_scan_window, base_finding, decode_
 # Finding types this detector emits; tscan_ng.resolve maps each to resolve().
 FINDING_TYPES = ("http_basic",)
 
-# Well-known and commonly-used HTTP/proxy ports.
+# Well-known and commonly-used HTTP/proxy ports — the DEFAULT gate only.
 # Sessions whose dport or sport is in this set are scanned for Basic Auth.
-# Add site-specific alternate ports here if needed.
+# detectors.configure_all() rebinds this name to the configured ports once per
+# worker process at startup, so editing this set does NOT change the gate in a
+# running deployment and is not how site-specific ports are added: set
+# ports.http in tscan_ng.conf instead. That same configured list builds the BPF
+# capture filter (capture._build_port_filter), so a port absent from it never
+# reaches this detector. These values mirror the "http" row of
+# tscan_ng.protocols.PROTOCOLS, the default the config layer falls back to —
+# keep the two in step.
 _HTTP_PORTS: frozenset = frozenset({
     80,    # HTTP
     8080,  # Common HTTP alternate / proxy
